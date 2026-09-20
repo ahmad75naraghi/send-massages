@@ -19,14 +19,18 @@ const RUBIKA_BOT_TOKEN   = 'CEJCFE0FCBZKUIGMNMOODEZXQAVAFDOLNFHMSBDFUVDAQMAFIYQD
 const RUBIKA_CHANNEL_ID  = '@shamimeashena1';
 
 // تنظیمات سروش‌پلاس
-const SOROUSH_CHANNEL_ID = 'shamimeashena1';
-const SOROUSH_SCRIPT     = '/home/file/public_html/s/send_soroush.js';
+const SOROUSH_CHANNEL_ID   = 'shamimeashena1';
+const SOROUSH_CHANNEL_NAME = 'شمیم آشنا';   // نام نمایشی کانال برای تأیید باز شدن چت درست
+const SOROUSH_SCRIPT       = '/home/file/public_html/s/send_soroush.js';
 
 // تنظیمات آیگپ
-const IGAP_CHANNEL_ID    = 'shamimeashena';
-const IGAP_SCRIPT        = '/home/file/public_html/s/send_igap.js';
+const IGAP_CHANNEL_ID      = 'shamimeashena';
+const IGAP_CHANNEL_NAME    = 'شمیم آشنا';   // نام نمایشی کانال در لیست گفت‌وگوهای آی‌گپ
+const IGAP_SCRIPT          = '/home/file/public_html/s/send_igap.js';
 
-const NODE_BIN           = '/usr/bin/node';
+const NODE_BIN             = '/usr/bin/node';
+const USERBOT_TIMEOUT_SEC  = 240;           // کرانهٔ سخت هر اجرای UserBot (جلوگیری از worker گیرکرده)
+const MEDIA_MAX_RETRY      = 3;             // سقف تلاش برای دانلود رسانهٔ یک پست پیش از انتشار بدون رسانه
 
 // اعتبارسنجی توکن دسترسی
 if (($_REQUEST['key'] ?? '') !== SECURITY_KEY and php_sapi_name() !== 'cli') {
@@ -37,6 +41,7 @@ if (($_REQUEST['key'] ?? '') !== SECURITY_KEY and php_sapi_name() !== 'cli') {
 // پایگاه داده وضعیت
 $dbPath = __DIR__ . '/state.sqlite';$db = new PDO("sqlite:{$dbPath}");
 $db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);$db->exec("CREATE TABLE IF NOT EXISTS sync_state (channel TEXT PRIMARY KEY, last_msg_id INTEGER NOT NULL)");
+$db->exec("CREATE TABLE IF NOT EXISTS media_fail (msg_id INTEGER PRIMARY KEY, fails INTEGER NOT NULL DEFAULT 0, last_reason TEXT, updated_at TEXT)");
 
 function getLastSeenId(PDO $db, string$channel): int {
     $stmt =$db->prepare("SELECT last_msg_id FROM sync_state WHERE channel = :channel");
@@ -50,9 +55,27 @@ function setLastSeenId(PDO $db, string $channel, int$msgId): void {
     $stmt->execute([':channel' => $channel, ':msg_id' =>$msgId]);
 }
 
-function downloadMedia(string $url, string$targetFilename): ?string {
+/**
+ * دانلود رسانهٔ ایتا به فایل موقت.
+ *
+ * لینک‌های رسانهٔ ایتا امضاشده و زمان‌دار هستند؛ بنابراین شکست دانلود یک
+ * «دلیل قابل اقدام» برمی‌گرداند (پارامتر ارجاعی $reason) تا لایهٔ بالاتر
+ * بتواند تصمیم درست بگیرد: تعویق پست (برای دریافت لینک تازه در scrape بعدی)
+ * یا انتشار بدون رسانه همراه با گزارش صریح.
+ */
+function downloadMedia(string $url, string$targetFilename, ?string &$reason = null): ?string {
+    $reason = null;
+    if ($url === '' or !preg_match('#^https?://#i', $url)) {
+        $reason = 'BAD_URL';
+        return null;
+    }
+
     $tmpPath = sys_get_temp_dir() . '/sync_' . uniqid('', true) . '_' . $targetFilename;
     $fp = fopen($tmpPath, 'w+');
+    if (!$fp) {
+        $reason = 'TEMP_NOT_WRITABLE';
+        return null;
+    }
     $ch = curl_init($url);
     curl_setopt_array($ch, [
         CURLOPT_FILE           => $fp,
@@ -63,14 +86,52 @@ function downloadMedia(string $url, string$targetFilename): ?string {
         CURLOPT_HTTPHEADER     => ['Referer: https://eitaa.com/' . EITAA_CHANNEL_ID]
     ]);
     $res = curl_exec($ch);
-    $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $errno = curl_errno($ch);
+    $size = (int)@filesize($tmpPath);
     curl_close($ch);
     fclose($fp);
-    if ($res and in_array($code, [200, 206], true) and filesize($tmpPath) > 100) {
+
+    if ($res and in_array($code, [200, 206], true) and $size > 100) {
         return $tmpPath;
     }
+
     @unlink($tmpPath);
+    if ($errno !== 0) {
+        $reason = 'CURL_ERROR_' . $errno;
+    } elseif ($code === 403 or $code === 401) {
+        $reason = 'TOKEN_EXPIRED_HTTP_' . $code;      // لینک امضاشده منقضی شده → scrape تازه لازم است
+    } elseif ($code === 404) {
+        $reason = 'MEDIA_GONE_HTTP_404';
+    } elseif ($code >= 500) {
+        $reason = 'UPSTREAM_HTTP_' . $code;
+    } elseif ($size <= 100) {
+        $reason = 'EMPTY_OR_PLACEHOLDER_BODY';        // مثلاً صفحهٔ «حجم رسانه بالاست / مشاهده در ایتا»
+    } else {
+        $reason = 'HTTP_' . $code;
+    }
     return null;
+}
+
+/** تعداد شکست‌های ثبت‌شدهٔ دانلود رسانه برای یک پست */
+function getMediaFailCount(PDO $db, int $msgId): int {
+    $stmt = $db->prepare('SELECT fails FROM media_fail WHERE msg_id = :id');
+    $stmt->execute([':id' => $msgId]);
+    $v = $stmt->fetchColumn();
+    return $v !== false ? (int)$v : 0;
+}
+
+/** ثبت/افزایش شکست دانلود و بازگرداندن شمار جدید */
+function bumpMediaFail(PDO $db, int $msgId, string $reason): int {
+    $stmt = $db->prepare('INSERT INTO media_fail (msg_id, fails, last_reason, updated_at) VALUES (:id, 1, :r, :t)
+                          ON CONFLICT(msg_id) DO UPDATE SET fails = fails + 1, last_reason = :r, updated_at = :t');
+    $stmt->execute([':id' => $msgId, ':r' => $reason, ':t' => date('c')]);
+    return getMediaFailCount($db, $msgId);
+}
+
+/** پاک‌سازی شمارندهٔ شکست پس از انتشار موفق */
+function clearMediaFail(PDO $db, int $msgId): void {
+    $db->prepare('DELETE FROM media_fail WHERE msg_id = :id')->execute([':id' => $msgId]);
 }
 
 // استخراج آخرین JSON معتبر از خروجی اسکریپت Node
@@ -91,6 +152,20 @@ function parseNodeJsonOutput(string $output): ?array {
         }
     }
     return null;
+}
+
+/**
+ * خواندن بدنهٔ درخواست.
+ * در حالت وب از php://input می‌خواند؛ در حالت CLI (cron) می‌توان مسیر فایل
+ * را با متغیر محیطی SYNC_BODY_FILE داد تا رفتار کاملاً قطعی باشد
+ * (وابسته به رفتار php://input روی stdin نباشد).
+ */
+function readRequestBody(): string {
+    $fromFile = getenv('SYNC_BODY_FILE');
+    if (is_string($fromFile) and $fromFile !== '' and is_readable($fromFile)) {
+        return (string)file_get_contents($fromFile);
+    }
+    return (string)file_get_contents('php://input');
 }
 
 function callApi(string $url, mixed$data, bool $isMultipart, array$headers = []): array {
@@ -137,48 +212,74 @@ function sendToRubika(string $text, ?string $file, ?string $type, string $fileNa
     return callApi($base . 'sendMessage', json_encode(['chat_id' => RUBIKA_CHANNEL_ID, 'text' =>$text]), false, ['Content-Type: application/json']);
 }
 
-function sendToSoroush(string $channel, string $text = '', ?string $filePath = null): array {
+/**
+ * اجرای یک UserBot به‌عنوان subprocess ایمن.
+ *
+ * نکاتی که این تابع را با نسخهٔ پیشین متفاوت (و درست) می‌کند:
+ *  ۱) `timeout N` دور دستور: یک Chromium گیرکرده دیگر worker PHP را بلوکه نمی‌کند.
+ *  ۲) `--type` نوع رسانه را از لایهٔ scraping به Node می‌دهد تا تصمیم
+ *     «Media یا File» بر اساس نوع واقعی باشد، نه حدس از روی پسوند.
+ *  ۳) `--channel-name` نام نمایشی کانال را می‌دهد تا اسکریپت بتواند
+ *     «باز شدن چت درست» را تأیید کند (جلوگیری از ارسال به چت اشتباه).
+ *  ۴) وضعیت UNVERIFIED (ارسال شد ولی تأیید نشد) به‌صورت شکستِ صادقانه
+ *     نگاشت می‌شود، نه OK کاذب.
+ */
+function runUserbot(string $script, string $profileDir, string $channel, string $channelName, string $text, ?string $filePath, ?string $mediaType): array {
+    if (trim($text) === '' and (!$filePath or !file_exists($filePath))) {
+        return ['success' => true, 'message' => 'SKIP: محتوایی برای ارسال نیست', 'skipped' => true];
+    }
+
     $cleanChannel = ltrim($channel, '@');
-    $profileDir   = '/home/file/public_html/s/soroush_profile';
     @array_map('unlink', glob($profileDir . '/Singleton*') ?: []);
 
-    $cmd = escapeshellarg(NODE_BIN) . ' ' . escapeshellarg(SOROUSH_SCRIPT) . ' --channel=' . escapeshellarg($cleanChannel);
+    $cmd  = 'timeout ' . (int)USERBOT_TIMEOUT_SEC . ' ';
+    $cmd .= escapeshellarg(NODE_BIN) . ' ' . escapeshellarg($script);
+    $cmd .= ' --channel=' . escapeshellarg($cleanChannel);
+    if ($channelName !== '') {
+        $cmd .= ' --channel-name=' . escapeshellarg($channelName);
+    }
     if ($text !== '') {
         $cmd .= ' --text=' . escapeshellarg($text);
     }
     if ($filePath and file_exists($filePath)) {
         $cmd .= ' --file=' . escapeshellarg($filePath);
+        $cmd .= ' --type=' . escapeshellarg((string)($mediaType ?? ''));
     }
 
     $output = shell_exec($cmd . ' 2>&1');
     @array_map('unlink', glob($profileDir . '/Singleton*') ?: []);
 
     $result = parseNodeJsonOutput((string)$output);
-    return (isset($result['status']) and $result['status'] === 'OK')
-        ? ['success' => true, 'message' => $result['message'] ?? 'OK']
-        : ['success' => false, 'message' => $result['error'] ?? ($output !== null && trim((string)$output) !== '' ? trim((string)$output) : 'Fail')];
+    $status = $result['status'] ?? null;
+
+    if ($status === 'OK') {
+        return [
+            'success'  => true,
+            'message'  => $result['message'] ?? 'OK',
+            'verified' => (bool)($result['verified'] ?? true),
+            'proof'    => $result['proof'] ?? '',
+        ];
+    }
+
+    $detail = $result['error'] ?? $result['message'] ?? '';
+    $code   = $result['code'] ?? '';
+    $logRef = isset($result['log']) ? ' [log: ' . basename((string)$result['log']) . ']' : '';
+    $raw    = trim((string)$output);
+
+    return [
+        'success' => false,
+        'message' => ($code !== '' ? '[' . $code . '] ' : '')
+                   . ($detail !== '' ? $detail : ($raw !== '' ? mb_substr($raw, -300) : 'Fail'))
+                   . $logRef,
+    ];
 }
 
-function sendToIgap(string $channel, string $text = '', ?string $filePath = null): array {
-    $cleanChannel = ltrim($channel, '@');
-    $profileDir   = '/home/file/public_html/s/igap_profile';
-    @array_map('unlink', glob($profileDir . '/Singleton*') ?: []);
+function sendToSoroush(string $channel, string $text = '', ?string $filePath = null, ?string $mediaType = null): array {
+    return runUserbot(SOROUSH_SCRIPT, '/home/file/public_html/s/soroush_profile', $channel, SOROUSH_CHANNEL_NAME, $text, $filePath, $mediaType);
+}
 
-    $cmd = escapeshellarg(NODE_BIN) . ' ' . escapeshellarg(IGAP_SCRIPT) . ' --channel=' . escapeshellarg($cleanChannel);
-    if ($text !== '') {
-        $cmd .= ' --text=' . escapeshellarg($text);
-    }
-    if ($filePath and file_exists($filePath)) {
-        $cmd .= ' --file=' . escapeshellarg($filePath);
-    }
-
-    $output = shell_exec($cmd . ' 2>&1');
-    @array_map('unlink', glob($profileDir . '/Singleton*') ?: []);
-
-    $result = parseNodeJsonOutput((string)$output);
-    return (isset($result['status']) and $result['status'] === 'OK')
-        ? ['success' => true, 'message' => $result['message'] ?? 'OK']
-        : ['success' => false, 'message' => $result['error'] ?? ($output !== null && trim((string)$output) !== '' ? trim((string)$output) : 'Fail')];
+function sendToIgap(string $channel, string $text = '', ?string $filePath = null, ?string $mediaType = null): array {
+    return runUserbot(IGAP_SCRIPT, '/home/file/public_html/s/igap_profile', $channel, IGAP_CHANNEL_NAME, $text, $filePath, $mediaType);
 }
 
 $action =$_GET['action'] ?? '';
@@ -271,7 +372,7 @@ if ($action === 'sync_single') {
     set_time_limit(300);
     header('Content-Type: application/json; charset=utf-8');
 
-    $payload = json_decode(file_get_contents('php://input'), true);
+    $payload = json_decode(readRequestBody(), true);
     if (!$payload or empty($payload['id'])) {
         echo json_encode(['success' => false, 'error' => 'Invalid payload']);
         exit;
@@ -283,16 +384,47 @@ if ($action === 'sync_single') {
     $mediaType =$payload['mediaType'] ?? null;
     $fileName  =$payload['fileName'] ?? 'file.bin';
 
-    $localFile =$mediaUrl ? downloadMedia($mediaUrl,$fileName) : null;
+    // ---------- دانلود رسانه با سیاست «تعویق هوشمند» ----------
+    // اگر رسانه دانلود نشود، پست «متن‌خالی» منتشر نمی‌شود؛ بلکه تعویق می‌شود تا
+    // در چرخهٔ بعد scrape تازه، لینک امضاشدهٔ جدید گرفته شود (خودترمیمی).
+    // پس از MEDIA_MAX_RETRY تلاش ناموفق (مثلاً رسانهٔ حجیم که نمای وب ایتا
+    // لینک مستقیم نمی‌دهد) پست فقط با متن منتشر و این اتفاق صریحاً گزارش می‌شود.
+    $localFile   = null;
+    $mediaReason = null;
+
+    if ($mediaUrl) {
+        $localFile = downloadMedia($mediaUrl, $fileName, $mediaReason);
+        if (!$localFile) {
+            sleep(2);                                   // تلاش دوم (خطای گذرای شبکه)
+            $localFile = downloadMedia($mediaUrl, $fileName, $mediaReason);
+        }
+        if (!$localFile) {
+            $attempts = bumpMediaFail($db, $msgId, (string)$mediaReason);
+            if ($attempts < MEDIA_MAX_RETRY) {
+                http_response_code(200);
+                echo json_encode([
+                    'success'  => false,
+                    'deferred' => true,
+                    'id'       => $msgId,
+                    'error'    => 'MEDIA_DOWNLOAD_FAILED',
+                    'reason'   => (string)$mediaReason,
+                    'attempt'  => $attempts,
+                    'message'  => "رسانهٔ پست $msgId دانلود نشد ($mediaReason). پست منتشر نشد و last_msg_id جلو نرفت؛ در چرخهٔ بعد با لینک تازه دوباره تلاش می‌شود (تلاش $attempts از " . MEDIA_MAX_RETRY . ')',
+                ], JSON_UNESCAPED_UNICODE);
+                exit;
+            }
+            // از این پس: انتشار بدون رسانه + گزارش صریح (دیگر بی‌صدا نیست)
+        }
+    }
 
     $bale = sendToBale($text, $localFile,$mediaType, $fileName);$baleOk = ($bale['code'] === 200 and ($bale['res']['ok'] ?? false));
 
     $rubika = sendToRubika($text, $localFile,$mediaType, $fileName);$rubikaOk = ($rubika['code'] === 200 and (($rubika['res']['status'] ?? '') === 'OK'));
 
-    $soroush = sendToSoroush(SOROUSH_CHANNEL_ID, $text,$localFile);
+    $soroush = sendToSoroush(SOROUSH_CHANNEL_ID, $text, $localFile, $mediaType);
     $soroushOk = ($soroush['success'] === true);
 
-    $igap = sendToIgap(IGAP_CHANNEL_ID, $text,$localFile);
+    $igap = sendToIgap(IGAP_CHANNEL_ID, $text, $localFile, $mediaType);
     $igapOk = ($igap['success'] === true);
 
     if ($localFile and file_exists($localFile)) {
@@ -301,9 +433,20 @@ if ($action === 'sync_single') {
 
     setLastSeenId($db, EITAA_CHANNEL_ID,$msgId);
 
+    // پستی که منتشر شد (با یا بدون رسانه) دیگر در صف تعویق نمی‌ماند
+    clearMediaFail($db, $msgId);
+
+    $mediaOk = true;
+    $mediaInfo = 'none';
+    if ($mediaUrl) {
+        $mediaOk = ($mediaReason === null);
+        $mediaInfo = $mediaOk ? 'downloaded' : ('DROPPED_AFTER_' . MEDIA_MAX_RETRY . '_TRIES:' . (string)$mediaReason);
+    }
+
     echo json_encode([
         'success' => true,
         'id'      => $msgId,
+        'media'   => ['ok' => $mediaOk, 'info' => $mediaInfo],
         'bale'    => ['ok' => $baleOk, 'info' =>$bale['code'] ?? 'ERR'],
         'rubika'  => ['ok' => $rubikaOk, 'info' =>$rubika['code'] ?? 'ERR'],
         'soroush' => ['ok' => $soroushOk, 'info' =>$soroush['message'] ?? 'ERR'],
@@ -315,7 +458,7 @@ if ($action === 'sync_single') {
 // ۳. ارسال گزارش پایانی
 if ($action === 'send_report') {
     header('Content-Type: application/json; charset=utf-8');
-    $payload = json_decode(file_get_contents('php://input'), true);
+    $payload = json_decode(readRequestBody(), true);
     $reportItems =$payload['report'] ?? [];
 
     if (!empty(BALE_ADMIN_CHAT_ID) and !empty($reportItems)) {
@@ -392,6 +535,7 @@ if ($action === 'send_report') {
 
 <script>
     const SECURITY_KEY = '<?= SECURITY_KEY ?>';
+    const MEDIA_MAX_RETRY_TXT = '<?= MEDIA_MAX_RETRY ?>';
     let pendingMessages = [];
     let reportList = [];
 
@@ -497,15 +641,47 @@ if ($action === 'send_report') {
                 });
                 const result = await res.json();
 
-                updateBadge(`bale-${m.id}`, result.bale?.ok, 'بله');
-                updateBadge(`rubika-${m.id}`, result.rubika?.ok, 'روبیکا');
-                updateBadge(`soroush-${m.id}`, result.soroush?.ok, 'سروش');
-                updateBadge(`igap-${m.id}`, result.igap?.ok, 'آیگپ');
+                // پست تعویق‌شده: رسانه دانلود نشد، چیزی منتشر نشده است
+                if (result.deferred) {
+                    ['bale', 'rubika', 'soroush', 'igap'].forEach(p => {
+                        const b = document.getElementById(`${p}-${m.id}`);
+                        if (b) { b.className = 'badge fail'; b.style.background = '#78350f'; b.innerText = 'تعویق'; b.title = result.message || ''; }
+                    });
+                    log(`⏸ پست ${m.id} منتشر نشد: ${result.message || result.reason || 'رسانه دانلود نشد'}`, '#fbbf24');
+                    reportList.push(`⏸ پست ${m.id}: رسانه دانلود نشد (${result.reason || '?'}) — منتشر نشد؛ تلاش ${result.attempt || 1}/${MEDIA_MAX_RETRY_TXT}`);
+                    card.classList.remove('active');
+                    continue;
+                }
+
+                if (result.success === false) {
+                    ['bale', 'rubika', 'soroush', 'igap'].forEach(p => {
+                        const b = document.getElementById(`${p}-${m.id}`);
+                        if (b) { b.className = 'badge fail'; b.innerText = 'خطا'; }
+                    });
+                    log(`❌ پست ${m.id}: ${result.error || 'خطای نامشخص'}`, '#f87171');
+                    card.classList.remove('active');
+                    continue;
+                }
+
+                updateBadge(`bale-${m.id}`, result.bale?.ok, 'بله', result.bale?.info);
+                updateBadge(`rubika-${m.id}`, result.rubika?.ok, 'روبیکا', result.rubika?.info);
+                updateBadge(`soroush-${m.id}`, result.soroush?.ok, 'سروش', result.soroush?.info);
+                updateBadge(`igap-${m.id}`, result.igap?.ok, 'آیگپ', result.igap?.info);
 
                 const mediaDesc = m.mediaType ? m.mediaType : 'متن';
-                reportList.push(`🔹 پست ${m.id} [${mediaDesc}]:\n  بله: ${result.bale?.ok ? "✅" : "❌"} | روبیکا: ${result.rubika?.ok ? "✅" : "❌"}\n  سروش: ${result.soroush?.ok ? "✅" : "❌"} | آیگپ: ${result.igap?.ok ? "✅" : "❌"}`);
+                const mediaState = result.media
+                    ? (result.media.ok ? '✅' : `❌ ${result.media.info}`)
+                    : (m.mediaUrl ? '⚠️ نامشخص' : '—');
+                reportList.push(`🔹 پست ${m.id} [${mediaDesc}]:\n  بله: ${result.bale?.ok ? "✅" : "❌"} | روبیکا: ${result.rubika?.ok ? "✅" : "❌"}\n  سروش: ${result.soroush?.ok ? "✅" : "❌"} | آیگپ: ${result.igap?.ok ? "✅" : "❌"}\n  رسانه: ${mediaState}`);
 
-                log(`پست ID ${m.id} ارسال شد. (سروش: ${result.soroush?.ok ? 'OK' : 'خطا'} | آیگپ: ${result.igap?.ok ? 'OK' : 'خطا'})`);
+                const sInfo = result.soroush?.info || '';
+                const gInfo = result.igap?.info || '';
+                log(`پست ID ${m.id} پردازش شد. (سروش: ${result.soroush?.ok ? 'OK' : (/UNVERIFIED/i.test(sInfo) ? 'تأیید نشد' : 'خطا')} | آیگپ: ${result.igap?.ok ? 'OK' : (/UNVERIFIED/i.test(gInfo) ? 'تأیید نشد' : 'خطا')})`);
+                if (result.media && result.media.ok === false) {
+                    log(`⚠️ رسانهٔ پست ${m.id} منتشر نشد: ${result.media.info}`, '#fbbf24');
+                }
+                if (!result.soroush?.ok) log(`   سروش: ${sInfo}`, '#fca5a5');
+                if (!result.igap?.ok) log(`   آیگپ: ${gInfo}`, '#fca5a5');
 
             } catch (err) {
                 log(`خطا در درخواست پست ${m.id}: ${err.message}`, '#f87171');
@@ -534,11 +710,20 @@ if ($action === 'send_report') {
         document.getElementById('startBtn').disabled = false;
     }
 
-    function updateBadge(elId, isOk, name) {
+    // سه حالت بصری: ✓ موفق تأییدشده، ؟ ارسال‌شده ولی تأیید‌نشده (UNVERIFIED)، ✕ شکست
+    function updateBadge(elId, isOk, name, info) {
         const el = document.getElementById(elId);
+        if (!el) return;
+        const detail = typeof info === 'string' ? info : '';
+        if (detail) el.title = detail;
+        const unverified = /UNVERIFIED|SEND_NOT_VERIFIED/i.test(detail);
         if (isOk) {
             el.className = 'badge ok';
             el.innerText = `${name} ✓`;
+        } else if (unverified) {
+            el.className = 'badge fail';
+            el.style.background = '#78350f';
+            el.innerText = `${name} ؟`;
         } else {
             el.className = 'badge fail';
             el.innerText = `${name} ✕`;

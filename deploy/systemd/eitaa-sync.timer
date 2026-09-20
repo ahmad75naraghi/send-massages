@@ -1,0 +1,13 @@
+# /etc/systemd/system/eitaa-sync.timer
+[Unit]
+Description=Run eitaa-sync every 10 minutes
+
+[Timer]
+OnBootSec=90s
+OnUnitActiveSec=10min
+RandomizedDelaySec=45s
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

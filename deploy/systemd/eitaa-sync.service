@@ -1,0 +1,22 @@
+# /etc/systemd/system/eitaa-sync.service
+[Unit]
+Description=Eitaa -> 4-platform sync (manual cron runner)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=file
+Group=file
+Environment=HOME=/home/file
+Environment=LANG=en_US.UTF-8
+Environment=LC_ALL=en_US.UTF-8
+Environment=SYNC_APP_DIR=/home/file/public_html/s
+ExecStart=/usr/bin/bash /home/file/public_html/s/cron_sync.sh
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=5
+MemoryMax=3G
+TimeoutStartSec=1800
+StandardOutput=append:/home/file/public_html/s/logs/systemd.log
+StandardError=append:/home/file/public_html/s/logs/systemd.log

@@ -40,6 +40,12 @@
 | پست در صف ظاهر نمی‌شود / جا افتاد | [§۸.۲](#s8-2) |
 | badge آی‌گپ «✕» ولی پیام در کانال هست | [§۸.۳](#s8-3) |
 | گزارش مدیریتی در بله نمی‌رسد | [§۸.۴](#s8-4) |
+| پیام به چت/کانال اشتباه رفت (نمونهٔ دستی درست بود) | [§۸.۵](#s8-5) |
+| `CHANNEL_NOT_FOUND` / `SESSION_EXPIRED` / `ATTACH_*` در JSON | [§۸.۶](#s8-6) |
+| `status: UNVERIFIED` — ارسال شد ولی تأیید نشد | [§۸.۷](#s8-7) |
+| کپشن رسانه در کانال دیده نمی‌شود | [§۸.۸](#s8-8) |
+| `FILE_INJECT_FAILED` — منوی ضمیمه باز شد ولی فایل نرفت | [§۸.۹](#s8-9) |
+| `MEDIA_DOWNLOAD_FAILED` / `deferred: true` | [§۳.۳](#s3-3) |
 | cron اجرا نمی‌شود | [§۹.۱](#s9-1) |
 | `jq: command not found` | [§۹.۲](#s9-2) |
 | نام فایل فارسی خراب شد | [§۹.۳](#s9-3) |
@@ -107,6 +113,15 @@ chown file:file /home/file/public_html/s/collect_diagnostics.sh
 chmod 750 /home/file/public_html/s/collect_diagnostics.sh
 bash /home/file/public_html/s/collect_diagnostics.sh
 ```
+
+> ✅ این اسکریپت هم‌اکنون به‌صورت فایل آماده در ریپو وجود دارد (`collect_diagnostics.sh`)؛ نیازی به ساخت دستی آن نیست. علاوه بر موارد بالا، لاگ هر اجرا (`logs/send_*.log`) و شواهد بصری را در `logs/diag_assets_<ts>/` جمع می‌کند.
+
+**دو ابزار تشخیصی دیگر که در همین نسخه اضافه شده‌اند**
+
+| ابزار | چه چیزی را روشن می‌کند | اجرا |
+|---|---|---|
+| `smoke_test.sh` | سلامت محیط، سینتکس، مجوزها، شبکه، صف و (با `--live`) ارسال واقعی | `sudo -u file bash smoke_test.sh --live` |
+| `dump_dom.js` | DOM زندهٔ وب‌کلاینت + فهرست کاندیدهای سلکتور بر اساس کلمهٔ کلیدی | `sudo -u file node dump_dom.js igap` |
 
 ---
 
@@ -204,6 +219,24 @@ ln -sf "$(command -v chromium || command -v chromium-browser)" /usr/bin/chromium
 > ```bash
 > grep -rn 'executablePath' --include='*.js' /home/file/public_html/s
 > ```
+
+**مسیر بدون symlink (توصیه‌شده در این نسخه)** — مسیر باینری دیگر در هر اسکریپت hard-code نیست؛ همه از `resolveChromium()` در `lib/pw_common.js` استفاده می‌کنند که به این ترتیب عمل می‌کند:
+
+```text
+SYNC_CHROMIUM_BIN (متغیر محیطی)  →  /usr/bin/chromium-browser  →  /usr/bin/chromium  →  google-chrome(-stable)
+```
+
+```bash
+# برای یک اجرای موقت:
+SYNC_CHROMIUM_BIN=/usr/lib64/chromium-browser/chromium-browser \
+  sudo -u file --preserve-env=SYNC_CHROMIUM_BIN /usr/bin/node send_igap.js --channel-name="شمیم آشنا" --text=probe
+
+# برای cron/systemd (دائم):
+echo 'export SYNC_CHROMIUM_BIN=/usr/lib64/chromium-browser/chromium-browser' \
+  >> /home/file/public_html/s/.cron_env
+```
+
+لاگ هر اجرا باینری انتخاب‌شده را ثبت می‌کند: `chromium binary: /usr/bin/chromium-browser`.
 
 ### ۱.۳ crash مرورگر و `/dev/shm` <a id="s1-3"></a>
 
@@ -551,6 +584,48 @@ head -c 200 /tmp/probe.bin | xxd | head -5
 | `code=206` | پاسخ Partial — **معتبر است** | کد فعلی `206` را می‌پذیرد؛ اقدامی لازم نیست |
 | `file` خروجی `HTML document` | همان ۴۰۳ | — |
 | `Permission denied` روی `/tmp` | `open_basedir` یا `/tmp` با `noexec` | `php -i \| grep open_basedir`؛ `mount \| grep /tmp` |
+
+**رفتار جدید لایهٔ PHP (تعویق هوشمند به‌جای حذف بی‌صدای رسانه)**
+
+پیش‌تر اگر `downloadMedia()` ناموفق بود، `$localFile = null` می‌شد و هر چهار پلتفرم **فقط متن** را منتشر می‌کردند؛ پاسخ هم `success: true` بود، یعنی رسانه بی‌صدا حذف می‌شد. اکنون:
+
+1. دو تلاش دانلود (با ۲ ثانیه فاصله) انجام می‌شود.
+2. اگر هر دو شکست بخورند و شمارندهٔ پست کمتر از `MEDIA_MAX_RETRY` (پیش‌فرض ۳) باشد، **هیچ‌چیز منتشر نمی‌شود** و `last_msg_id` جلو نمی‌رود؛ پاسخ:
+
+```json
+{"success":false,"deferred":true,"id":74125,"error":"MEDIA_DOWNLOAD_FAILED","reason":"TOKEN_EXPIRED_HTTP_403","attempt":1,"message":"رسانهٔ پست 74125 دانلود نشد …"}
+```
+
+   چون `get_pending` در چرخهٔ بعد دوباره از ایتا scrape می‌کند، **لینک امضاشدهٔ تازه** ساخته می‌شود و مورد خودترمیم است.
+3. پس از ۳ تلاش ناموفق (مثلاً رسانهٔ حجیم که نمای وب لینک مستقیم نمی‌دهد → [§۳.۴](#s3-4)) پست فقط با متن منتشر می‌شود ولی این اتفاق **صریحاً** در پاسخ، گزارش مدیریتی و لاگ cron ثبت می‌گردد:
+
+```json
+{"success":true,"media":{"ok":false,"info":"DROPPED_AFTER_3_TRIES:EMPTY_OR_PLACEHOLDER_BODY"}, "bale":{…}}
+```
+
+**کدهای دلیل (`reason`)**
+
+| `reason` | معنا |
+|---|---|
+| `TOKEN_EXPIRED_HTTP_403` / `_401` | لینک امضاشده منقضی شده → تعویق و scrape تازه |
+| `MEDIA_GONE_HTTP_404` | رسانه در مبدأ حذف شده |
+| `UPSTREAM_HTTP_5xx` | خطای موقت سمت ایتا |
+| `EMPTY_OR_PLACEHOLDER_BODY` | پاسخ کوچک‌تر از ۱۰۰ بایت (مثلاً صفحهٔ «حجم رسانه بالاست») |
+| `CURL_ERROR_<n>` | خطای شبکه/DNS/TLS (شمارهٔ خطا = `curl_errno`) |
+| `BAD_URL` | `mediaUrl` معتبر نیست (پارسر ایتا → [§۳.۲](#s3-2)) |
+| `TEMP_NOT_WRITABLE` | `/tmp` نوشتنی نیست |
+
+**بازبینی شمارندهٔ تعویق‌ها**
+
+```bash
+APP=/home/file/public_html/s
+sqlite3 "$APP/state.sqlite" "SELECT msg_id, fails, last_reason, updated_at FROM media_fail ORDER BY updated_at DESC LIMIT 10;"
+grep -E 'DEFER|رسانه' "$APP"/logs/cron_sync.log | tail -10
+# پاک‌سازی دستی یک پست برای تلاش دوباره:
+sqlite3 "$APP/state.sqlite" "DELETE FROM media_fail WHERE msg_id=74125;"
+```
+
+> کد خروج `cron_sync.sh`: `0` سبز، `3` شکست ارسال، `4` فقط موارد تعویق‌شده.
 
 **بازبینی فایل‌های موقت باقی‌مانده:**
 
@@ -1506,6 +1581,161 @@ curl -s "https://tapi.bale.ai/bot<TOKEN>/getUpdates" | jq '.result | length'
 | `BALE_ADMIN_CHAT_ID` اشتباه | با مقدار `chat.id` از `getUpdates` جایگزین کنید |
 | توکن باطل | §۴.۱ |
 
+### ۸.۵ پیام به چت اشتباه رفت — ریشهٔ «نمونه درست / تولید خراب» <a id="s8-5"></a>
+
+**علائم**
+
+- اجرای دستی از خط فرمان (نمونه‌ها) درست کار می‌کرد و پیام در کانال مقصد دیده می‌شد.
+- اجرای تولید (از داشبورد یا cron) یا `CHANNEL_NOT_FOUND` می‌داد یا پیام را به چت دیگری می‌فرستاد.
+- در لاگ اجرا، مقدار کانال **با کوتیشن واقعی** دیده می‌شود:
+
+```text
+[..] args: channel='shamimeashena1' name=- text=48ch file=- type=-
+```
+
+**علت ریشه‌ای**
+
+نسخهٔ قدیمی `sync_manual.php` دستور shell را با `sprintf` می‌ساخت و در قالب آن backslash خام به‌کار رفته بود (`'\%s \%s --channel=\%s'`). نتیجه این بود که خروجی `escapeshellarg()` دوباره داخل کوتیشن می‌رفت و bash به‌جای حذف کوتیشن‌ها، آن‌ها را **به‌عنوان بخشی از مقدار** به Node می‌داد:
+
+```text
+آنچه PHP می‌ساخت:  --channel=\'shamimeashena1\'
+آنچه Node می‌دید:  channel = 'shamimeashena1'      ← با کوتیشن
+آدرس ساخته‌شده:    https://web.splus.ir/#@'shamimeashena1'   ← هرگز resolve نمی‌شود
+```
+
+وقتی hash route نتیجه نمی‌داد، fallback جست‌وجو فعال می‌شد و **اولین نتیجهٔ لیست** کلیک می‌شد؛ یعنی ارسال به چت اشتباه. در نمونه‌های دستی آرگومان‌ها پاک بودند، پس همین مسیر هرگز فعال نمی‌شد — دقیقاً همان تفاوت «نمونه درست / تولید خراب».
+
+**تشخیص**
+
+```bash
+APP=/home/file/public_html/s
+
+# ۱) آرگومان واقعی را با کوتیشن آلوده شبیه‌سازی کنید (باید بی‌خطر پاک شود)
+node -e 'const C=require("'"$APP"'/lib/pw_common.js");
+console.log(JSON.stringify(C.parseArgs(["node","x.js","--channel='"'"'shamimeashena1'"'"'"])))'
+# انتظار: {"channel":"shamimeashena1", ...}
+
+# ۲) در کد PHP هیچ sprintf با backslash خام نمانده باشد
+grep -n "sprintf('"'"'\\%" "$APP/sync_manual.php" && echo "❌ هنوز باگ هست" || echo "✅ پاک است"
+
+# ۳) دستور واقعی که اجرا می‌شود را در لاگ ببینید
+tail -50 "$APP"/logs/send_soroush_*.log | grep 'args:'
+```
+
+**رفع (در همین نسخه انجام شده)**
+
+| لایه | رفع |
+|---|---|
+| PHP | حذف `sprintf` و اتصال مستقیم `escapeshellarg()` برای هر آرگومان |
+| Node | `parseArgs` در `lib/pw_common.js` هر کوتیشن جفت‌شدهٔ اطراف مقدار را حذف می‌کند |
+| ناوبری | سه راهبرد باز کردن چت (لیست ← جست‌وجو ← hash) + **تأیید باز شدن چت درست** با دیدن composer/نام کانال در هدر |
+| قرارداد | آرگومان `--channel-name` تا تأیید بر اساس نام نمایشی انجام شود؛ در `sync_manual.php` ثابت‌های `SOROUSH_CHANNEL_NAME` و `IGAP_CHANNEL_NAME` مقداردهی شده‌اند |
+
+> اگر کانال مقصد عوض شد، **هر دو** مقدار `*_CHANNEL_ID` و `*_CHANNEL_NAME` را به‌روز کنید؛ بدون نام نمایشی، اسکریپت فقط به شناسه تکیه می‌کند و تأیید ضعیف‌تر می‌شود.
+
+### ۸.۶ جدول کدهای خطای اسکریپت‌های ارسال <a id="s8-6"></a>
+
+هر دو اسکریپت `send_soroush.js` و `send_igap.js` دقیقاً یک خط JSON روی stdout می‌نویسند و کد خروج `0` فقط برای `OK` است.
+
+| `code` | `status` | معنا | اقدام |
+|---|---|---|---|
+| `EMPTY_PAYLOAD` | ERROR | هم `--text` و هم `--file` خالی | بررسی لایهٔ scraping؛ پستی بدون محتوا نباید به sender برسد |
+| `FILE_MISSING` | ERROR | مسیر `--file` وجود ندارد | خروجی `downloadMedia` را ببینید → [§۳.۳](#s3-3) |
+| `SESSION_EXPIRED` | ERROR | صفحهٔ ورود دیده شد | `login_soroush.js` / `login_igap.js` → [§۲](#s2) |
+| `APP_NOT_LOADED` | ERROR | لیست گفت‌وگوها بارگذاری نشد (آی‌گپ) | شبکه/`web.igap.net` و سپس دامپ با `dump_dom.js` |
+| `CHANNEL_NOT_FOUND` | ERROR | هیچ راهبرد باز کردن چت تأیید نشد | `--channel-name` را بدهید؛ نام دقیق را از چپ‌ستون کپی کنید → [§۸.۵](#s8-5) |
+| `ATTACH_BUTTON_NOT_FOUND` | ERROR | دکمهٔ سنجاقک دیده نشد | وب‌کلاینت عوض شده → `dump_dom.js` و به‌روزرسانی `ATTACH_BTN` |
+| `ATTACH_MENU_NOT_OPEN` | ERROR | منو پس از کلیک باز نشد (سروش) | لایهٔ ripple/overlay → `click({force:true})` و تلاش مجدد |
+| `ATTACH_MENU_ITEM_NOT_FOUND` | ERROR | گزینهٔ Media/File در منو پیدا نشد | برچسب‌های واقعی را از `igap_attach_menu.jpg` یا `dump_dom.js` بگیرید |
+| `FILE_INJECT_FAILED` | ERROR | نه `filechooser` رخ داد نه `input[type=file]` | → [§۸.۹](#s8-9) |
+| `SEND_NOT_VERIFIED` | UNVERIFIED | فرایند ارسال اجرا شد، شاهدی پیدا نشد | → [§۸.۷](#s8-7) |
+| `TIMEOUT` | ERROR | یکی از انتظارها به کرانهٔ زمانی رسید | لاگ همان اجرا را ببینید تا مرحلهٔ گیرکرده معلوم شود |
+| `RUNTIME` | ERROR | خطای پیش‌بینی‌نشده | `log.step('FATAL: …')` در لاگ، stack کامل دارد |
+| `NO_RESULT` | ERROR | اسکریپت بدون ساخت نتیجه پایان یافت | باگ داخلی؛ لاگ را ضمیمهٔ گزارش کنید |
+
+**دستور خواندن آخرین نتیجهٔ هر پلتفرم**
+
+```bash
+APP=/home/file/public_html/s
+for p in soroush igap; do
+  echo "--- $p ---"
+  f=$(ls -t "$APP"/logs/send_${p}_*.log 2>/dev/null | head -1)
+  [ -n "$f" ] && tail -12 "$f"
+done
+```
+
+### ۸.۷ `UNVERIFIED` — ارسال شد ولی تأیید نشد <a id="s8-7"></a>
+
+این وضعیت عمداً **موفقیت گزارش نمی‌شود** (پایان «OK کاذب»). یعنی همهٔ مراحل اجرا شد ولی هیچ شاهدی از نشستن پیام در چت پیدا نشد.
+
+**سیگنال‌های تأیید**
+
+| پلتفرم | سیگنال‌ها (به ترتیب اولویت) |
+|---|---|
+| سروش‌پلاس | دیده‌شدن بریدهٔ متن (snippet) در ستون میانی ← رشد تعداد حباب‌های پیام ← تغییر پیش‌نمایش چت فعال در لیست ← خالی‌شدن composer |
+| آی‌گپ | دیده‌شدن متن در `#MiddleColumn` **و** بسته‌شدن مودال ← تغییر پیش‌نمایش سلول کانال ← بسته‌شدن مودال + رشد کارت‌های رسانه |
+
+**چک‌لیست تصمیم**
+
+```bash
+APP=/home/file/public_html/s
+# ۱) چه سیگنال‌هایی بررسی و رد شدند؟
+grep -E 'verified=|verification window' "$APP"/logs/send_soroush_*.log | tail -5
+
+# ۲) شاهد بصری
+ls -l "$APP"/last_media_send.jpg "$APP"/last_igap_send.jpg
+```
+
+| مشاهده | نتیجه‌گیری | اقدام |
+|---|---|---|
+| در اسکرین‌شات پیام **هست** | ارسال موفق بوده ولی سلکتورهای تأیید با DOM جدید نمی‌خوانند | **resend نکنید**؛ با `dump_dom.js` سلکتور تأیید را اصلاح کنید |
+| در اسکرین‌شات پیام **نیست** و مودال باز مانده | دکمهٔ ارسال مودال درست کلیک نشده | `MODAL_SEND` را بازبینی کنید؛ `Control+Enter` را تست کنید |
+| چت اشتباه باز شده | ناوبری شکست خورده | → [§۸.۵](#s8-5) |
+| صفحهٔ ورود/خالی است | session رفته | → [§۲](#s2) |
+
+> پیش از هر resend دستی، حتماً کانال مقصد را چک کنید؛ `UNVERIFIED` می‌تواند در عمل «ارسال موفق» باشد و resend به انتشار دوباره می‌انجامد ([§۸.۱](#s8-1)).
+
+### ۸.۸ کپشن رسانه در کانال دیده نمی‌شود <a id="s8-8"></a>
+
+**علت تاریخی** — کد قدیمی از `locator.isVisible({ timeout: 8000 })` استفاده می‌کرد. در Playwright 1.63 پارامتر `timeout` برای `isVisible` **deprecated و بی‌اثر** است؛ متد فوراً `false` برمی‌گرداند، بنابراین اسکریپت فکر می‌کرد مودال آماده نیست و کپشن را **بی‌صدا حذف** می‌کرد. نتیجه: رسانه بدون کپشن منتشر می‌شد.
+
+**رفع انجام‌شده**
+
+| جایگزین | کاربرد |
+|---|---|
+| `C.seen(locator, ms)` بر پایهٔ `waitFor({state:'visible'})` | تشخیص آماده‌شدن مودال و فیلد کپشن |
+| `C.waitUntil(fn, {timeout,interval})` | polling برای سیگنال‌های تأیید |
+| `C.firstVisible(page, [selectors])` | یافتن اولین عنصر **واقعاً دیده‌شده** از یک فهرست |
+| `C.insertText(page, text)` با `keyboard.insertText` | درج کپشن بدون Enter فیزیکی (Enter می‌تواند مودال را زودهنگام ببندد) |
+
+**تشخیص در لاگ**
+
+```bash
+APP=/home/file/public_html/s
+grep -nE 'modal shown|caption editor ready|WARNING: caption|WARNING: modal caption' "$APP"/logs/send_*.log | tail -10
+```
+
+اگر `caption editor ready: false` می‌بینید، سلکتور فیلد کپشن با DOM جدید نمی‌خواند؛ با `dump_dom.js` فیلدهای `contenteditable`/`textarea` را فهرست کنید و به آرایهٔ سلکتورهای کپشن اضافه کنید.
+
+### ۸.۹ منوی ضمیمه باز می‌شود ولی فایل تحویل داده نمی‌شود <a id="s8-9"></a>
+
+**علت‌ها**
+
+| علت | تشخیص |
+|---|---|
+| رویداد `filechooser` رخ نمی‌دهد (آیتم منو مستقیماً `input[type=file]` پنهان را trigger می‌کند) | در لاگ: `WARNING: input[type=file] fallback failed` غایب است ولی `filechooser` timeout شده |
+| کلیک اول توسط لایهٔ ripple بلعیده می‌شود (آی‌گپ) | در لاگ: `menu item not visible (attempt 1); re-clicking attach button` |
+| آیتم اشتباه از منو انتخاب شده (ایندکس موقعیتی در نسخهٔ قدیم) | برچسب واقعی منو در `igap_attach_menu.jpg` با مقدار لاگ `menu item matched:` مقایسه شود |
+
+**رفع انجام‌شده** — تزریق فایل اکنون دو مسیره است: نخست `page.waitForEvent('filechooser')` (۱۲ ثانیه) و در صورت عدم وقوع، `setInputFiles` روی آخرین `input[type="file"]` (که حتی اگر پنهان باشد کار می‌کند). اگر هر دو شکست بخورند، کد `FILE_INJECT_FAILED` برگردانده می‌شود — نه پیام خالی.
+
+```bash
+APP=/home/file/public_html/s
+# ورودی‌های فایل موجود در DOM را با دامپ ببینید
+sudo -u file /usr/bin/node "$APP/dump_dom.js" igap 2>&1 | grep -E 'input|editable' | head -20
+grep -nE 'file injected via|FILE_INJECT_FAILED' "$APP"/logs/send_*.log | tail -10
+```
+
 ---
 
 ## ۹. خودکارسازی (Cron / systemd)
@@ -1550,11 +1780,29 @@ flock -n /tmp/cron_sync.lock -c 'echo FREE' || echo "LOCKED — اجرای قب�
 
 ### ۹.۲ وابستگی‌های `cron_sync.sh` <a id="s9-2"></a>
 
+`cron_sync.sh` هم‌اکنون فایل آمادهٔ ریپو است و **دو حالت اجرا** دارد:
+
+| حالت | کی فعال می‌شود | وابستگی | مزیت |
+|---|---|---|---|
+| `cli` (پیش‌فرض) | وقتی `SYNC_BASE_URL` تنظیم **نشده** باشد | باینری PHP + `jq` + `flock` | بدون Apache، بدون `SECURITY_KEY`، بدون `ProxyTimeout` |
+| `http` | وقتی `SYNC_BASE_URL` در `.cron_env` باشد | `curl` + `jq` + `flock` + `.cron_key` | سازگار با استقرارهایی که PHP CLI ندارند |
+
 ```bash
 for c in curl jq flock sqlite3 node; do
   printf '%-10s ' "$c"; command -v "$c" || echo "MISSING 🔴"
 done
+# در حالت cli، باینری PHP هم لازم است:
+for c in ea-php83 ea-php82 ea-php81 php; do command -v "$c" && break; done
 ```
+
+**کدهای خروج `cron_sync.sh`**
+
+| کد | معنا |
+|---|---|
+| `0` | همه‌چیز سبز (یا صف خالی) |
+| `1` | خطای زیرساختی (PHP/JSON خالی/صف خوانده نشد) |
+| `3` | دست‌کم یک پست در همهٔ پلتفرم‌ها شکست خورد |
+| `4` | فقط موارد تعویق‌شده (`deferred`) وجود داشت → رسانه دانلود نشد ([§۳.۳](#s3-3)) |
 
 ```bash
 dnf install -y jq curl util-linux sqlite

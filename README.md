@@ -150,19 +150,34 @@ sequenceDiagram
 │
 ├── 🌐 لایه وب / ارکستراسیون
 │   ├── sync_manual.php          ← ⭐ نقطه ورود اصلی: داشبورد + ۳ اندپوینت AJAX
+│   ├── cli_run.php              ← ⭐ پل CLI: اجرای همان action ها بدون Apache (cron)
 │   ├── sync_daemon.php          ← جایگزین CLI: حلقه daemon با فاصله ۳۰ ثانیه (legacy)
-│   └── .htaccess                ← (باید ساخته شود) محافظت از state/profile ها
+│   └── .htaccess                ← محافظت از state/profile/اسکرین‌شات‌ها (لیست سفید)
 │
 ├── 🤖 لایه خودکارسازی مرورگر (Node.js + Playwright)
-│   ├── send_soroush.js          ← ارسال به سروش‌پلاس (متن + رسانه)
-│   ├── send_igap.js             ← ارسال به آی‌گپ (متن + رسانه)
+│   ├── lib/
+│   │   └── pw_common.js         ← ⭐ لایهٔ مشترک: parseArgs، RunLog، launchBrowser،
+│   │                               seen/waitUntil/firstVisible، emit، detectLoginPage
+│   ├── send_soroush.js          ← ارسال به سروش‌پلاس (متن + رسانه + تأیید ارسال)
+│   ├── send_igap.js             ← ارسال به آی‌گپ (متن + رسانه + تأیید ارسال)
 │   ├── login_soroush.js         ← ورود تعاملی و ساخت session سروش‌پلاس
+│   ├── login_igap.js            ← ⭐ ورود تعاملی و ساخت session آی‌گپ
 │   ├── restore_session.js       ← بازگردانی session از soroush_session.json
+│   ├── dump_dom.js              ← ⭐ دامپ DOM + استخراج کاندیدهای سلکتور
 │   ├── inspect_igap.js          ← ابزار تشخیص DOM فوتر composer آی‌گپ
 │   ├── inspect_attach.js        ← ابزار تشخیص منوی ضمیمه آی‌گپ
-│   ├── start_browser.sh         ← اجرای Chromium با remote debugging روی پورت ۹۲۲۲
+│   ├── start_browser.sh         ← Chromium با پروفایل پایدار (دیباگ فقط روی 127.0.0.1)
 │   ├── package.json             ← وابستگی: playwright ^1.63.0
 │   └── node_modules/            ← (git-ignored)
+│
+├── ⚙️ عملیات و نگهداری (Ops)
+│   ├── cron_sync.sh             ← ⭐ رانندهٔ خودکار: صف → ارسال → گزارش (CLI/HTTP)
+│   ├── smoke_test.sh            ← ⭐ آزمون پذیرش ۶ بخشی (محیط، سینتکس، شبکه، ارسال زنده)
+│   ├── acceptance.sh            ← پوشش جدول T-1..T-18 (همان smoke_test.sh)
+│   ├── health_check.sh          ← بررسی سلامت روزانه + هشدار به مدیر در بله
+│   ├── collect_diagnostics.sh   ← جمع‌آوری یکجای شواهد برای گزارش خطا
+│   ├── logrotate.conf           ← چرخش لاگ‌ها (کپی به /etc/logrotate.d/eitaa-sync)
+│   └── deploy/systemd/          ← eitaa-sync.{service,timer} و eitaa-health.{service,timer}
 │
 ├── 🧪 اسکریپت‌های تست مستقل
 │   ├── test.php                 ← تست پارسر ایتا روی هر کانال دلخواه (?ch=)
@@ -183,7 +198,9 @@ sequenceDiagram
 │   ├── last_igap_send.jpg       ← اسکرین‌شات پایانی send_igap.js
 │   ├── step1..3.jpg, step_filled.jpg   ← مراحل ورود سروش‌پلاس
 │   ├── igap_attach_menu.jpg, igap_popup_opened.jpg, igap_state.jpg
-│   ├── igap_dump.html           ← دامپ DOM آی‌گپ برای استخراج سلکتور
+│   ├── igap_dump.html, igap_dump.jpg   ← خروجی dump_dom.js برای استخراج سلکتور
+│   ├── igap_login_step1..4.jpg  ← مراحل ورود آی‌گپ (login_igap.js)
+│   ├── logs/                    ← لاگ هر اجرا: send_<platform>_<ts>_<pid>.log + cron_sync.log
 │   └── error_log                ← خطاهای PHP (توسط cPanel نوشته می‌شود)
 │
 └── 📚 مستندات
@@ -238,35 +255,66 @@ curl -s "https://your-domain/s/test.php?ch=shamimeashena" | head -40
 # ۶) ساخت session سروش‌پلاس (تعاملی — شماره موبایل و کد OTP لازم است)
 sudo -u file /usr/bin/node login_soroush.js
 
-# ۷) باز کردن داشبورد در مرورگر و کلیک روی «بررسی و شروع همگام‌سازی»
+# ۷) ساخت session آی‌گپ (تعاملی — همین الگو برای web.igap.net)
+sudo -u file /usr/bin/node login_igap.js
+
+# ۸) خودآزمون کامل محیط (بدون ارسال) و سپس با ارسال زندهٔ تستی
+sudo -u file bash smoke_test.sh
+sudo -u file bash smoke_test.sh --live
+
+# ۹) باز کردن داشبورد در مرورگر و کلیک روی «بررسی و شروع همگام‌سازی»
 #    https://your-domain/s/sync_manual.php?key=<SECURITY_KEY>
 ```
 
 ### اجرای دستی یک ارسال UserBot (خارج از داشبورد)
 
+> ⚠️ `--channel-name` اختیاری است ولی **قویاً توصیه می‌شود**: اسکریپت با آن
+> تأیید می‌کند که چتِ درست باز شده است. بدون آن، اگر جست‌وجو نتیجهٔ اشتباه
+> بدهد، پیام به چت دیگری می‌رود (ریشهٔ باگ اصلی این پروژه — §۱۲).
+
 ```bash
-# ارسال متن خالی به سروش‌پلاس
+# ارسال متن به سروش‌پلاس
 sudo -u file /usr/bin/node /home/file/public_html/s/send_soroush.js \
   --channel=shamimeashena1 \
+  --channel-name="شمیم آشنا" \
   --text="تست ارسال از خط فرمان"
 
-# ارسال تصویر + کپشن به آی‌گپ
+# ارسال تصویر + کپشن به آی‌گپ (--type نوع رسانه را صریح می‌کند)
 sudo -u file /usr/bin/node /home/file/public_html/s/send_igap.js \
   --channel=shamimeashena \
+  --channel-name="شمیم آشنا" \
   --text="تست رسانه" \
-  --file=/home/file/public_html/s/test_img.jpg
+  --file=/home/file/public_html/s/test_img.jpg \
+  --type=image
 ```
 
-خروجی موفق باید **دقیقاً** یک خط JSON روی stdout باشد:
+stdout **دقیقاً یک خط JSON** است (لاگ مرحله‌ای روی stderr و در `logs/` می‌رود):
 
 ```json
-{"status":"OK","message":"Media post dispatched successfully"}
+{"status":"OK","message":"Sent to iGap (modal-button)","verified":true,"proof":"snippet-in-chat","header":"شمیم آشنا","log":"/home/file/public_html/s/logs/send_igap_20260920_120000_31337.log"}
 ```
 
-و در صورت خطا روی stderr همراه با کد خروج `1`:
+سه حالت خروجی ممکن (کد خروج: `0` فقط برای `OK`):
 
-```json
-{"status":"ERROR","error":"Timeout 15000ms exceeded."}
+| `status` | معنا | کد خروج |
+|---|---|---|
+| `OK` | ارسال شد **و** صحت آن با یکی از سیگنال‌های تأیید راستی‌آزمایی شد (`proof`) | `0` |
+| `UNVERIFIED` | فرایند ارسال اجرا شد ولی تأیید نشد → **OK کاذب گزارش نمی‌شود** | `1` |
+| `ERROR` | خطای قطعی با `code` قابل اقدام (جدول کدها در [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md) §۸٫۶) | `1` |
+
+### اجرای چرخهٔ کامل بدون داشبورد (CLI)
+
+```bash
+# یک action را مستقیم با PHP CLI اجرا کنید (بدون Apache و بدون کلید)
+cd /home/file/public_html/s
+ACTION=get_pending php cli_run.php
+
+# بدنهٔ POST را از فایل بدهید (برای sync_single)
+printf '%s' '{"id":74124,"text":"تست","mediaUrl":null,"mediaType":"text"}' > /tmp/body.json
+ACTION=sync_single SYNC_BODY_FILE=/tmp/body.json php cli_run.php
+
+# کل چرخه: صف → ارسال → گزارش مدیریتی
+sudo -u file bash cron_sync.sh
 ```
 
 ---
@@ -286,10 +334,14 @@ sudo -u file /usr/bin/node /home/file/public_html/s/send_igap.js \
 | `RUBIKA_BOT_TOKEN` | *(محرمانه)* | توکن بات روبیکا |
 | `RUBIKA_CHANNEL_ID` | `@shamimeashena1` | کانال مقصد روبیکا |
 | `SOROUSH_CHANNEL_ID` | `shamimeashena1` | کانال مقصد سروش‌پلاس (بدون `@`) |
+| `SOROUSH_CHANNEL_NAME` | `شمیم آشنا` | **نام نمایشی** کانال سروش؛ معیار تأیید «باز شدن چت درست» (`--channel-name`) |
 | `SOROUSH_SCRIPT` | `/home/file/public_html/s/send_soroush.js` | مسیر مطلق اسکریپت Node |
 | `IGAP_CHANNEL_ID` | `shamimeashena` | کانال مقصد آی‌گپ |
+| `IGAP_CHANNEL_NAME` | `شمیم آشنا` | نام نمایشی کانال در لیست گفت‌وگوهای آی‌گپ (`--channel-name`) |
 | `IGAP_SCRIPT` | `/home/file/public_html/s/send_igap.js` | مسیر مطلق اسکریپت Node |
 | `NODE_BIN` | `/usr/bin/node` | باینری Node مورد استفاده در `shell_exec` |
+| `USERBOT_TIMEOUT_SEC` | `240` | کرانهٔ سخت هر اجرای UserBot (`timeout` دور subprocess) |
+| `MEDIA_MAX_RETRY` | `3` | سقف تلاش برای دانلود رسانه پیش از انتشار بدون رسانه ([`TROUBLESHOOTING.md`](TROUBLESHOOTING.md) §۳.۳) |
 
 > 🔒 **هشدار امنیتی:** توکن‌ها در حال حاضر hard-code هستند. پیش از هر استقرار عمومی، بخش «امنیت» در [`ARCHITECTURE.md`](ARCHITECTURE.md) §۹ و گام ۹ [`DEPLOYMENT.md`](DEPLOYMENT.md) را اجرا کنید (انتقال به `.env` / `config.local.php` و **چرخش توکن‌ها**، چون در تاریخ Git ثبت شده‌اند).
 
@@ -300,9 +352,27 @@ sudo -u file /usr/bin/node /home/file/public_html/s/send_igap.js \
 | متد | اندپوینت | ورودی | خروجی |
 |---|---|---|---|
 | `GET` | `sync_manual.php?action=get_pending&key=<KEY>` | — | `{success, lastSeenId, count, messages:[{id,text,mediaUrl,mediaType,fileName}]}` |
-| `POST` | `sync_manual.php?action=sync_single&key=<KEY>` | بدنهٔ JSON یک پیام | `{success, id, bale:{ok,info}, rubika:{ok,info}, soroush:{ok,info}, igap:{ok,info}}` |
+| `POST` | `sync_manual.php?action=sync_single&key=<KEY>` | بدنهٔ JSON یک پیام | `{success, id, media:{ok,info}, bale:{ok,info}, rubika:{ok,info}, soroush:{ok,info}, igap:{ok,info}}` |
 | `POST` | `sync_manual.php?action=send_report&key=<KEY>` | `{report:[string]}` | `{success:true}` |
 | `GET` | `sync_manual.php?key=<KEY>` (بدون action) | — | HTML داشبورد |
+
+**دو پاسخ ویژهٔ `sync_single`**
+
+| حالت | نمونه | رفتار |
+|---|---|---|
+| تعویق رسانه | `{"success":false,"deferred":true,"id":74125,"error":"MEDIA_DOWNLOAD_FAILED","reason":"TOKEN_EXPIRED_HTTP_403","attempt":1}` | **هیچ‌چیز منتشر نمی‌شود** و `last_msg_id` جلو نمی‌رود؛ در چرخهٔ بعد با لینک امضاشدهٔ تازه دوباره تلاش می‌شود |
+| انتشار بدون رسانه | `{"success":true,"media":{"ok":false,"info":"DROPPED_AFTER_3_TRIES:EMPTY_OR_PLACEHOLDER_BODY"}}` | پس از سقف تلاش‌ها فقط متن منتشر می‌شود و این اتفاق صریحاً در داشبورد، لاگ cron و گزارش مدیریتی ثبت می‌گردد |
+
+**اجرای همان action ها از CLI (بدون Apache و بدون کلید)**
+
+```bash
+cd /home/file/public_html/s
+ACTION=get_pending php cli_run.php
+printf '%s' '{"id":74124,"text":"تست"}' > /tmp/body.json
+ACTION=sync_single SYNC_BODY_FILE=/tmp/body.json php cli_run.php
+```
+
+> 🔴 `cli_run.php` با `.htaccess` از وب **مسدود** است؛ هرگز آن را در لیست سفید نگذارید.
 
 **معیار موفقیت هر پلتفرم:**
 
@@ -310,10 +380,10 @@ sudo -u file /usr/bin/node /home/file/public_html/s/send_igap.js \
 |---|---|
 | بله | `HTTP 200` **و** `response.ok === true` |
 | روبیکا | `HTTP 200` **و** `response.status === "OK"` |
-| سروش‌پلاس | JSON خروجی اسکریپت: `status === "OK"` |
-| آی‌گپ | JSON خروجی اسکریپت: `status === "OK"` |
+| سروش‌پلاس | JSON خروجی اسکریپت: `status === "OK"` **و** `verified === true` (حالت `UNVERIFIED` = شکست) |
+| آی‌گپ | JSON خروجی اسکریپت: `status === "OK"` **و** `verified === true` (حالت `UNVERIFIED` = شکست) |
 
-> نکته مهم: در `sync_single`، مقدار `last_msg_id` **صرف‌نظر از موفقیت یا شکست پلتفرم‌ها** به‌روزرسانی می‌شود. یعنی پستی که مثلاً فقط در آی‌گپ شکست بخورد، دوباره در صف قرار نمی‌گیرد و باید دستی resend شود (نگاه کنید به [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md) §۸).
+> نکته مهم: در `sync_single`، مقدار `last_msg_id` **صرف‌نظر از موفقیت یا شکست پلتفرم‌ها** به‌روزرسانی می‌شود (تنها استثنا: حالت `deferred` که هیچ‌چیز منتشر نشده است). یعنی پستی که مثلاً فقط در آی‌گپ شکست بخورد، دوباره در صف قرار نمی‌گیرد و باید دستی resend شود (نگاه کنید به [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md) §۸).
 
 ---
 
@@ -328,7 +398,14 @@ sudo -u file /usr/bin/node /home/file/public_html/s/send_igap.js \
 | `test_soroush.php` | `getMe` و `sendMessage` روی Bot API سروش‌پلاس | `curl "…/test_soroush.php"` |
 | `inspect_igap.js` | استخراج دکمه‌های فوتر composer و `input[type=file]` آی‌گپ | `node inspect_igap.js` |
 | `inspect_attach.js` | استخراج گزینه‌های منوی ضمیمه آی‌گپ | `node inspect_attach.js` |
-| `start_browser.sh` | Chromium با remote debugging (پورت ۹۲۲۲) برای دیباگ زنده | `bash start_browser.sh` |
+| `dump_dom.js` | دامپ کامل DOM + فهرست کاندیدهای سلکتور بر اساس کلمهٔ کلیدی | `node dump_dom.js igap` |
+| `start_browser.sh` | Chromium با پروفایل پایدار؛ پورت دیباگ فقط `127.0.0.1` | `bash start_browser.sh igap \| soroush [--headed]` |
+| `smoke_test.sh` | آزمون پذیرش ۶ بخشی (محیط، سینتکس، مجوز، شبکه، صف، ارسال زنده) | `bash smoke_test.sh [--live]` |
+| `acceptance.sh` | پوشش جدول آزمون T-1..T-18 (پوششی بر `smoke_test.sh`) | `bash acceptance.sh` |
+| `health_check.sh` | سلامت روزانهٔ زیرساخت + هشدار خودکار به مدیر در بله | `bash health_check.sh` |
+| `collect_diagnostics.sh` | جمع‌آوری یکجای شواهد (سیستم، مجوز، فرایند، state، شبکه، لاگ) | `bash collect_diagnostics.sh` |
+| `cli_run.php` | اجرای هر action از `sync_manual.php` در CLI (بدون Apache/کلید) | `ACTION=get_pending php cli_run.php` |
+| `cron_sync.sh` | چرخهٔ کامل خودکار: صف → ارسال → گزارش | `bash cron_sync.sh` |
 
 ---
 
@@ -351,6 +428,16 @@ sudo -u file /usr/bin/node /home/file/public_html/s/send_igap.js \
 | 2 | افزودن `parseNodeJsonOutput()` برای استخراج آخرین JSON معتبر از خروجی Node (هشدارهای Playwright/Chromium که با `2>&1` به stdout می‌آیند، قبلاً باعث `json_decode` ناموفق و badge «✕» کاذب می‌شدند) | 🐛 Bugfix | `sync_manual.php` |
 | 3 | افزودن `.gitignore` و خارج‌سازی `node_modules/`، پروفایل‌های مرورگر، `soroush_session.json`، `state.sqlite`، اسکرین‌شات‌های runtime و `error_log` از ردیابی Git (3844 → 17 فایل) | 🔒 امنیتی/بهداشت ریپو | `.gitignore` |
 | 4 | افزودن مجموعه مستندات تولیدی پنج‌گانه | 📚 Documentation | `README.md`, `ARCHITECTURE.md`, `DEPLOYMENT.md`, `PLAYWRIGHT_SPECS.md`, `TROUBLESHOOTING.md` |
+| 5 | **بازنویسی کامل موتور ارسال UserBot**: لایهٔ مشترک `lib/pw_common.js` (پارس آرگومان، لاگ ماندگار، راه‌اندازی مرورگر، انتظار شرطی، خروجی JSON) تا رفتار سروش‌پلاس و آی‌گپ یکسان و قابل اتکا شود | ♻️ Refactor | `lib/pw_common.js`, `send_soroush.js`, `send_igap.js` |
+| 6 | **رفع ریشهٔ «نمونه درست / تولید خراب»**: کوتیشن‌های واقعیِ باقی‌مانده در `--channel` باعث می‌شد آدرس `#@'shamimeashena1'` هرگز resolve نشود و پیام به چت اشتباه برود. اکنون (الف) `escapeshellarg()` مستقیم است و (ب) `parseArgs` هر کوتیشن جفت‌شدهٔ اطراف مقدار را حذف می‌کند | 🐛 Bugfix بحرانی | `lib/pw_common.js`, `sync_manual.php` |
+| 7 | **تأیید پس از ارسال**: موفقیت فقط با دیدن یکی از سیگنال‌ها (متن در چت، رشد تعداد پیام‌ها، تغییر پیش‌نمایش لیست، بسته‌شدن مودال) گزارش می‌شود؛ در غیر این صورت `UNVERIFIED` با کد خروج ۱ — پایان OK کاذب | ✨ قابلیت | `send_soroush.js`, `send_igap.js` |
+| 8 | **حذف `isVisible({timeout})`** (در Playwright 1.63 تایم‌اوت آن deprecated و بی‌اثر است و باعث می‌شد کپشن بی‌صدا حذف شود)؛ جایگزینی با `waitFor`/`waitUntil`/`seen` | 🐛 Bugfix | `lib/pw_common.js`, هر دو sender |
+| 9 | **پایان آبشار قفل Singleton**: حذف `process.exit()` داخل `catch` و استفاده از `process.exitCode` در `finally` تا `browser.close()` همیشه اجرا شود؛ به‌علاوه پاک‌سازی Singleton پیش و پس از اجرا و کرانهٔ `timeout 240` روی subprocess از سمت PHP | 🐛 Bugfix | هر دو sender, `sync_manual.php` |
+| 10 | **باز شدن چت درست با سه راهبرد** (لیست ← جست‌وجو ← hash در سروش‌پلاس؛ `data-list-item-id` ← `span:text-is` ← `:has-text` در آی‌گپ) همراه با تأیید نام کانال در هدر؛ کانال آی‌گپ دیگر سخت‌کد نیست (`--channel-name`, `--item-id`) | ✨ قابلیت | هر دو sender |
+| 11 | **تزریق فایل با دو مسیر** (رویداد `filechooser` و در نهایت `input[type="file"]` پنهان) + انتخاب آیتم منوی ضمیمه با آیکون/متن دوزبانه به‌جای ایندکس موقعیتی + `--type` صریح از لایهٔ scraping | 🐛 Bugfix | هر دو sender, `sync_manual.php` |
+| 12 | افزودن `login_igap.js` (ورود تعاملی آی‌گپ با قالب شمارهٔ ملی/بین‌المللی) و `dump_dom.js` (یافتن سلکتور جایگزین پس از تغییر وب‌کلاینت) | ✨ ابزار جدید | `login_igap.js`, `dump_dom.js` |
+| 13 | افزودن فایل‌های عملیاتی آمادهٔ اجرا: `cron_sync.sh` (حالت CLI بدون وابستگی به تایم‌اوت Apache)، `cli_run.php`، `smoke_test.sh`، `acceptance.sh`، `health_check.sh`، `collect_diagnostics.sh`، `logrotate.conf`، `.htaccess`، واحدهای `deploy/systemd/` | ⚙️ Ops | ۹ فایل جدید |
+| 14 | **رفع حفرهٔ امنیتی CDP**: `start_browser.sh` پیش‌تر `--remote-debugging-address=0.0.0.0` داشت (دسترسی کامل به session از بیرون)؛ اکنون فقط `127.0.0.1` و فقط پروفایل هدف را `pkill` می‌کند | 🔒 امنیتی | `start_browser.sh` |
 
 ---
 
@@ -359,3 +446,5 @@ sudo -u file /usr/bin/node /home/file/public_html/s/send_igap.js \
 - مسیرهای UserBot (سروش‌پلاس و آی‌گپ) به **رابط وب رسمی** این پیام‌رسان‌ها وابسته‌اند. هر به‌روزرسانی سمت آن‌ها ممکن است سلکتورهای DOM را باطل کند؛ در این صورت [`PLAYWRIGHT_SPECS.md`](PLAYWRIGHT_SPECS.md) §۸ (playbook بازسازی سلکتور) را دنبال کنید.
 - استفاده از حساب کاربری واقعی برای خودکارسازی، مشروط به رعایت **شرایط استفادهٔ هر پلتفرم** است. پیش از استقرار تولید، از انطباق قانونی آن اطمینان حاصل کنید.
 - لینک‌های رسانهٔ ایتا **امضاشده و زمان‌دار** هستند؛ فاصلهٔ زیاد بین `get_pending` و `sync_single` می‌تواند منجر به `HTTP 403` در دانلود رسانه شود.
+- برای رسانهٔ حجیم، نمای وب ایتا به‌جای `src` مستقیم پیام «حجم رسانه بالاست / مشاهده در ایتا» نشان می‌دهد؛ چنین پست‌هایی با خطای `MEDIA_URL_UNAVAILABLE` در صف می‌مانند و باید دستی منتشر شوند.
+- وضعیت `UNVERIFIED` به معنای «شکست قطعی» نیست، بلکه یعنی **شاهدی برای موفقیت پیدا نشد**. پیش از resend، اسکرین‌شات شاهد و فایل `logs/` همان اجرا را بررسی کنید تا پست دوباره (و دو بار) منتشر نشود.

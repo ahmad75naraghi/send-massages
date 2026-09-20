@@ -1,0 +1,14 @@
+# /etc/systemd/system/eitaa-health.service
+[Unit]
+Description=Eitaa sync stack health check
+
+[Service]
+Type=oneshot
+User=file
+Group=file
+Environment=HOME=/home/file
+Environment=SYNC_APP_DIR=/home/file/public_html/s
+ExecStart=/usr/bin/bash /home/file/public_html/s/health_check.sh
+TimeoutStartSec=600
+StandardOutput=append:/home/file/public_html/s/logs/health_service.log
+StandardError=append:/home/file/public_html/s/logs/health_service.log

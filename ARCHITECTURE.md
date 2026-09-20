@@ -86,12 +86,20 @@ flowchart LR
 
 | فایل | لایه | مسئولیت | وابستگی‌ها |
 |---|---|---|---|
-| `sync_manual.php` | ۱–۴ | داشبورد + روتر + همهٔ کلاینت‌های API + پل Node | `pdo_sqlite`, `curl`, `dom`, `mbstring`, `fileinfo` |
-| `send_soroush.js` | ۵ | خودکارسازی `web.splus.ir` | `playwright`, `fs`, `path` |
-| `send_igap.js` | ۵ | خودکارسازی `web.igap.net` | `playwright`, `fs`, `path` |
+| `sync_manual.php` | ۱–۴ | داشبورد + روتر + همهٔ کلاینت‌های API + پل Node (`runUserbot`) + سیاست تعویق رسانه | `pdo_sqlite`, `curl`, `dom`, `mbstring`, `fileinfo` |
+| `cli_run.php` | ۱ (CLI) | اجرای هر action از `sync_manual.php` بدون Apache و بدون کلید وب | PHP CLI |
+| `lib/pw_common.js` | ۵ (مشترک) | `parseArgs`، `RunLog`، `cleanSingletons`، `resolveChromium`، `launchBrowser`، `seen`/`waitUntil`/`firstVisible`، `insertText`، `emit`، `detectLoginPage` | `fs`, `path` |
+| `send_soroush.js` | ۵ | خودکارسازی `web.splus.ir` + تأیید ارسال | `playwright`, `lib/pw_common.js` |
+| `send_igap.js` | ۵ | خودکارسازی `web.igap.net` + تأیید ارسال | `playwright`, `lib/pw_common.js` |
 | `login_soroush.js` | ۵ (bootstrap) | ساخت session سروش‌پلاس با OTP تعاملی | `playwright`, `readline` |
+| `login_igap.js` | ۵ (bootstrap) | ساخت session آی‌گپ با OTP تعاملی (قالب `09…` و `+98…`) | `playwright`, `readline` |
 | `restore_session.js` | ۵ (bootstrap) | تزریق LocalStorage/SessionStorage/IndexedDB از فایل پشتیبان | `playwright`, `fs` |
+| `dump_dom.js` | ۵ (diagnostics) | دامپ DOM + استخراج کاندیدهای سلکتور بر پایهٔ کلمهٔ کلیدی | `playwright`, `lib/pw_common.js` |
 | `inspect_igap.js` / `inspect_attach.js` | ۵ (diagnostics) | استخراج سلکتور زنده از DOM | `playwright` |
+| `cron_sync.sh` | ۶ (ops) | چرخهٔ خودکار: صف → ارسال → گزارش (حالت CLI یا HTTP) | `bash`, `jq`, `flock`, PHP CLI یا `curl` |
+| `smoke_test.sh` / `acceptance.sh` | ۶ (ops) | آزمون پذیرش محیط + ارسال زندهٔ تستی | `bash`, `jq`, `curl` |
+| `health_check.sh` | ۶ (ops) | سلامت روزانه + هشدار به مدیر در بله | `bash`, PHP CLI |
+| `collect_diagnostics.sh` | ۶ (ops) | جمع‌آوری یکجای شواهد برای گزارش خطا | `bash`, `sqlite3`, `curl` |
 | `sync_daemon.php` | legacy | حلقهٔ daemon مستقل (Bale + Rubika فقط؛ سروش غیرفعال) | `pdo_sqlite`, `curl`, `dom` |
 | `test*.php`, `send_test.php` | diagnostics | تست‌های ایزولهٔ هر یکپارچگی | `curl`, `dom`, `gd` |
 
@@ -288,7 +296,10 @@ stateDiagram-v2
     CANDIDATE --> QUEUED : در بازهٔ مجاز
     QUEUED --> DOWNLOADING : شروع sync_single
     DOWNLOADING --> DISPATCHING : رسانه روی tmp آماده شد
-    DOWNLOADING --> DISPATCHING : بدون رسانه، فقط متن
+    DOWNLOADING --> DEFERRED : دانلود رسانه شکست خورد و شمار تلاش کمتر از MEDIA_MAX_RETRY است
+    DOWNLOADING --> MEDIA_DROPPED : پس از MEDIA_MAX_RETRY تلاش، فقط متن می‌ماند
+    DEFERRED --> QUEUED : چرخهٔ بعد، scrape تازه و لینک امضاشدهٔ جدید
+    MEDIA_DROPPED --> DISPATCHING : انتشار متن + گزارش صریح «رسانه حذف شد»
     DISPATCHING --> PARTIAL_OK : یک تا سه پلتفرم موفق
     DISPATCHING --> FULL_OK : هر چهار پلتفرم موفق
     DISPATCHING --> FULL_FAIL : هیچ پلتفرم موفق نشد
@@ -300,6 +311,8 @@ stateDiagram-v2
     COMMITTED --> [*]
 ```
 
+> **تغییر کلیدی:** حالت `DEFERRED` جدید است. پیش‌تر شکست دانلود رسانه **بی‌صدا** به «انتشار بدون رسانه» می‌انجامید و `last_msg_id` هم ارتقا می‌یافت (یعنی محتوای ناقص و غیرقابل بازگشت). اکنون پست در چنین حالتی منتشر نمی‌شود و `last_msg_id` جلو نمی‌رود؛ چون `get_pending` هر بار از ایتا scrape تازه می‌کند، لینک امضاشدهٔ جدید ساخته می‌شود و مورد خودترمیم است. سقف `MEDIA_MAX_RETRY` (پیش‌فرض ۳) از حلقهٔ بی‌پایان برای رسانه‌ای که هرگز لینک مستقیم ندارد جلوگیری می‌کند.
+
 ### ۵.۴ ناورداهای سیستم (Invariants)
 
 | # | ناواردا | تضمین‌کننده |
@@ -308,7 +321,12 @@ stateDiagram-v2
 | I-2 | یک `id` حداکثر یک‌بار به `sync_single` می‌رسد | فیلتر `id > lastSeenId` + UPSERT در پایان |
 | I-3 | صف حداکثر ۷ عضو دارد | `MAX_MESSAGES_LIMIT` + `array_slice($newMessages, -7)` |
 | I-4 | هیچ فایل موقتی روی دیسک نمی‌ماند | `@unlink($localFile)` پس از dispatch و همچنین داخل `downloadMedia()` در مسیر شکست |
-| I-5 | دو مرورگر هم‌زمان روی یک پروفایل اجرا نمی‌شوند | پاک‌سازی `Singleton*` + اجرای ترتیبی در `sync_single` |
+| I-5 | دو مرورگر هم‌زمان روی یک پروفایل اجرا نمی‌شوند | پاک‌سازی `Singleton*` + اجرای ترتیبی در `sync_single` + کرانهٔ `timeout 240` + `flock` در `cron_sync.sh` |
+| I-6 | پست رسانه‌دار **هرگز بی‌صدا** بدون رسانه منتشر نمی‌شود | یا `DEFERRED` (چیزی منتشر نمی‌شود) یا انتشار با `media.ok=false` و گزارش صریح در پاسخ، لاگ cron و گزارش مدیریتی |
+| I-7 | `OK` از UserBot تنها با شاهد تأیید صادر می‌شود | پنجرهٔ تأیید ۲۰ ثانیه‌ای (P-8) و در غیر این صورت `UNVERIFIED` |
+| I-8 | هر اجرای UserBot حداکثر ۲۴۰ ثانیه worker را اشغال می‌کند | `timeout` دور subprocess + `setDefaultTimeout(30s)` داخل صفحه |
+
+> ⚠️ **استثنای I-2:** در حالت `DEFERRED` یک `id` می‌تواند بیش از یک‌بار به `sync_single` برسد، ولی چون **هیچ‌چیز منتشر نشده** است، تکراری در کانال‌ها ایجاد نمی‌شود. شمارندهٔ `media_fail` این تکرارها را سقف می‌گذارد.
 
 ### ۵.۵ شکست ناواردا — حالت‌های لبه
 
@@ -316,7 +334,10 @@ stateDiagram-v2
 |---|---|---|
 | `last_msg_id = 0` (پایگاه دادهٔ تازه) | **همهٔ** پست‌های موجود در صفحهٔ ایتا جدید محسوب می‌شوند → ۷ پست آخر منتشر می‌شود | پیش از اولین اجرای تولید، مقدار اولیه را دستی ست کنید (§۵.۶) |
 | پست حذف‌شده در مبدأ | `id` هرگز دیده نمی‌شود؛ state جلو می‌زند و پست برای همیشه از دست می‌رود | resend دستی با اسکریپت‌های Node |
-| `sync_single` وسط اجرا می‌میرد (kill/تایم‌اوت) | `last_msg_id` ارتقا نمی‌یابد → پست در اجرای بعد **دوباره** ارسال می‌شود (احتمال تکرار در ۴ کانال) | اجتناب از اجرای هم‌زمان دو داشبورد |
+| `sync_single` وسط اجرا می‌میرد (kill/تایم‌اوت) | `last_msg_id` ارتقا نمی‌یابد → پست در اجرای بعد **دوباره** ارسال می‌شود (احتمال تکرار در ۴ کانال) | اجتناب از اجرای هم‌زمان دو داشبورد + `flock` در `cron_sync.sh` |
+| رسانهٔ پست در ایتا لینک مستقیم ندارد («حجم رسانه بالاست») | پس از ۳ تلاش، پست فقط متنی منتشر می‌شود و `media.info=DROPPED_AFTER_3_TRIES:EMPTY_OR_PLACEHOLDER_BODY` | انتشار دستی رسانه از طریق خود ایتا/کلاینت دسکتاپ |
+| لینک امضاشدهٔ رسانه منقضی شد (`403`) | پست `DEFERRED` می‌شود و در چرخهٔ بعد با لینک تازه تلاش می‌شود | فاصلهٔ بین `get_pending` و `sync_single` را کوتاه نگه دارید |
+| UserBot پیام را فرستاد ولی تأیید نشد (`UNVERIFIED`) | ممکن است resend باعث انتشار دوباره شود | پیش از resend کانال مقصد را چشمی بررسی کنید (اسکرین‌شات شاهد + `logs/`) |
 | اجرای هم‌زمان دو کاربر روی داشبورد | race روی UPSERT و قفل شدن پروفایل Chromium | `.htaccess`/IP allowlist یا `SECURITY_KEY` اختصاصی |
 
 ### ۵.۶ مقداردهی اولیهٔ state (جلوگیری از انتشار ۷ پست قدیمی)
@@ -472,51 +493,76 @@ $fileId = is_array($upRes['res']['data'] ?? null)
 
 ```mermaid
 flowchart LR
-    A["sendToSoroush()"] --> B["پاک‌سازی Singleton*<br/>(پیش از اجرا)"]
-    B --> C["ساخت دستور shell<br/>escapeshellarg() روی همهٔ آرگومان‌ها"]
+    A["sendToSoroush() / sendToIgap()<br/>= پوشش نازک runUserbot()"] --> A0{"text و file هر دو خالی؟"}
+    A0 -->|"بله"| A1["SKIP<br/>success=true, skipped=true"]
+    A0 -->|"خیر"| B["پاک‌سازی Singleton*<br/>(پیش از اجرا)"]
+    B --> C["ساخت دستور shell<br/>timeout 240 + escapeshellarg روی همهٔ آرگومان‌ها<br/>--channel --channel-name --text --file --type"]
     C --> D["shell_exec(cmd . ' 2>&1')"]
     D --> E["پاک‌سازی Singleton*<br/>(پس از اجرا)"]
     E --> F["parseNodeJsonOutput()"]
-    F --> G{"status === 'OK' ؟"}
-    G -->|"بله"| H["['success'=>true, 'message'=>...]"]
-    G -->|"خیر"| I["['success'=>false, 'message'=> error ?? raw output]"]
+    F --> G{"status"}
+    G -->|"OK"| H["success=true + verified + proof"]
+    G -->|"UNVERIFIED"| I["success=false + code=SEND_NOT_VERIFIED"]
+    G -->|"ERROR"| I2["success=false + [code] error + log"]
 ```
 
-**دستور ساخته‌شده (پس از اصلاح باگ `sprintf`):**
+**دستور ساخته‌شده (پس از اصلاح باگ `sprintf` و افزودن `timeout`/`--channel-name`/`--type`):**
 
 ```bash
-'/usr/bin/node' '/home/file/public_html/s/send_soroush.js' \
+timeout 240 '/usr/bin/node' '/home/file/public_html/s/send_soroush.js' \
   --channel='shamimeashena1' \
+  --channel-name='شمیم آشنا' \
   --text='❤️ سلام عزیزان جان! …' \
-  --file='/tmp/sync_66f1a2b3c4d5e_maghale.pdf' 2>&1
+  --file='/tmp/sync_66f1a2b3c4d5e_maghale.pdf' \
+  --type='document' 2>&1
 ```
+
+هر دو تابع `sendToSoroush()` و `sendToIgap()` اکنون پوشش نازکی بر یک `runUserbot()` مشترک‌اند؛ یعنی **یک** پیاده‌سازی برای زمان‌بندی، کرانهٔ زمانی، پاک‌سازی Singleton، پارس JSON و نگاشت وضعیت.
 
 > **باگ اصلاح‌شده:** نسخهٔ پیشین از `sprintf('\%s \%s --channel=\%s', escapeshellcmd(NODE_BIN), …)` استفاده می‌کرد. در PHP، `'\%s'` داخل single-quote به‌صورت **backslash خام + `%s`** تفسیر می‌شود؛ بنابراین خروجی sprintf با `\` آغاز می‌شد و backslash بلافاصله قبل از `'` تولیدشده توسط `escapeshellarg()` قرار می‌گرفت. نتیجه: `\'` در shell به معنای «نقل‌قول ادبی» است و **کل ساختار quoting به‌هم می‌ریخت** — آرگومان‌های چندکلمه‌ای و حاوی `\n` به‌درستی منتقل نمی‌شدند. نسخهٔ فعلی با الحاق مستقیم و `escapeshellarg()` روی همهٔ اجزا ساخته می‌شود.
 
 ### ۷.۲ قرارداد CLI اسکریپت‌های Node
 
+پارس آرگومان در `lib/pw_common.js` متمرکز است (یک پیاده‌سازی برای هر دو پلتفرم).
+
 | آرگومان | الزامی | پردازش |
 |---|---|---|
-| `--channel=<id>` | خیر (پیش‌فرض `shamimeashena1` در سروش) | `replace(/^@/, '')` |
+| `--channel=<id>` | برای سروش بله (راهبرد hash/جست‌وجو) | حذف `@` ابتدایی + حذف کوتیشن جفت‌شده |
+| `--channel-name=<نام>` | توصیه‌شده (معیار تأیید چت درست) | حذف کوتیشن جفت‌شده + حذف `"` و `\` پیش از ورود به سلکتور |
 | `--text=<string>` | خیر | ممکن است شامل `\n`، ایموجی و کاراکتر فارسی باشد |
-| `--file=<path>` | خیر | باید از قبل روی دیسک وجود داشته باشد (`fs.existsSync`) |
+| `--file=<path>` | خیر | باید از قبل روی دیسک وجود داشته باشد (`fs.existsSync`) وگرنه `FILE_MISSING` |
+| `--type=<mediaType>` | خیر | نوع رسانه از لایهٔ scraping؛ در نبود آن، حدس از پسوند |
+| `--item-id=<id>` | خیر (فقط آی‌گپ) | `data-list-item-id` سل کانال؛ env جایگزین: `SYNC_IGAP_ITEM_ID` |
 
 ```javascript
-const args = process.argv.slice(2);
-const getArg = (flag) => {
+const clean = (v) => {                      // دفاع در برابر کوتیشنِ باقی‌مانده از shell
+    let s = String(v == null ? '' : v).trim();
+    while (s.length >= 2 && ((s[0] === "'" && s[s.length-1] === "'") ||
+                             (s[0] === '"' && s[s.length-1] === '"'))) s = s.slice(1, -1).trim();
+    return s;
+};
+const get = (flag, def = null) => {
     const found = args.find(a => a.startsWith(`--${flag}=`));
-    return found ? found.split('=').slice(1).join('=') : null;
+    return found ? clean(found.split('=').slice(1).join('=')) : def;
 };
 ```
 
-> `split('=').slice(1).join('=')` عمداً انتخاب شده تا متن‌های حاوی `=` (مثل لینک‌های دارای query string) سالم بمانند.
+> `split('=').slice(1).join('=')` عمداً انتخاب شده تا متن‌های حاوی `=` (مثل لینک‌های دارای query string) سالم بمانند. `clean()` لایهٔ دفاع دوم در برابر باگ تاریخی quoting است ([`TROUBLESHOOTING.md`](TROUBLESHOOTING.md) §۸.۵).
 
 ### ۷.۳ قرارداد خروجی (Output Contract)
 
 | وضعیت | کانال | کد خروج | بدنه |
 |---|---|---|---|
-| موفق | `stdout` | `0` | `{"status":"OK","message":"Media post dispatched successfully"}` |
-| خطا | `stderr` (که با `2>&1` به stdout می‌پیوندد) | `1` | `{"status":"ERROR","error":"<پیام Playwright>"}` |
+| موفق تأییدشده | `stdout` | `0` | `{"status":"OK","message":"Sent to iGap (modal-button)","verified":true,"proof":"snippet-in-chat","header":"شمیم آشنا","log":"…/logs/send_igap_….log"}` |
+| ارسال بدون تأیید | `stdout` | `1` | `{"status":"UNVERIFIED","code":"SEND_NOT_VERIFIED","verified":false,…}` |
+| خطا | `stdout` | `1` | `{"status":"ERROR","code":"SESSION_EXPIRED","error":"…","log":"…"}` |
+| لاگ مرحله‌ای | `stderr` + `logs/send_<platform>_<ts>_<pid>.log` | — | `RunLog` — هرگز روی stdout نمی‌رود |
+
+سه ناواردا (invariant) در این قرارداد:
+
+1. stdout **دقیقاً یک خط** JSON است؛ حتی در خطای غیرمنتظره (`NO_RESULT`).
+2. `OK` تنها با دست‌کم یک شاهد تأیید صادر می‌شود (متن در چت، رشد تعداد پیام، تغییر پیش‌نمایش لیست، بسته‌شدن مودال).
+3. `process.exit()` داخل `catch` ممنوع است؛ `process.exitCode` در `finally` پس از `closeQuietly()` و `cleanSingletons()`.
 
 **چرا `parseNodeJsonOutput()` لازم است؟**
 Chromium و Playwright گاهی هشدارهایی مانند موارد زیر چاپ می‌کنند:
@@ -543,29 +589,39 @@ function parseNodeJsonOutput(string $output): ?array {
 
 ### ۷.۴ راه‌اندازی مرورگر
 
-هر دو اسکریپت از الگوی یکسانی استفاده می‌کنند:
+هر دو اسکریپت از `launchBrowser()` در `lib/pw_common.js` استفاده می‌کنند:
 
 ```javascript
-browser = await chromium.launchPersistentContext(userDataDir, {
-    executablePath: '/usr/bin/chromium-browser',   // Chromium سیستم، نه دانلود Playwright
+const { browser, page } = await C.launchBrowser({ chromium }, PROFILE_DIR, VIEWPORT, log);
+// معادل داخلی:
+cleanSingletons(profileDir, log);
+browser = await chromium.launchPersistentContext(profileDir, {
+    executablePath: resolveChromium(),      // SYNC_CHROMIUM_BIN ← /usr/bin/chromium-browser ← chromium ← google-chrome
     args: [
         '--no-sandbox',              // الزامی در cPanel (بدون user namespace)
         '--disable-setuid-sandbox',  // مکمل --no-sandbox
         '--disable-dev-shm-usage',   // جلوگیری از پر شدن /dev/shm (معمولاً ۶۴MB در cPanel)
-        '--disable-gpu'              // بدون GPU در سرور
+        '--disable-gpu',             // بدون GPU در سرور
+        '--disable-features=IsolateOrigins,site-per-process',
+        '--mute-audio'
     ],
-    headless: true,
-    viewport: { width: 1440, height: 900 },        // آی‌گپ: 1440×900 / سروش: 1280×720
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    headless: true,                  // با SYNC_HEADED=1 غیرheadless
+    viewport,                        // آی‌گپ: 1440×900 / سروش: 1280×720
+    locale: 'fa-IR', timezoneId: 'Asia/Tehran', ignoreHTTPSErrors: true
 });
+page.setDefaultTimeout(30000);
+page.setDefaultNavigationTimeout(60000);
+page.on('dialog', d => d.dismiss().catch(() => {}));   // alert بومی جریان را متوقف نکند
 ```
 
 | گزینه | چرا |
 |---|---|
 | `launchPersistentContext` | کوکی‌ها، LocalStorage و IndexedDB (که session پیام‌رسان در آن‌هاست) بین اجراها زنده می‌مانند |
-| `executablePath` | از دانلود ~۱۷۰ مگابایت مرورگر Playwright بی‌نیاز می‌کند و با Chromium نصب‌شده توسط EPEL هم‌تراز است |
+| `resolveChromium()` | مسیر باینری دیگر در هر فایل hard-code نیست؛ با یک متغیر محیطی یا نام‌های رایج جایگزین می‌شود |
 | `headless: true` | سرور بدون X11 است؛ جزئیات سازگاری در [`PLAYWRIGHT_SPECS.md`](PLAYWRIGHT_SPECS.md) §۶ |
-| `userAgent` ثابت | وب‌کلاینت‌های پیام‌رسان با UA ناشناخته ممکن است قابلیت‌ها را محدود کنند |
+| `userAgent` **override نمی‌شود** | نمونه‌های کاری پروژه (`inspect_*.js`) بدون override موفق بودند؛ UA ثابتِ قدیمی با نسخهٔ واقعی Chromium ناهمخوان بود. فقط با `SYNC_USER_AGENT` فعال می‌شود |
+| `setDefaultTimeout(30s)` | هیچ `waitFor`/`click` ای بی‌پایان منتظر نمی‌ماند؛ کرانهٔ بیرونی `timeout 240` سمت PHP است |
+| `locale`/`timezoneId` | زبان UI و زمان‌نگارش پیام‌ها با حساب کاربر هم‌تراز می‌شود |
 
 ### ۷.۵ مدیریت قفل Singleton
 
@@ -599,6 +655,19 @@ find /home/file/public_html/s -maxdepth 2 -name 'Singleton*' -delete
 ```
 
 > **علت ریشه‌ای `Permission denied (13)`**: اگر حتی یک‌بار اسکریپت را با `root` اجرا کرده باشید، فایل‌های `Singleton*` با مالکیت `root:root` ساخته می‌شوند. کاربر وب‌سرور (`file`) نمی‌تواند آن‌ها را حذف کند و حتی با پاک‌سازی خودکار هم به بن‌بست می‌رسد. **هرگز اسکریپت‌ها را با root اجرا نکنید**؛ همیشه `sudo -u file`.
+
+**لایهٔ پنجم — پایان ایمن فرایند (P-9):** اگر `process.exit()` داخل `catch` صدا زده شود، `finally` نیمه‌کاره می‌ماند: کرومیوم زنده می‌ماند، `Singleton*` پاک نمی‌شود و اجرای بعدی با `Permission denied (13)` شکست می‌خورد. این همان «آبشار قفل» بود که یک شکست گذرا را به چندین شکست پیاپی تبدیل می‌کرد. اکنون:
+
+```javascript
+} finally {
+    await C.closeQuietly(browser, log);     // هرگز استثنا پرتاب نمی‌کند
+    C.cleanSingletons(PROFILE_DIR, log);
+    C.emit(result || { status: 'ERROR', code: 'NO_RESULT', error: 'بدون نتیجه' });
+    process.exitCode = exitCode;            // نه process.exit()
+}
+```
+
+کرانهٔ `timeout 240` سمت PHP آخرین دفاع است: اگر Node به هر دلیل گیر کرد، subprocess کشته می‌شود و پاک‌سازی Singleton پس از `shell_exec` اجرا می‌گردد.
 
 ---
 
@@ -811,18 +880,18 @@ Options -Indexes
 
 ## ۱۱. بدهی فنی و نقشه راه <a id="s11"></a>
 
-| # | مورد | اثر | پیشنهاد | اولویت |
-|---|---|---|---|---|
-| D-1 | پارامتر بی‌استفادهٔ `$isMultipart` در `callApi()` | گمراه‌کننده برای توسعه‌دهندهٔ بعدی | حذف یا اعمال واقعی (ساخت مرز multipart دستی) | کم |
-| D-2 | همگرایی ناموفق `sync_daemon.php` با `sync_manual.php` (اولویت رسانه، `sendPhoto` روبیکا به‌جای pipeline سه‌مرحله‌ای، فقط تصویر) | دو رفتار متفاوت برای یک دامنه | حذف daemon یا بازنویسی آن به‌عنوان consumer مشترک از همان توابع | متوسط |
-| D-3 | نبود جدول لاگ | عدم امکان resend خودکار پست‌های شکست‌خورده | افزودن `sync_log` + اندپوینت `?action=retry_failed` | **بالا** |
-| D-4 | اجرای ترتیبی سروش و آی‌گپ | ~۳۰s اتلاف برای هر پست رسانه‌دار | اجرای موازی با پروفایل‌های جداگانه (هر دو هم‌زمان ممکن است چون `user-data-dir` متفاوت است) با `proc_open` | متوسط |
-| D-5 | `delay()` های ثابت به‌جای `waitForSelector` | شکنندگی روی سرور کند + اتلاف زمان روی سرور سریع | جایگزینی با `page.waitForLoadState` / انتظار صریح روی سلکتور | **بالا** |
-| D-6 | سلکتور سخت‌کدشدهٔ آی‌گپ `data-list-item-id="16200343869985976"` | با تغییر کانال یا به‌روزرسانی UI می‌شکند | انتقال به فایل پیکربندی + fallback بر اساس متن | متوسط |
-| D-7 | `SECURITY_KEY` و توکن‌ها در کد | ریسک امنیتی §۹ | §۹.۲ | **بحرانی** |
-| D-8 | `CURLOPT_SSL_VERIFYPEER = false` | ریسک MITM | `dnf install ca-certificates && update-ca-trust` سپس `true` | متوسط |
-| D-9 | نبود health check خودکار | خرابی session تا اجرای دستی کشف نمی‌شود | cron سلامت (§۸ [`DEPLOYMENT.md`](DEPLOYMENT.md)) با هشدار به `BALE_ADMIN_CHAT_ID` | **بالا** |
-| D-10 | نبود تست خودکار | رگرسیون سلکتورها دیر کشف می‌شود | افزودن `smoke_test.sh` که فقط متن تستی به یک کانال موقت می‌فرستد | متوسط |
+| # | مورد | اثر | پیشنهاد | اولویت | وضعیت در این نسخه |
+|---|---|---|---|---|---|
+| D-1 | پارامتر بی‌استفادهٔ `$isMultipart` در `callApi()` | گمراه‌کننده برای توسعه‌دهندهٔ بعدی | حذف یا اعمال واقعی (ساخت مرز multipart دستی) | کم | ⏳ باز |
+| D-2 | همگرایی ناموفق `sync_daemon.php` با `sync_manual.php` (اولویت رسانه، `sendPhoto` روبیکا به‌جای pipeline سه‌مرحله‌ای، فقط تصویر) | دو رفتار متفاوت برای یک دامنه | حذف daemon یا بازنویسی آن به‌عنوان consumer مشترک از همان توابع | متوسط | ⏳ باز — تا زمانی که `sync_daemon.php` حذف نشده، فقط `sync_manual.php` + `cli_run.php` مسیر پشتیبانی‌شده است |
+| D-3 | نبود جدول لاگ | عدم امکان resend خودکار پست‌های شکست‌خورده | افزودن `sync_log` + اندپوینت `?action=retry_failed` | **بالا** | 🟡 بخشی — جدول `media_fail` و لاگ ماندگار هر اجرای Node (`logs/send_<platform>_<ts>_<pid>.log`) اضافه شد؛ `sync_log` کامل و `retry_failed` باقی است |
+| D-4 | اجرای ترتیبی سروش و آی‌گپ | ~۳۰s اتلاف برای هر پست رسانه‌دار | اجرای موازی با پروفایل‌های جداگانه (هر دو هم‌زمان ممکن است چون `user-data-dir` متفاوت است) با `proc_open` | متوسط | ⏳ باز — کرانهٔ `timeout 240` ریسک گیرکردن را کم کرده ولی اتلاف زمانی پابرجاست |
+| D-5 | `delay()` های ثابت به‌جای `waitForSelector` | شکنندگی روی سرور کند + اتلاف زمان روی سرور سریع | جایگزینی با `page.waitForLoadState` / انتظار صریح روی سلکتور | **بالا** | ✅ رفع شد — `seen()`/`waitUntil()`/`firstVisible()` در همهٔ نقاط حساس (مودال، کپشن، منو، تأیید)؛ چند `delay` کوتاه فقط برای hydrate باقی است |
+| D-6 | سلکتور سخت‌کدشدهٔ آی‌گپ `data-list-item-id="16200343869985976"` | با تغییر کانال یا به‌روزرسانی UI می‌شکند | انتقال به فایل پیکربندی + fallback بر اساس متن | متوسط | ✅ رفع شد — `--item-id`/`--channel-name` + متغیرهای محیطی + سه راهبرد با تأیید هدر |
+| D-7 | `SECURITY_KEY` و توکن‌ها در کد | ریسک امنیتی §۹ | §۹.۲ | **بحرانی** | ⏳ باز — الگوی `config.local.php` در §۹.۲ آماده است؛ چرخش توکن‌های نشت‌کرده همچنان ضروری است |
+| D-8 | `CURLOPT_SSL_VERIFYPEER = false` | ریسک MITM | `dnf install ca-certificates && update-ca-trust` سپس `true` | متوسط | ⏳ باز |
+| D-9 | نبود health check خودکار | خرابی session تا اجرای دستی کشف نمی‌شود | cron سلامت (§۸ [`DEPLOYMENT.md`](DEPLOYMENT.md)) با هشدار به `BALE_ADMIN_CHAT_ID` | **بالا** | ✅ رفع شد — `health_check.sh` با ۲۵+ بررسی و هشدار خودکار به مدیر + `deploy/systemd/eitaa-health.timer` |
+| D-10 | نبود تست خودکار | رگرسیون سلکتورها دیر کشف می‌شود | افزودن `smoke_test.sh` که فقط متن تستی به یک کانال موقت می‌فرستد | متوسط | ✅ رفع شد — `smoke_test.sh` (۶ بخش، با `--live` برای ارسال واقعی) و پوشش `acceptance.sh` |
 
 ---
 

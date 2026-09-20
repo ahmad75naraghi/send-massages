@@ -10,6 +10,9 @@
 !.env.example
 config.local.php
 secrets.php
+.cron_env
+.cron_key
+*.token
 *_token*
 *.pem
 *.key
@@ -48,6 +51,12 @@ igap_popup_opened.jpg
 igap_state.jpg
 igap_dump.html
 *_dump.html
+*_dump.jpg
+*_dump.png
+igap_login_step*.jpg
+soroush_login_step*.jpg
+diag_assets_*/
+diag_*.txt
 screenshot*.png
 
 # --- ۶. لاگ‌ها ---
@@ -60,6 +69,7 @@ logs/
 # این الگوها فقط برای حالتی است که TMPDIR به داخل پروژه نگاشت شود.
 tmp/
 temp/
+.tmp_run/
 media_cache/
 /tmp/sync_*
 /tmp/eitaa_media_*

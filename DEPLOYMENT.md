@@ -436,42 +436,44 @@ rollingTimeout 600
 
 ### ۶.۳ محافظت از مسیر با `.htaccess`
 
-فایل `/home/file/public_html/s/.htaccess` را بسازید:
+فایل `.htaccess` **آماده در ریپو** است؛ آن را در مسیر استقرار کپی کنید. منطقش «همه‌چیز بسته، مگر آنچه صریحاً باز شده» است:
 
 ```apache
 Options -Indexes -ExecCGI
 
-# ۱) مسدودسازی هر چیزی که اعتبارنامه یا state است
-<FilesMatch "\.(sqlite|sqlite3|sqlite-journal|sqlite-wal|json|log|sh|ini|env|key|pem)$">
-    Require all denied
-</FilesMatch>
+# ۱) پیش‌فرض: همه‌چیز بسته
+Require all denied
 
-# ۲) مسدودسازی دامپ DOM و اسکرین‌شات‌های شاهد
-<FilesMatch "\.(jpg|jpeg|png|html)$">
-    Require all denied
-</FilesMatch>
-
-# ۳) باز کردن صریح فقط نقاط ورود مجاز
+# ۲) فقط نقاط ورود مجاز وب باز می‌شوند
 <FilesMatch "^(sync_manual|test|test_rubika|test_rubika_media|test_soroush|send_test)\.php$">
     Require all granted
 </FilesMatch>
 
-# ۴) محدودسازی IP داشبورد (اختیاری اما اکیداً توصیه‌شده)
+# ۳) محدودسازی IP داشبورد (اکیداً توصیه‌شده؛ IP خود را جایگزین کنید)
 # <Files "sync_manual.php">
 #     Require ip 203.0.113.45
-#     Require ip 198.51.100.0/24
 # </Files>
+
+# ۴) اجرای PHP و دسترسی به دایرکتوری‌های داده کاملاً ممنوع
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+    RewriteRule ^(lib|logs|backups|soroush_profile|igap_profile)/ - [F,L]
+    RewriteRule \.(sqlite|sqlite3|sqlite-journal|sqlite-wal|json|log|sh|env|ini|key|pem|jpg|jpeg|png|html)$ - [F,L,NC]
+</IfModule>
 
 <IfModule mod_headers.c>
     Header set X-Robots-Tag "noindex, nofollow, noarchive, nosnippet"
     Header set Referrer-Policy "no-referrer"
     Header set X-Content-Type-Options "nosniff"
+    Header set X-Frame-Options "DENY"
 </IfModule>
 
 <IfModule mod_expires.c>
     ExpiresActive Off
 </IfModule>
 ```
+
+> 🔴 **نکتهٔ حیاتی:** `cli_run.php` عمداً در لیست سفید **نیست**. این فایل `SECURITY_KEY` را نمی‌پرسد (فقط برای اجرای CLI طراحی شده) و اگر از وب قابل دسترس باشد، هر کسی می‌تواند `sync_single` را صدا بزند. با `Require all denied` پیش‌فرض، بسته است؛ آن را هرگز باز نکنید.
 
 ```bash
 chown file:file /home/file/public_html/s/.htaccess
@@ -483,7 +485,7 @@ chmod 644 /home/file/public_html/s/.htaccess
 ```bash
 BASE="https://your-domain/s"
 for u in state.sqlite soroush_session.json igap_dump.html step2.jpg last_igap_send.jpg \
-         send_soroush.js start_browser.sh error_log; do
+         send_soroush.js start_browser.sh error_log cli_run.php cron_sync.sh lib/pw_common.js logs/cron_sync.log; do
   printf '%-28s → %s\n' "$u" "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/$u")"
 done
 ```
@@ -621,91 +623,49 @@ sudo -u file /usr/bin/node login_soroush.js
   pkill -f 'remote-debugging-port=9222'
   ```
 
-> 🔴 `start_browser.sh` موجود در ریپو از `--remote-debugging-address=0.0.0.0` استفاده می‌کند. **پروتکل CDP هیچ احراز هویتی ندارد** و باز بودن آن روی همهٔ اینترفیس‌ها یعنی کنترل کامل حساب کاربری شما از اینترنت. پیش از هر اجرای production آن را به `127.0.0.1` تغییر دهید و پورت را در فایروال ببندید:
+> ✅ **رفع شد:** `start_browser.sh` موجود در ریپو اکنون `--remote-debugging-address=127.0.0.1` دارد (نسخهٔ پیشین `0.0.0.0` بود و **CDP هیچ احراز هویتی ندارد**، یعنی کنترل کامل حساب کاربری از اینترنت). همچنین هدف (`soroush`/`igap`) پارامتری شده و فقط کرومیومِ همان پروفایل بسته می‌شود. پورت را همچنان در فایروال ببندید و تأیید کنید:
 > ```bash
-> sed -i 's/--remote-debugging-address=0.0.0.0/--remote-debugging-address=127.0.0.1/' start_browser.sh
-> csf -d 9222 "CDP debug port - blocked" && csf -r    # یا: firewall-cmd --permanent --remove-port=9222/tcp
-> ss -lntp | grep 9222                                  # باید خالی یا فقط 127.0.0.1 باشد
+> grep -n 'remote-debugging-address' start_browser.sh      # باید 127.0.0.1 باشد
+> csf -d 9222 "CDP debug port - blocked" && csf -r         # یا: firewall-cmd --permanent --remove-port=9222/tcp
+> ss -lntp | grep 9222                                     # باید خالی یا فقط 127.0.0.1 باشد
 > ```
+> برای دیباگ از راه دور به‌جای باز کردن پورت، تونل SSH بزنید: `ssh -L 9222:127.0.0.1:9222 file@server`.
 
 ### ۸.۲ آی‌گپ (اسکریپت ورود)
 
-ریپو فعلی اسکریپت ورود اختصاصی آی‌گپ ندارد؛ `igap_profile/` باید یک‌بار به‌صورت دستی مقداردهی شود. اسکریپت زیر را در `/home/file/public_html/s/login_igap.js` ذخیره کنید (الگویی دقیقاً مشابه `login_soroush.js`، متناسب با `web.igap.net`):
-
-```javascript
-// login_igap.js — ورود تعاملی به آی‌گپ و ساخت igap_profile
-const { chromium } = require('playwright');
-const readline = require('readline').createInterface({ input: process.stdin, output: process.stdout });
-const question = (q) => new Promise(r => readline.question(q, r));
-const delay = (ms) => new Promise(r => setTimeout(r, ms));
-
-(async () => {
-    const userDataDir = '/home/file/public_html/s/igap_profile';
-
-    const browser = await chromium.launchPersistentContext(userDataDir, {
-        executablePath: '/usr/bin/chromium-browser',
-        args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
-        headless: true,
-        viewport: { width: 1440, height: 900 },
-        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    });
-
-    const page = browser.pages()[0] || await browser.newPage();
-    console.log('[*] Opening https://web.igap.net ...');
-    await page.goto('https://web.igap.net', { waitUntil: 'domcontentloaded', timeout: 60000 });
-    await delay(8000);
-    await page.screenshot({ path: '/home/file/public_html/s/igap_login_step1.jpg' });
-
-    // ۱) شماره موبایل
-    const phone = (await question('=> شماره موبایل (مثلاً 09123456789): ')).trim();
-    const phoneInput = page.locator('input[type="tel"], input[placeholder*="موبایل"], input[placeholder*="شماره"], input').first();
-    await phoneInput.waitFor({ state: 'visible', timeout: 15000 });
-    await phoneInput.click({ force: true });
-    await phoneInput.fill(phone);
-    await delay(800);
-    await page.screenshot({ path: '/home/file/public_html/s/igap_login_step2.jpg' });
-
-    // ۲) دکمهٔ ادامه / ورود
-    const nextBtn = page.locator('button:has-text("ادامه"), button:has-text("ورود"), button[type="submit"]').first();
-    await nextBtn.click({ force: true });
-    console.log('[*] Waiting for OTP step...');
-    await delay(6000);
-    await page.screenshot({ path: '/home/file/public_html/s/igap_login_step3.jpg' });
-    console.log('[!] اسکرین‌شات: igap_login_step3.jpg (با scp منتقل کنید)');
-
-    // ۳) کد تأیید
-    const otp = (await question('=> کد تأیید دریافتی: ')).trim();
-    const otpInput = page.locator('input').first();
-    await otpInput.click({ force: true });
-    await page.keyboard.type(otp, { delay: 120 });
-    await delay(15000);
-    await page.screenshot({ path: '/home/file/public_html/s/igap_login_step4.jpg' });
-
-    // ۴) تأیید حضور کانال هدف در لیست
-    const channel = page.locator('span:has-text("شمیم آشنا"), div[data-list-item-id="16200343869985976"]').first();
-    const visible = await channel.isVisible().catch(() => false);
-    console.log(visible
-        ? '[+] ورود موفق — کانال هدف در لیست دیده شد.'
-        : '[!] ورود احتمالاً موفق بوده اما کانال هدف در لیست دیده نشد؛ اسکرین‌شات step4 را بررسی کنید.');
-
-    await browser.close();
-    readline.close();
-})();
-```
-
-اجرا:
+اسکریپت `login_igap.js` **آماده در ریپو** است و از `lib/pw_common.js` استفاده می‌کند (پاک‌سازی `Singleton*`، یافتن خودکار باینری کرومیوم، لاگ در `logs/`، پایان ایمن در `finally`).
 
 ```bash
 cd /home/file/public_html/s
 chown file:file login_igap.js && chmod 644 login_igap.js
+
 sudo -u file /usr/bin/node login_igap.js
+# روی ماشین دارای نمایشگر (اختیاری — دیدن پنجرهٔ مرورگر):
+SYNC_HEADED=1 sudo -u file --preserve-env=SYNC_HEADED /usr/bin/node login_igap.js
 ```
+
+**جریان اجرا**
+
+| گام | کار | خروجی |
+|---|---|---|
+| ۰ | باز کردن `https://web.igap.net` و بررسی session فعلی | اگر `#LeftColumn div[aria-haspopup="true"]` دیده شود ⇒ «session فعال است» و پایان |
+| ۱ | پرسیدن شمارهٔ موبایل از ترمینال + اعتبارسنجی قالب `09xxxxxxxxx` | `igap_login_step2.jpg` |
+| ۲ | کلیک «ادامه/ورود»؛ اگر صفحهٔ کد تأیید نیامد، تلاش مجدد با قالب `+989xxxxxxxxx` | `igap_login_step3.jpg` |
+| ۳ | پرسیدن کد OTP و تایپ آن در اولین فیلد مرئی (`firstVisible`) | — |
+| ۴ | تأیید موفقیت با دیده‌شدن لیست گفت‌وگوها (تا ۳۰ ثانیه) | `igap_login_step4.jpg` + دستور پشتیبان‌گیری |
+
+کد خروج `0` یعنی ورود موفق و `1` یعنی ناموفق؛ لاگ کامل در `logs/send_igap_login_<ts>_<pid>.log` است.
 
 سپس اسکرین‌شات‌ها را ببینید و صحت ورود را تأیید کنید:
 
 ```bash
 scp file@server:/home/file/public_html/s/igap_login_step*.jpg ./
+ls -l /home/file/public_html/s/igap_profile/Default/Cookies   # باید وجود داشته باشد
 ```
+
+> ⚠️ **یک‌بار ورود، چندین بار استفاده.** هر ورود تازه از IP جدید ممکن است هشدار امنیتی «ورود جدید به حساب کاربری» برای کاربر بفرستد و در صورت تأیید نکردن، session باطل شود. بلافاصله پس از ورود موفق، پشتیبان §۸.۳ را بگیرید.
+
+> 💡 اگر کانال مقصد شما «شمیم آشنا» نیست، پس از ورود نام دقیق کانال را از لیست گفت‌وگوها یادداشت کنید و در `sync_manual.php` مقدار `IGAP_CHANNEL_NAME` (و در صورت نیاز `SYNC_IGAP_ITEM_ID`) را تنظیم نمایید.
 
 ### ۸.۳ پشتیبان‌گیری و بازگردانی session
 
@@ -771,114 +731,64 @@ chmod 660 state.sqlite && chown file:file state.sqlite
 
 ## ۹. اتوماسیون: Cron و Systemd <a id="s9"></a>
 
-داشبورد وب برای اجرای **دستی** است. برای اجرای خودکار، از اسکریپت زیر استفاده کنید که دقیقاً همان سه اندپوینت را با `curl` صدا می‌زند.
+داشبورد وب برای اجرای **دستی** است. برای اجرای خودکار، اسکریپت `cron_sync.sh` (آماده در ریپو) دقیقاً همان سه اندپوینت را به‌ترتیب صدا می‌زند — یا مستقیم با PHP CLI (بدون Apache) یا با `curl`.
 
 ### ۹.۱ `cron_sync.sh`
 
+این فایل **آماده در ریپو** است (`cron_sync.sh` + `cli_run.php`)؛ نیازی به ساخت دستی نیست:
+
 ```bash
-cat > /home/file/public_html/s/cron_sync.sh <<'SCRIPT'
-#!/usr/bin/env bash
-# ============================================================
-#  cron_sync.sh — رانندهٔ بدون مرورگر برای sync_manual.php
-#  get_pending → sync_single (×N) → send_report
-# ============================================================
-set -uo pipefail
+cd /home/file/public_html/s
+chown file:file cron_sync.sh cli_run.php
+chmod 750 cron_sync.sh cli_run.php
 
-APP_DIR="/home/file/public_html/s"
-BASE_URL="https://file.falnic.com/s/sync_manual.php"   # ← دامنهٔ خود
-KEY_FILE="${APP_DIR}/.cron_key"
-LOG_DIR="${APP_DIR}/logs"
-LOG_FILE="${LOG_DIR}/cron_sync.log"
-LOCK_FILE="/tmp/cron_sync.lock"
-
-export HOME="/home/file"
-export LANG="en_US.UTF-8"                              # برای نام فایل‌های فارسی ضروری است
-export LC_ALL="en_US.UTF-8"
-
-mkdir -p "$LOG_DIR"
-log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$LOG_FILE"; }
-
-# --- قفل اجرای یکتا (جلوگیری از هم‌پوشانی دو اجرای هم‌زمان) ---
-exec 9>"$LOCK_FILE"
-if ! flock -n 9; then
-  log "SKIP: اجرای قبلی هنوز در جریان است"
-  exit 0
-fi
-
-if [[ ! -r "$KEY_FILE" ]]; then
-  log "FATAL: فایل کلید $KEY_FILE وجود ندارد یا خواندنی نیست"
-  exit 1
-fi
-KEY="$(tr -d '\n\r' <"$KEY_FILE")"
-
-# --- ۱) دریافت صف ---
-PENDING="$(curl -sS --max-time 60 "${BASE_URL}?action=get_pending&key=${KEY}" 2>>"$LOG_FILE")"
-if [[ -z "$PENDING" ]]; then
-  log "ERROR: پاسخ خالی از get_pending (تایم‌اوت یا خطای Apache)"
-  exit 1
-fi
-if [[ "$(jq -r '.success // false' <<<"$PENDING")" != "true" ]]; then
-  log "ERROR: get_pending → $(jq -r '.error // "نامشخص"' <<<"$PENDING")"
-  exit 1
-fi
-
-COUNT="$(jq -r '.count // 0' <<<"$PENDING")"
-if [[ "$COUNT" -eq 0 ]]; then
-  log "OK: پیام جدیدی نیست (lastSeenId=$(jq -r '.lastSeenId' <<<"$PENDING"))"
-  exit 0
-fi
-log "START: ${COUNT} پست جدید"
-
-# --- ۲) پردازش ترتیبی هر پست ---
-FAIL=0
-REPORT=""
-for ((i = 0; i < COUNT; i++)); do
-  PAYLOAD="$(jq -c ".messages[$i]" <<<"$PENDING")"
-  MID="$(jq -r '.id' <<<"$PAYLOAD")"
-
-  RESULT="$(curl -sS --max-time 300 -X POST \
-              -H 'Content-Type: application/json' \
-              --data "$PAYLOAD" \
-              "${BASE_URL}?action=sync_single&key=${KEY}" 2>>"$LOG_FILE")"
-
-  if ! jq -e '.success' >/dev/null 2>&1 <<<"$RESULT"; then
-    log "ERROR: پاسخ نامعتبر برای پست ${MID}: ${RESULT:0:200}"
-    FAIL=$((FAIL + 1))
-    continue
-  fi
-
-  B="$(jq -r '.bale.ok'    <<<"$RESULT")"
-  R="$(jq -r '.rubika.ok'  <<<"$RESULT")"
-  S="$(jq -r '.soroush.ok' <<<"$RESULT")"
-  G="$(jq -r '.igap.ok'    <<<"$RESULT")"
-  SB_DETAIL="$(jq -r '.soroush.info // ""' <<<"$RESULT" | head -c 160)"
-  IG_DETAIL="$(jq -r '.igap.info   // ""' <<<"$RESULT" | head -c 160)"
-
-  log "POST ${MID} → bale=${B} rubika=${R} soroush=${S} igap=${G}"
-  [[ "$S" != "true" ]] && log "   soroush.detail: ${SB_DETAIL}"
-  [[ "$G" != "true" ]] && log "   igap.detail: ${IG_DETAIL}"
-  [[ "$B$R$S$G" != *"true"* ]] && FAIL=$((FAIL + 1))
-
-  mark() { [[ "$1" == "true" ]] && echo "✅" || echo "❌"; }
-  REPORT+="🔹 پست ${MID}: بله $(mark "$B") | روبیکا $(mark "$R") | سروش $(mark "$S") | آی‌گپ $(mark "$G")"$'\n'
-done
-
-# --- ۳) گزارش مدیریتی به بله ---
-jq -n --arg r "$REPORT" '{report: [$r]}' \
-  | curl -sS --max-time 30 -X POST -H 'Content-Type: application/json' \
-      --data @- "${BASE_URL}?action=send_report&key=${KEY}" >>"$LOG_FILE" 2>&1
-
-log "DONE: ${COUNT} پست پردازش شد، ${FAIL} مورد با شکست کامل"
-SCRIPT
-
-chown file:file /home/file/public_html/s/cron_sync.sh
-chmod 750 /home/file/public_html/s/cron_sync.sh
-
-# ذخیرهٔ کلید دسترسی در فایل مجزا (به‌جای hard-code در اسکریپت)
-echo -n 'SECURITY_KEY_خود_را_اینجا_بگذارید' > /home/file/public_html/s/.cron_key
-chown file:file /home/file/public_html/s/.cron_key
-chmod 600 /home/file/public_html/s/.cron_key
+# حالت پیش‌فرض (CLI): مستقیم با PHP CLI، بدون Apache و بدون SECURITY_KEY
+sudo -u file bash cron_sync.sh
+tail -20 logs/cron_sync.log
 ```
+
+اگر PHP CLI روی سرور در دسترس نیست، حالت HTTP را فعال کنید:
+
+```bash
+cd /home/file/public_html/s
+printf 'SYNC_BASE_URL=https://your-domain/s\n' > .cron_env
+printf '%s\n' '<SECURITY_KEY>' > .cron_key
+chown file:file .cron_env .cron_key && chmod 600 .cron_env .cron_key
+sudo -u file bash cron_sync.sh
+```
+
+**رفتار اسکریپت (به همان ترتیب اجرا)**
+
+| مرحله | کار | نکته |
+|---|---|---|
+| ۰ | `flock` روی `/tmp/cron_sync.lock` | اجرای هم‌زمان دومین نمونه ⇒ `SKIP` و خروج `0` |
+| ۱ | خواندن `.cron_env` و یافتن باینری PHP | `ea-php83/82/81` ← `php` ← مسیر cPanel |
+| ۲ | `php -l sync_manual.php` (فقط حالت CLI) | خطای سینتکس ⇒ توقف پیش از هر ارسال |
+| ۳ | `get_pending` | صف خالی ⇒ خروج `0` بدون ارسال گزارش |
+| ۴ | `sync_single` برای هر پست، ترتیبی | `timeout 240` دور هر فراخوانی Node در لایهٔ PHP |
+| ۵ | ثبت جزئیات هر پست در لاگ | شامل `media`، دلیل `UNVERIFIED` و کد خطا |
+| ۶ | `send_report` به مدیر در بله | فقط اگر دست‌کم یک پست پردازش شده باشد |
+
+**متغیرهای محیطی پشتیبانی‌شده (در `.cron_env` یا shell)**
+
+| متغیر | پیش‌فرض | نقش |
+|---|---|---|
+| `SYNC_APP_DIR` | `/home/file/public_html/s` | مسیر استقرار |
+| `SYNC_BASE_URL` | *(خالی ⇒ حالت CLI)* | پایهٔ URL برای حالت HTTP |
+| `SYNC_GAP_SEC` | `5` | فاصلهٔ بین پست‌ها (نرخ‌محدودسازی) |
+| `SYNC_CHROMIUM_BIN` | `/usr/bin/chromium-browser` | باینری کرومیوم (باید `export` شود) |
+
+**کدهای خروج**
+
+| کد | معنا |
+|---|---|
+| `0` | سبز (یا صف خالی) |
+| `1` | خطای زیرساختی (PHP یافت نشد، صف خوانده نشد، JSON نامعتبر) |
+| `3` | دست‌کم یک پست در هر چهار پلتفرم شکست خورد |
+| `4` | فقط موارد تعویق‌شده (`deferred`) — رسانه دانلود نشد |
+
+> ⚠️ در حالت HTTP حتماً `.cron_key` را `chmod 600` کنید و هرگز آن را در Git نگذارید (`.gitignore` پوشش می‌دهد).
+
 
 **اجرای آزمایشی:**
 
@@ -916,6 +826,12 @@ MAILTO=""
 > در cPanel می‌توانید همان خطوط را در **cPanel → Cron Jobs** وارد کنید؛ فقط توجه کنید که cPanel دستور را با `sh -c` اجرا می‌کند، بنابراین مسیرهای مطلق (`/usr/bin/flock`) الزامی است.
 
 ### ۹.۳ گزینهٔ ب — systemd (توصیه‌شده برای لاگ و کنترل بهتر)
+
+> نمونه‌های آمادهٔ همین واحدها در `deploy/systemd/` ریپو هستند (`eitaa-sync.service`, `eitaa-sync.timer`, `eitaa-health.service`, `eitaa-health.timer`). می‌توانید به‌جای heredoc، آن‌ها را مستقیم کپی کنید:
+> ```bash
+> cp /home/file/public_html/s/deploy/systemd/*.service /home/file/public_html/s/deploy/systemd/*.timer /etc/systemd/system/
+> systemctl daemon-reload
+> ```
 
 ```bash
 cat > /etc/systemd/system/eitaa-sync.service <<'UNIT'
@@ -1012,24 +928,28 @@ journalctl -u eitaa-daemon -f
 
 ### ۹.۵ چرخش لاگ
 
+### ۹.۵ چرخش لاگ
+
+فایل `logrotate.conf` آماده در ریپو است؛ فقط نصبش کنید:
+
 ```bash
-cat > /home/file/public_html/s/logrotate.conf <<'CONF'
-/home/file/public_html/s/logs/*.log
-/home/file/public_html/s/error_log
-{
-    daily
-    rotate 14
-    compress
-    delaycompress
-    missingok
-    notifempty
-    copytruncate
-    maxsize 50M
-}
-CONF
-chown file:file /home/file/public_html/s/logrotate.conf
-chmod 644 /home/file/public_html/s/logrotate.conf
+cp /home/file/public_html/s/logrotate.conf /etc/logrotate.d/eitaa-sync
+chown root:root /etc/logrotate.d/eitaa-sync
+chmod 644 /etc/logrotate.d/eitaa-sync
+
+logrotate -d /etc/logrotate.d/eitaa-sync     # تست حالت خشک (بدون تغییر)
+logrotate -f /etc/logrotate.d/eitaa-sync     # اجرای اجباری یک‌باره
+ls -l /home/file/public_html/s/logs/
 ```
+
+| پارامتر | مقدار | چرا |
+|---|---|---|
+| `daily` + `rotate 14` | دو هفته لاگ روزانه | پوشش کافی برای ردیابی یک حادثه |
+| `size 20M` / `maxsize` ضمنی | سقف حجم | لاگ ارسال رسانه می‌تواند سریع رشد کند |
+| `copytruncate` | بدون نیاز به سیگنال | چون PHP/Node فایل را append می‌کنند و reopen نمی‌کنند |
+| `su file file` | اجرا با کاربر وب | وگرنه logrotate به دلیل مالکیت root/file خطا می‌دهد |
+| `logs/send_*.log` weekly | ۴ نسخهٔ فشرده | لاگ هر اجرا جداست؛ جمع‌شدنشان بی‌ضرر است |
+
 
 ---
 
@@ -1037,79 +957,44 @@ chmod 644 /home/file/public_html/s/logrotate.conf
 
 ### ۱۰.۱ `health_check.sh`
 
+### ۱۰.۱ `health_check.sh`
+
+این فایل هم آماده در ریپو است (`health_check.sh`). بیش از ۲۵ بررسی انجام می‌دهد و در صورت وجود مشکل، **همان متن هشدار را با `send_report` به مدیر در بله می‌فرستد** (از مسیر `cli_run.php`، پس به کلید وب نیاز ندارد).
+
 ```bash
-cat > /home/file/public_html/s/health_check.sh <<'SCRIPT'
-#!/usr/bin/env bash
-# health_check.sh — بررسی سلامت زیرساخت + ارسال هشدار به مدیر در بله
-set -uo pipefail
+cd /home/file/public_html/s
+chown file:file health_check.sh && chmod 750 health_check.sh
 
-APP_DIR="/home/file/public_html/s"
-LOG_FILE="${APP_DIR}/logs/health.log"
-KEY_FILE="${APP_DIR}/.cron_key"
-BASE_URL="https://file.falnic.com/s/sync_manual.php"
-export LANG="en_US.UTF-8"
-
-mkdir -p "${APP_DIR}/logs"
-PROBLEMS=()
-
-chk() {  # chk "شرح" "دستور شرط"
-  if eval "$2" >/dev/null 2>&1; then
-    printf '  [OK]   %s\n' "$1" | tee -a "$LOG_FILE"
-  else
-    printf '  [FAIL] %s\n' "$1" | tee -a "$LOG_FILE"
-    PROBLEMS+=("$1")
-  fi
-}
-
-echo "=== $(date '+%F %T') بررسی سلامت ===" | tee -a "$LOG_FILE"
-
-chk "باینری node"                'test -x /usr/bin/node'
-chk "باینری chromium-browser"    'test -x /usr/bin/chromium-browser'
-chk "اکستنشن pdo_sqlite"         'ea-php81 -m | grep -qx pdo_sqlite'
-chk "shell_exec فعال است"        "! ea-php81 -i | grep -i disable_functions | grep -q shell_exec"
-chk "state.sqlite خواندنی/نوشتنی" 'test -r ${APP_DIR}/state.sqlite && test -w ${APP_DIR}/state.sqlite'
-chk "soroush_profile نوشتنی"     'test -w ${APP_DIR}/soroush_profile'
-chk "igap_profile نوشتنی"        'test -w ${APP_DIR}/igap_profile'
-chk "مالکیت profile = file"      'stat -c %U ${APP_DIR}/igap_profile | grep -qx file'
-chk "بدون Singleton باقی‌مانده"   'test -z "$(find ${APP_DIR} -maxdepth 2 -name "Singleton*" -print -quit)"'
-chk "فضای دیسک > 1GB"            'test "$(df -BM --output=avail /home | tail -1 | tr -dc 0-9)" -gt 1024'
-chk "رم آزاد > 500MB"            'test "$(free -m | awk "/^Mem:/{print \$7}")" -gt 500'
-chk "بدون فرایند chromium یتیم"  'test "$(pgrep -c -f chromium 2>/dev/null || echo 0)" -lt 20'
-chk "دسترسی به ایتا"             'curl -s -o /dev/null --max-time 15 -w "%{http_code}" https://eitaa.com/shamimeashena | grep -q 200'
-chk "دسترسی به API بله"          'curl -s -o /dev/null --max-time 15 https://tapi.bale.ai'
-chk "دسترسی به API روبیکا"       'curl -s -o /dev/null --max-time 15 https://botapi.rubika.ir'
-chk "دسترسی به web.splus.ir"     'curl -s -o /dev/null --max-time 20 -w "%{http_code}" https://web.splus.ir | grep -qE "200|301|302"'
-chk "دسترسی به web.igap.net"     'curl -s -o /dev/null --max-time 20 -w "%{http_code}" https://web.igap.net | grep -qE "200|301|302"'
-chk "session سروش تازه (< 30 روز)" 'test -n "$(find ${APP_DIR}/soroush_profile -name Cookies -mtime -30 -print -quit 2>/dev/null)"'
-chk "session آی‌گپ تازه (< 30 روز)" 'test -n "$(find ${APP_DIR}/igap_profile -name Cookies -mtime -30 -print -quit 2>/dev/null)"'
-chk "get_pending پاسخ می‌دهد"     'curl -s --max-time 60 "${BASE_URL}?action=get_pending&key=$(cat ${KEY_FILE})" | grep -q "\"success\""'
-
-echo "-------------------------------------" | tee -a "$LOG_FILE"
-
-if [[ ${#PROBLEMS[@]} -eq 0 ]]; then
-  echo "RESULT: HEALTHY ✅" | tee -a "$LOG_FILE"
-  exit 0
-fi
-
-echo "RESULT: ${#PROBLEMS[@]} مشکل ⚠️" | tee -a "$LOG_FILE"
-printf '  - %s\n' "${PROBLEMS[@]}" | tee -a "$LOG_FILE"
-
-# هشدار به مدیر در بله (بدون نیاز به کانال)
-MSG="⚠️ هشدار سلامت سیستم همگام‌سازی
-زمان: $(date '+%F %T')
-موارد ناموفق:
-$(printf '• %s\n' "${PROBLEMS[@]}")"
-jq -n --arg t "$MSG" '{report:[$t]}' \
-  | curl -s --max-time 30 -X POST -H 'Content-Type: application/json' \
-      --data @- "${BASE_URL}?action=send_report&key=$(cat ${KEY_FILE})" >/dev/null
-
-exit 1
-SCRIPT
-
-chown file:file /home/file/public_html/s/health_check.sh
-chmod 750 /home/file/public_html/s/health_check.sh
-sudo -u file bash /home/file/public_html/s/health_check.sh
+sudo -u file bash health_check.sh; echo "exit=$?"
+tail -40 logs/health.log
 ```
+
+خروجی نمونه:
+
+```text
+  [ OK ] باینری node
+  [ OK ] سینتکس sync_manual.php
+  [FAIL] session آی‌گپ تازه (<۳۰ روز)
+-------------------------------------
+RESULT: 1 مشکل ⚠️
+  - session آی‌گپ تازه (<۳۰ روز)
+```
+
+**دسته‌بندی بررسی‌ها**
+
+| دسته | نمونه بررسی |
+|---|---|
+| زمان اجرا | `node`، `chromium-browser`، ماژول `playwright`، اکستنشن‌های PHP، فعال بودن `shell_exec` |
+| سینتکس | `php -l sync_manual.php`، `node --check` روی هر دو sender |
+| مجوز/وضعیت | نوشتنی بودن `state.sqlite` و پروفایل‌ها، مالکیت غیر root، نبود `Singleton*` باقی‌مانده |
+| منابع | فضای آزاد `/home` بیشتر از ۱ GB، رم آزاد بیشتر از ۵۰۰ MB، تعداد کرومیوم کمتر از ۶ |
+| شبکه | `eitaa.com`، `tapi.bale.ai`، `botapi.rubika.ir`، `web.splus.ir`، `web.igap.net` |
+| Session | سن فایل `Cookies` هر پروفایل کمتر از ۳۰ روز |
+| امنیت | بسته بودن پورت `9222`، وجود `.htaccess` |
+| کارکرد | پاسخ دادن `get_pending` از مسیر CLI |
+
+کد خروج `0` یعنی سالم؛ `1` یعنی دست‌کم یک مورد قرمز (و هشدار به مدیر ارسال شده). زمان‌بندی روزانه در §۹.۴ و فایل `deploy/systemd/eitaa-health.{service,timer}` آمده است.
+
 
 ### ۱۰.۲ مانیتورینگ زنده
 
@@ -1174,43 +1059,33 @@ sqlite3 /home/file/public_html/s/state.sqlite "SELECT channel, last_msg_id FROM 
 | T-18 | محافظت وب | §۶.۳ | همهٔ منابع حساس `403` |
 | T-19 | سلامت | `sudo -u file bash health_check.sh` | `RESULT: HEALTHY ✅` |
 
-**اسکریپت یکپارچهٔ آزمون (ذخیره به‌عنوان `acceptance.sh`):**
+**اسکریپت یکپارچهٔ آزمون — آماده در ریپو:**
+
+دو فایل این جدول را پوشش می‌دهند: `smoke_test.sh` (منطق اصلی، ۶ بخش) و `acceptance.sh` (پوشش نازک همان اسکریپت با نگاشت T-1..T-18).
 
 ```bash
-cat > /home/file/public_html/s/acceptance.sh <<'SCRIPT'
-#!/usr/bin/env bash
-set -uo pipefail
-APP=/home/file/public_html/s
-cd "$APP"
-pass=0; fail=0
-t() { printf '%-34s' "$1"; if eval "$2" >/dev/null 2>&1; then echo "PASS"; pass=$((pass+1));
-      else echo "FAIL"; fail=$((fail+1)); fi; }
+cd /home/file/public_html/s
+chown file:file smoke_test.sh acceptance.sh
+chmod 750 smoke_test.sh acceptance.sh
 
-t "T-1  node binary"        'test -x /usr/bin/node'
-t "T-1  chromium binary"    'test -x /usr/bin/chromium-browser'
-t "T-2  playwright module"  'sudo -u file node -e "require(\"playwright\")"'
-t "T-3  pdo_sqlite"         'ea-php81 -m | grep -qx pdo_sqlite'
-t "T-3  curl ext"           'ea-php81 -m | grep -qx curl'
-t "T-3  dom ext"            'ea-php81 -m | grep -qx dom'
-t "T-3  mbstring"           'ea-php81 -m | grep -qx mbstring'
-t "T-3  fileinfo"           'ea-php81 -m | grep -qx fileinfo'
-t "T-4  sqlite writable"    'sudo -u file test -w $APP/state.sqlite'
-t "T-4  profile writable"   'sudo -u file test -w $APP/igap_profile'
-t "T-5  php syntax"         'ea-php81 -l $APP/sync_manual.php | grep -q "No syntax errors"'
-t "T-5  js syntax soroush"  'node --check $APP/send_soroush.js'
-t "T-5  js syntax igap"     'node --check $APP/send_igap.js'
-t "T-18 htaccess present"   'test -f $APP/.htaccess'
-t "T-18 gitignore present"  'test -f $APP/.gitignore'
-echo "-----------------------------------------"
-echo "PASS=$pass  FAIL=$fail"
-[[ $fail -eq 0 ]] || exit 1
-SCRIPT
-chown file:file /home/file/public_html/s/acceptance.sh
-chmod 750 /home/file/public_html/s/acceptance.sh
-bash /home/file/public_html/s/acceptance.sh
+# بدون ارسال (فقط محیط، سینتکس، مجوز، شبکه، صف)
+sudo -u file bash acceptance.sh; echo "exit=$?"
+
+# با ارسال زندهٔ تستی به هر چهار مقصد (پیش از تست واقعی توصیه می‌شود)
+sudo -u file bash smoke_test.sh --live
 ```
 
-> آزمون‌های T-6 تا T-17 نیازمند اعتبارنامهٔ واقعی و تعامل هستند، پس در `acceptance.sh` نیامده‌اند؛ آن‌ها را دستی طبق جدول اجرا کنید.
+| بخش smoke_test | پوشش |
+|---|---|
+| ۱ محیط زمان اجرا | T-1، T-2، T-3 |
+| ۲ سینتکس و یکپارچگی کد | T-5، T-18 + نبود `sprintf` با backslash خام |
+| ۳ مجوزها و وضعیت runtime | T-4 |
+| ۴ شبکهٔ خروجی | T-7 |
+| ۵ لایهٔ scraping | `get_pending` از مسیر CLI |
+| ۶ ارسال زنده (با `--live`) | T-9..T-16 به‌صورت خودکار |
+
+
+> آزمون‌های T-6 تا T-15 نیازمند اعتبارنامهٔ واقعی هستند؛ `smoke_test.sh --live` بخش ارسال‌محور آن‌ها (T-9 تا T-16) را خودکار پوشش می‌دهد، ولی مشاهدهٔ چشمی نتیجه در کانال مقصد همچنان بر عهدهٔ شماست. T-6، T-8 و T-17 را دستی طبق جدول اجرا کنید.
 
 ---
 
