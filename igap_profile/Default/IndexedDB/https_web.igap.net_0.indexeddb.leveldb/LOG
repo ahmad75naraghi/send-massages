@@ -1,0 +1,25 @@
+2026/09/20-12:54:57.642 3eb70a Reusing MANIFEST /home/file/public_html/s/igap_profile/Default/IndexedDB/https_web.igap.net_0.indexeddb.leveldb/MANIFEST-000001
+2026/09/20-12:54:57.642 3eb70a Recovering log #129
+2026/09/20-12:54:57.643 3eb70a Reusing old log /home/file/public_html/s/igap_profile/Default/IndexedDB/https_web.igap.net_0.indexeddb.leveldb/000129.log 
+2026/09/20-12:54:57.643 3eb70a Delete type=2 #128
+2026/09/20-12:54:57.737 3eb70a Level-0 table #134: started
+2026/09/20-12:54:57.750 3eb70a Level-0 table #134: 24673 bytes OK
+2026/09/20-12:54:57.758 3eb70a Delete type=0 #129
+2026/09/20-12:54:57.759 3eb70a Manual compaction at level-0 from '\x00*\x00\x00\x00' @ 72057594037927935 : 1 .. '\x00+\x00\x00\x00' @ 0 : 0; will stop at '\x00*\x00\x00\x05' @ 3001 : 1
+2026/09/20-12:54:57.759 3eb70a Compacting 1@0 + 1@1 files
+2026/09/20-12:54:57.771 3eb70a Generated table #135@0: 420 keys, 13485 bytes
+2026/09/20-12:54:57.771 3eb70a Compacted 1@0 + 1@1 files => 13485 bytes
+2026/09/20-12:54:57.776 3eb70a compacted to: files[ 0 1 1 0 0 0 0 ]
+2026/09/20-12:54:57.778 3eb70a Delete type=2 #134
+2026/09/20-12:54:57.779 3eb70a Manual compaction at level-0 from '\x00*\x00\x00\x05' @ 3001 : 1 .. '\x00+\x00\x00\x00' @ 0 : 0; will stop at (end)
+2026/09/20-12:54:57.797 3eb70b Level-0 table #137: started
+2026/09/20-12:54:57.804 3eb70b Level-0 table #137: 8706 bytes OK
+2026/09/20-12:54:57.812 3eb70b Delete type=2 #131
+2026/09/20-12:54:57.812 3eb70b Delete type=0 #133
+2026/09/20-12:54:57.813 3eb70a Manual compaction at level-0 from '\x00+\x00\x00\x00' @ 72057594037927935 : 1 .. '\x00,\x00\x00\x00' @ 0 : 0; will stop at '\x00+\x00\x00\x05' @ 3026 : 1
+2026/09/20-12:54:57.813 3eb70a Compacting 1@0 + 1@1 files
+2026/09/20-12:54:57.823 3eb70a Generated table #138@0: 420 keys, 13487 bytes
+2026/09/20-12:54:57.823 3eb70a Compacted 1@0 + 1@1 files => 13487 bytes
+2026/09/20-12:54:57.828 3eb70a compacted to: files[ 0 1 1 0 0 0 0 ]
+2026/09/20-12:54:57.829 3eb70a Delete type=2 #137
+2026/09/20-12:54:57.829 3eb70a Manual compaction at level-0 from '\x00+\x00\x00\x05' @ 3026 : 1 .. '\x00,\x00\x00\x00' @ 0 : 0; will stop at (end)
