@@ -135,11 +135,13 @@ async function readActivePreview(page) {
 
 (async () => {
     const opts = C.parseArgs(process.argv);
+    // اولویت: آرگومان خط فرمان > .env (SOROUSH_*) > بدون مقدار
     // نام/شناسهٔ کانال پیش از ورود به سلکتور از کاراکترهای شکننده پاک می‌شود
-    opts.channel = String(opts.channel || '').replace(/["\\]/g, '');
+    opts.channel = String(opts.channel || C.env('SOROUSH_CHANNEL_ID') || '').replace(/["\\]/g, '');
+    opts.channelName = (opts.channelName || C.env('SOROUSH_CHANNEL_NAME') || null);
     opts.channelName = opts.channelName ? String(opts.channelName).replace(/["\\]/g, '') : null;
     const log = new C.RunLog('soroush');
-    log.step(`args: channel=${opts.channel || '-'} name=${opts.channelName || '-'} text=${opts.text.length}ch file=${opts.file || '-'} type=${opts.type || '-'}`);
+    log.step(`args: channel=${opts.channel || '-'} name=${opts.channelName || '-'} text=${opts.text.length}ch file=${opts.file || '-'} type=${opts.type || '-'} env=${C.ENV_FILE || 'none'}`);
 
     let browser = null;
     let exitCode = 0;
@@ -148,6 +150,11 @@ async function readActivePreview(page) {
     try {
         if (!opts.text && !opts.file) {
             result = { status: 'ERROR', code: 'EMPTY_PAYLOAD', error: 'هم text و هم file خالی است؛ چیزی برای ارسال نیست' };
+            exitCode = 1;
+            return;
+        }
+        if (!opts.channel && !opts.channelName) {
+            result = { status: 'ERROR', code: 'NO_CHANNEL', error: 'کانال مقصد مشخص نیست؛ --channel یا --channel-name بدهید یا SOROUSH_CHANNEL_ID/SOROUSH_CHANNEL_NAME را در .env تنظیم کنید' };
             exitCode = 1;
             return;
         }

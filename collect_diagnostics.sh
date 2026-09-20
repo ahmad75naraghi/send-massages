@@ -11,8 +11,17 @@ OUT="$APP/logs/diag_$(date +%F_%H%M%S).txt"
 mkdir -p "$APP/logs"
 exec > >(tee -a "$OUT") 2>&1
 
-PHP_BIN=""
-for c in ea-php83 ea-php82 ea-php81 php; do command -v "$c" >/dev/null 2>&1 && { PHP_BIN="$(command -v "$c")"; break; }; done
+if [[ -r "$APP/.env" ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source "$APP/.env"
+  set +a
+fi
+PHP_BIN="${PHP_BIN:-}"
+if [[ -z "$PHP_BIN" ]]; then
+  for c in ea-php83 ea-php82 ea-php81 php; do command -v "$c" >/dev/null 2>&1 && { PHP_BIN="$(command -v "$c")"; break; }; done
+fi
+[[ -z "$PHP_BIN" ]] && PHP_BIN="php"
 
 echo "=========== $(date '+%F %T') ==========="
 
@@ -76,7 +85,17 @@ cp -f "$APP"/igap_dump.html "$DIAGDIR"/ 2>/dev/null
 ls -t "$APP"/logs/send_*.log 2>/dev/null | head -3 | xargs -r cp -f -t "$DIAGDIR"/ 2>/dev/null
 echo "شواهد بصری کپی شد در: $DIAGDIR"
 
-echo; echo "--- ۹) خودآزمون سریع ---"
+echo; echo "--- ۹) پیکربندی (.env) ---"
+if [[ -f "$APP/.env" ]]; then
+  echo "مسیر: $APP/.env | مجوز: $(stat -c '%a %U:%G' "$APP/.env" 2>/dev/null)"
+  # فقط نام کلیدها و وضعیت پر/خالی بودن؛ مقدارهای حساس هرگز چاپ نمی‌شوند
+  awk -F= '/^[A-Za-z_][A-Za-z0-9_]*=/ { printf "  %-24s %s\n", $1, (length($2) > 0 ? "SET" : "EMPTY") }' "$APP/.env"
+else
+  echo "  ❌ .env وجود ندارد (bash setup_env.sh)"
+fi
+echo "توکن hard-code در PHP:"; grep -rlE "const[[:space:]]+(BALE|RUBIKA|SOROUSH)_BOT_TOKEN" --include='*.php' "$APP" 2>/dev/null || echo "  (هیچ — پاک است)"
+
+echo; echo "--- ۱۰) خودآزمون سریع ---"
 echo ">>> get_pending:"
 ACTION=get_pending "$PHP_BIN" -f "$APP/cli_run.php" </dev/null 2>&1 | head -c 600; echo
 

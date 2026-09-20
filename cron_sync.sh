@@ -37,18 +37,34 @@ if ! flock -n 9; then
   exit 0
 fi
 
-# ---------- محیط اختیاری ----------
+# ---------- پیکربندی از .env (و سپس .cron_env برای سازگاری با نسخهٔ قبل) ----------
+# .env همان فایلی است که config.php و lib/pw_common.js هم می‌خوانند.
+DOT_ENV="$APP_DIR/.env"
+if [[ -r "$DOT_ENV" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "$DOT_ENV"
+  set +a
+  log "config: $DOT_ENV"
+else
+  log "WARN: فایل .env پیدا نشد ($DOT_ENV) — از مقدارهای پیش‌فرض و محیط استفاده می‌شود"
+fi
 if [[ -r "$ENV_FILE" ]]; then
+  set -a
   # shellcheck disable=SC1090
   source "$ENV_FILE"
+  set +a
 fi
 BASE_URL="${SYNC_BASE_URL:-}"
 
 # ---------- انتخاب باینری PHP ----------
-PHP_BIN=""
-for c in ea-php83 ea-php82 ea-php81 php php83 php82 php81; do
-  if command -v "$c" >/dev/null 2>&1; then PHP_BIN="$(command -v "$c")"; break; fi
-done
+# اگر در .env مقدار PHP_BIN ست شده باشد، همان اولویت دارد (پس از source خوانده شده).
+PHP_BIN="${PHP_BIN:-}"
+if [[ -z "$PHP_BIN" ]]; then
+  for c in ea-php83 ea-php82 ea-php81 php php83 php82 php81; do
+    if command -v "$c" >/dev/null 2>&1; then PHP_BIN="$(command -v "$c")"; break; fi
+  done
+fi
 if [[ -z "$PHP_BIN" && -x /opt/cpanel/ea-php81/root/usr/bin/php ]]; then
   PHP_BIN=/opt/cpanel/ea-php81/root/usr/bin/php
 fi
@@ -68,9 +84,13 @@ call_cli() {  # $1=action  $2=json|''
 }
 
 call_http() {  # $1=action  $2=json|''
-  local key="$1"
+  local key=""
   key="$(cat "$APP_DIR/.cron_key" 2>/dev/null || true)"
-  if [[ -z "$key" ]]; then both "FATAL: حالت HTTP انتخاب شده ولی .cron_key وجود ندارد"; exit 1; fi
+  [[ -z "$key" ]] && key="${SECURITY_KEY:-}"
+  if [[ -z "$key" ]]; then
+    both "FATAL: حالت HTTP انتخاب شده ولی کلید پیدا نشد (.cron_key یا SECURITY_KEY در .env)"
+    exit 1
+  fi
   if [[ -n "${2:-}" ]]; then
     curl -sS --max-time 300 -X POST -H 'Content-Type: application/json' \
          --data "$2" "${BASE_URL}/sync_manual.php?action=$1&key=${key}"

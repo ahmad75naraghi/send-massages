@@ -766,67 +766,101 @@ async function processQueue() {
 
 | # | موضوع | وضعیت فعلی | ریسک | اقدام لازم |
 |---|---|---|---|---|
-| S-1 | `SECURITY_KEY = '1'` | کلید تک‌کاراکتری | 🔴 بحرانی — هر کسی می‌تواند داشبورد را اجرا و در ۴ کانال عمومی پست بگذارد | کلید ≥ ۳۲ کاراکتر تصادفی |
-| S-2 | توکن‌ها hard-code در `.php` | در کد و **در تاریخ Git** | 🔴 بحرانی — نشت توکن = کنترل کامل بات | چرخش توکن + انتقال به `.env`/`config.local.php` |
-| S-3 | پروفایل‌های مرورگر در `public_html` | `web.splus.ir`/`web.igap.net` session ها روی دیسک عمومی | 🔴 بحرانی — دسترسی = دسترسی کامل به حساب کاربری | `.htaccess` + انتقال به خارج از `public_html` |
-| S-4 | `state.sqlite` در `public_html` | قابل دانلود مستقیم | 🟡 متوسط | `.htaccess` deny |
+| S-1 | `SECURITY_KEY = '1'` | ✅ **رفع شد** — `setup_env.sh` کلید تصادفی ۳۲ نویسه‌ای می‌سازد و اگر خالی باشد داشبورد بالا نمی‌آید | 🟢 کنترل‌شده | کلید فعلی را در `.env` نگه دارید و در URL داشبورد استفاده کنید |
+| S-2 | توکن‌ها hard-code در `.php` | ✅ **رفع شد** — همه از `.env` خوانده می‌شوند؛ اما مقدارهای قدیمی هنوز **در تاریخ Git** هستند | 🟠 بالا (تاریخچه) | **چرخش توکن‌ها** + اختیاری: `git filter-repo`/BFG برای پاک‌سازی تاریخ |
+| S-3 | پروفایل‌های مرورگر در `public_html` | `web.splus.ir`/`web.igap.net` session ها روی دیسک عمومی، با مجوز `700` و `.htaccess` deny | 🔴 بحرانی — دسترسی = دسترسی کامل به حساب کاربری | انتقال به خارج از `public_html` (مسیر با `SOROUSH_PROFILE_DIR`/`IGAP_PROFILE_DIR` در `.env` قابل تغییر است) |
+| S-4 | `state.sqlite` در `public_html` | `.htaccess` deny فعال | 🟢 کنترل‌شده | حفظ قاعده در هر تغییر `.htaccess` |
 | S-5 | `CURLOPT_SSL_VERIFYPEER = false` | در همهٔ فراخوانی‌های cURL | 🟡 متوسط — MITM روی توکن‌ها | فعال‌سازی + به‌روزرسانی `ca-certificates` |
-| S-6 | `start_browser.sh` با `--remote-debugging-address=0.0.0.0` | پورت ۹۲۲۲ روی همهٔ اینترفیس‌ها | 🔴 بحرانی — CDP بدون احراز هویت = کنترل کامل مرورگر | فقط در دیباگ، با `127.0.0.1` + SSH tunnel |
-| S-7 | اسکرین‌شات‌های اجرا در `public_html` | `step2.jpg` ممکن است حاوی OTP یا شماره موبایل باشد | 🟠 بالا | حذف دوره‌ای + `.htaccess` |
+| S-6 | `start_browser.sh` با `--remote-debugging-address=0.0.0.0` | ✅ **رفع شد** — فقط `127.0.0.1` و `pkill` محدود به پروفایل هدف | 🟢 کنترل‌شده | فقط در دیباگ، با SSH tunnel |
+| S-7 | اسکرین‌شات‌های اجرا در `public_html` | `.htaccess` مسدود می‌کند؛ فایل‌ها می‌توانند حاوی OTP/شماره موبایل باشند | 🟠 بالا | حذف دوره‌ای + مشاهده فقط با `scp`/SSH |
 | S-8 | `shell_exec` با ورودی کاربر | ✅ با `escapeshellarg()` محافظت‌شده | 🟢 کنترل‌شده | حفظ الگو در هر تغییر آینده |
+| S-9 | `.env` خودش یک هدف نشت است | مجوز `600`، git-ignored، مسدود در `.htaccess`، هرگز لاگ نمی‌شود (فقط وضعیت کلیدها) | 🟡 متوسط | در `collect_diagnostics.sh` فقط نام کلیدها چاپ می‌شود، نه مقدارها |
 
-### ۹.۲ الگوی توصیه‌شده برای برون‌سپاری اعتبارنامه‌ها
+### ۹.۲ معماری پیکربندی: یک فایل `.env` برای همهٔ زبان‌ها
 
-ایجاد `config.local.php` (خارج از Git — در `.gitignore` ثبت شده):
+الگوی پیاده‌شده (جایگزین `config.local.php` پیشنهادی قدیمی):
 
-```php
-<?php
-// /home/file/public_html/s/config.local.php  —  chmod 600, chown file:file
-return [
-    'SECURITY_KEY'       => 'CHANGE_ME_32+_RANDOM_CHARS',
-    'BALE_BOT_TOKEN'     => getenv('BALE_BOT_TOKEN')     ?: '',
-    'BALE_CHANNEL_ID'    => '@testforme',
-    'BALE_ADMIN_CHAT_ID' => '1598432451',
-    'RUBIKA_BOT_TOKEN'   => getenv('RUBIKA_BOT_TOKEN')   ?: '',
-    'RUBIKA_CHANNEL_ID'  => '@shamimeashena1',
-    'SOROUSH_CHANNEL_ID' => 'shamimeashena1',
-    'IGAP_CHANNEL_ID'    => 'shamimeashena',
-];
+```mermaid
+flowchart LR
+    E[".env<br/>chmod 600 — git-ignored"]
+    EX[".env.example<br/>الگو با توضیح فارسی"]
+    SU["setup_env.sh<br/>مهاجرت از تاریخ Git + کلید تصادفی"]
+    CP["config.php<br/>loadDotEnv + env/envInt/envBool"]
+    PW["lib/pw_common.js<br/>loadDotEnv + env"]
+    OS["متغیر محیطی واقعی<br/>systemd / cron / shell"]
+
+    EX -.->|الگو| SU
+    SU -->|ساخت| E
+    E --> CP
+    E --> PW
+    OS ==>|اولویت بالاتر| CP
+    OS ==>|اولویت بالاتر| PW
+    CP --> P["همهٔ *.php"]
+    PW --> N["همهٔ *.js"]
+    E --> SH["cron_sync.sh / health_check.sh<br/>(source .env با set -a)"]
 ```
 
-و در `sync_manual.php`:
+**قاعدهٔ اولویت** (یکسان در PHP و Node):
 
-```php
-$CFG = require __DIR__ . '/config.local.php';
-define('SECURITY_KEY', $CFG['SECURITY_KEY']);
-define('BALE_BOT_TOKEN', $CFG['BALE_BOT_TOKEN']);
-// ...
+```text
+متغیر محیطی واقعی   >   مقدار در .env   >   پیش‌فرض داخل کد
 ```
 
-مقادیر `getenv()` را در `/home/file/.bashrc` یا فایل `Environment=` در unit فایل systemd تزریق کنید (§۸ [`DEPLOYMENT.md`](DEPLOYMENT.md)).
+**اصل «پیش‌فرض خالی برای secret»:** همهٔ کلیدهای حساس (`SECURITY_KEY`, `*_BOT_TOKEN`, `*_ADMIN_CHAT_ID`, `RUBIKA_CHAT_ID_GUID`, `SOROUSH_CHAT_ID`) پیش‌فرض **رشتهٔ خالی** دارند. نتیجه: نبود پیکربندی هرگز به «ارسال به کانال اشتباه» یا «OK کاذب» تبدیل نمی‌شود، بلکه به خطای صریح:
+
+```php
+// config.php
+function envMissing(array $keys): array          // کدام کلیدها خالی‌اند
+function envMissingMessage(array $keys): string  // پیام راهنما با نام setup_env.sh
+```
+
+```php
+// sync_manual.php — sendToBale
+$missing = envMissing(['BALE_BOT_TOKEN']);
+if ($missing) return ['ok' => false, 'code' => 0, 'info' => envMissingMessage($missing)];
+```
+
+سمت Node هم همین منطق: اگر `SOROUSH_CHANNEL_ID` و `SOROUSH_CHANNEL_NAME` هر دو خالی باشند، اسکریپت با کد `NO_CHANNEL` خارج می‌شود (پیش از راه‌اندازی مرورگر).
+
+**چرا `.env` و نه `config.local.php`؟**
+
+| معیار | `.env` | `config.local.php` |
+|---|---|---|
+| خواندن از PHP | ✅ | ✅ |
+| خواندن از Node | ✅ (بدون subprocess) | ❌ نیاز به `php -r` دارد |
+| خواندن از Bash (cron) | ✅ `set -a; source` | ❌ |
+| تزریق از systemd `Environment=` | ✅ هم‌نام | باید دستی map شود |
+| ریسک اجرای کد دلخواه | ❌ (فقط key=value) | ⚠️ PHP اجرا می‌شود |
 
 ### ۹.۳ لایهٔ دفاعی `.htaccess`
 
+فایل واقعی در ریپو سه لایه دارد (نسخهٔ خلاصه):
+
 ```apache
-# /home/file/public_html/s/.htaccess
 Options -Indexes
 
-<FilesMatch "\.(sqlite|sqlite3|json|log|sh|html)$">
+# ۱) انکار پیش‌فرض برای هر چیزی که PHP اجرایی نیست
+<FilesMatch "!\.php$">
     Require all denied
 </FilesMatch>
 
-# فایل‌های مجاز (داشبورد و تست‌ها) صریحاً باز می‌شوند
+# ۲) فقط نقاط ورود مجاز وب باز می‌شوند (config.php و cli_run.php عمداً نیستند)
 <FilesMatch "^(sync_manual|test|test_rubika|test_rubika_media|test_soroush|send_test)\.php$">
     Require all granted
 </FilesMatch>
 
-<IfModule mod_headers.c>
-    Header set X-Robots-Tag "noindex, nofollow, noarchive"
-    Header set Referrer-Policy "no-referrer"
-</IfModule>
+# ۲-ب) لایهٔ صریح برای پیکربندی و اعتبارنامه (دفاع دوم)
+<FilesMatch "^(\.env|\.env\..*|\.cron_key|\.cron_env|config\.php|cli_run\.php)$">
+    Require all denied
+</FilesMatch>
+
+# ۳) قفل Rewrite برای پسوندهای داده‌ای/رسانه‌ای
+RewriteRule \.(sqlite|sqlite3|sqlite-journal|sqlite-wal|json|log|sh|env|ini|key|pem|jpg|jpeg|png|html)$ - [F,L,NC]
 ```
 
-> ⚠️ `igap_dump.html` و `step*.jpg` نیز با قاعدهٔ بالا مسدود می‌شوند؛ برای مشاهدهٔ اسکرین‌شات‌ها از `scp` یا SSH tunnel استفاده کنید نه URL عمومی.
+> ⚠️ `igap_dump.html` و `step*.jpg` نیز مسدود می‌شوند؛ برای مشاهدهٔ اسکرین‌شات‌ها از `scp` یا SSH tunnel استفاده کنید نه URL عمومی.
+>
+> 🔴 `.htaccess` **جایگزین مجوز فایل نیست**: اگر `DocumentRoot` به‌گونه‌ای پیکربندی شود که `AllowOverride None` باشد، این لایه بی‌اثر می‌شود. بررسی: `curl -I https://دامنه/s/.env` باید `403` بدهد.
 
 ### ۹.۴ مدل مجوز فایل
 
@@ -834,10 +868,15 @@ Options -Indexes
 |---|---|---|---|
 | `/home/file/public_html/s/` | `file:file` | `755` | Apache باید بتواند بخواند |
 | `*.php`, `*.js` | `file:file` | `644` | خواندنی برای وب |
+| `.env`, `.cron_key` | `file:file` | `600` | حاوی همهٔ توکن‌ها (`640` + گروه `www-data` فقط در حالت `mod_php`) |
+| `.env.example`, `config.php` | `file:file` | `644` | بدون مقدار حساس |
+| `setup_env.sh`, `cron_sync.sh`, `health_check.sh` | `file:file` | `750` | اجرایی فقط برای مالک |
 | `soroush_profile/`, `igap_profile/` | `file:file` | `700` | session = اعتبارنامه |
 | `state.sqlite` | `file:file` | `660` | نیاز به نوشتن توسط PHP **و** CLI |
-| `config.local.php` | `file:file` | `600` | حاوی توکن |
+| `logs/` | `file:file` | `750` | نوشتن توسط هر دو مسیر وب و CLI |
 | `/tmp/sync_*` | `file:file` | `600` (خودکار) | رسانهٔ موقت |
+
+**قاعدهٔ لاگ:** هیچ اسکریپتی مقدار یک secret را چاپ نمی‌کند. `setup_env.sh --show` و `collect_diagnostics.sh` فقط «نام کلید + وضعیت (ست شده/خالی) + چند نویسهٔ اول» را نشان می‌دهند.
 
 ---
 

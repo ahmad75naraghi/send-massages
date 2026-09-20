@@ -309,12 +309,17 @@ ls -1 /home/file/public_html/s
 خروجی مورد انتظار (فایل‌های کد):
 
 ```
+.htaccess
+.env.example          ← الگو (فایل .env واقعی را setup_env.sh می‌سازد)
+.gitignore
 ARCHITECTURE.md
 DEPLOYMENT.md
 PLAYWRIGHT_SPECS.md
 README.md
 TROUBLESHOOTING.md
-.gitignore
+cli_run.php           ← پل CLI برای cron
+config.php            ← خواندن .env و تعریف ثابت‌ها
+dump_dom.js
 inspect_attach.js
 inspect_igap.js
 login_soroush.js
@@ -324,6 +329,8 @@ restore_session.js
 send_igap.js
 send_soroush.js
 send_test.php
+setup_env.sh          ← ساخت .env (گام بعدی — §۷.۱)
+smoke_test.sh
 start_browser.sh
 sync_daemon.php
 sync_manual.php
@@ -332,8 +339,12 @@ test_img.jpg
 test_rubika.php
 test_rubika_media.php
 test_soroush.php
-backups/          logs/          node_modules/
+acceptance.sh  collect_diagnostics.sh  cron_sync.sh  health_check.sh  logrotate.conf
+lib/            (pw_common.js و ابزارهای مشترک)
+backups/   logs/   node_modules/   soroush_profile/   igap_profile/   state.sqlite
 ```
+
+> ✅ پس از اطمینان از کامل بودن این فهرست، **بلافاصله** §۷.۱ را اجرا کنید (`bash setup_env.sh`) تا `.env` ساخته شود؛ بدون آن برنامه با «پیکربندی ناقص» بالا نمی‌آید.
 
 ---
 
@@ -352,7 +363,12 @@ find "$APP" -type d -exec chmod 755 {} \;
 find "$APP" -type f -exec chmod 644 {} \;
 
 # ۳) اسکریپت‌های اجرایی
-chmod 750 "$APP"/start_browser.sh "$APP"/cron_sync.sh "$APP"/health_check.sh 2>/dev/null
+chmod 750 "$APP"/start_browser.sh "$APP"/cron_sync.sh "$APP"/health_check.sh \
+          "$APP"/smoke_test.sh "$APP"/acceptance.sh "$APP"/collect_diagnostics.sh \
+          "$APP"/setup_env.sh 2>/dev/null
+
+# ۳-ب) 🔴 .env و فایل‌های کلید — گام ۲ آن‌ها را ۶۴۴ کرد؛ باید محدود شوند
+chmod 600 "$APP"/.env "$APP"/.cron_key "$APP"/.cron_env 2>/dev/null
 
 # ۴) پروفایل‌های مرورگر = اعتبارنامه (محدودترین مجوز ممکن)
 chmod 700 "$APP"/soroush_profile "$APP"/igap_profile
@@ -361,15 +377,25 @@ find "$APP"/soroush_profile "$APP"/igap_profile -type d -exec chmod 700 {} \;
 
 # ۵) پایگاه داده و session
 chmod 660 "$APP"/state.sqlite
-chmod 600 "$APP"/soroush_session.json "$APP"/config.local.php "$APP"/.cron_key 2>/dev/null
+chmod 600 "$APP"/soroush_session.json "$APP"/config.local.php 2>/dev/null
 
 # ۶) پاک‌سازی قفل‌های به‌جامانده از اجراهای قبلی با root
 find "$APP" -maxdepth 2 -name 'Singleton*' -ls -delete
 
 # ۷) بازبینی
 ls -ld "$APP" "$APP"/{soroush_profile,igap_profile}
-ls -l  "$APP"/state.sqlite "$APP"/sync_manual.php
+ls -l  "$APP"/state.sqlite "$APP"/sync_manual.php "$APP"/.env "$APP"/.cron_key
 ```
+
+> 🔴 **`.env` باید ۶۰۰ باشد، مگر اینکه PHP با کاربر دیگری اجرا شود.** در cPanel (suPHP / PHP-FPM) اسکریپت PHP با کاربر `file` اجرا می‌شود، پس `600` درست است. اما اگر Apache با `mod_php` و کاربر `www-data`/`apache` اجرا می‌شود، آن کاربر هم باید `.env` را بخواند:
+> ```bash
+> ps -eo user,comm | grep -E 'httpd|apache2|php-fpm' | head      # کاربر واقعی وب‌سرور
+> chown file:www-data "$APP"/.env && chmod 640 "$APP"/.env       # حالت mod_php
+> ```
+> بررسی اینکه PHP واقعاً می‌تواند `.env` را بخواند:
+> ```bash
+> sudo -u file bash -c 'cd /home/file/public_html/s && php -r "require \"config.php\"; echo SECURITY_KEY ? \"OK: key loaded\\n\" : \"EMPTY\\n\";"'
+> ```
 
 **بررسی نهایی با کاربر واقعی وب‌سرور:**
 
@@ -506,48 +532,83 @@ curl -s -o /dev/null -w '%{http_code}\n' "$BASE/sync_manual.php?key=RIGHT"   # 2
 
 ## ۷. پیکربندی اپلیکیشن <a id="s7"></a>
 
-### ۷.۱ ویرایش ثابت‌ها
+### ۷.۱ ساخت `.env` — تنها منبع پیکربندی
+
+هیچ ثابتی در `sync_manual.php` باقی نمانده است؛ همهٔ مقدارها از `.env` کنار برنامه خوانده می‌شوند (`config.php` سمت PHP و `lib/pw_common.js` سمت Node).
 
 ```bash
-cp sync_manual.php sync_manual.php.bak.$(date +%F)
-nano sync_manual.php
+cd /home/file/public_html/s
+
+# ۱) ساخت .env + مهاجرت خودکار مقدارهای قدیمی از تاریخ Git + کلید تصادفی
+bash setup_env.sh
+
+# ۲) مجوز و مالکیت
+chown file:file .env .cron_key
+chmod 600 .env .cron_key
+
+# ۳) مرور مقدارها (نمایش پوشیده) و اعتبارسنجی
+bash setup_env.sh --show
+bash setup_env.sh --check
 ```
 
-حداقل تغییرات لازم:
+سپس این مقدارها را در `.env` اصلاح کنید:
 
-| ثابت | اقدام |
+| کلید | اقدام |
 |---|---|
-| `SECURITY_KEY` | یک رشتهٔ تصادفی ≥ ۳۲ کاراکتر |
-| `BALE_BOT_TOKEN` | توکن جدید بات بله (از @BotFather بله) |
+| `SECURITY_KEY` | `setup_env.sh` یک مقدار تصادفی ۳۲ نویسه‌ای می‌سازد؛ همان را در URL داشبورد استفاده کنید |
+| `DASHBOARD_ALLOWED_IP` | IP خود را بگذارید تا داشبورد فقط از آن IP باز شود (اختیاری ولی توصیه‌شده) |
+| `BALE_BOT_TOKEN` | توکن **چرخش‌یافتهٔ** بات بله (از @BotFather بله) |
 | `BALE_CHANNEL_ID` | کانال مقصد نهایی (نه `@testforme`) |
 | `BALE_ADMIN_CHAT_ID` | شناسهٔ عددی کاربر مدیر |
-| `RUBIKA_BOT_TOKEN` | توکن جدید بات روبیکا |
+| `RUBIKA_BOT_TOKEN` | توکن **چرخش‌یافتهٔ** بات روبیکا |
 | `RUBIKA_CHANNEL_ID` | کانال مقصد روبیکا |
-| `SOROUSH_CHANNEL_ID` | نام کاربری کانال سروش‌پلاس بدون `@` |
-| `IGAP_CHANNEL_ID` | نام کاربری کانال آی‌گپ بدون `@` |
+| `SOROUSH_CHANNEL_ID` / `SOROUSH_CHANNEL_NAME` | نام کاربری کانال (بدون `@`) + نام نمایشی دقیق آن در وب‌کلاینت |
+| `IGAP_CHANNEL_ID` / `IGAP_CHANNEL_NAME` / `IGAP_ITEM_ID` | مشخصات کانال آی‌گپ؛ `IGAP_ITEM_ID` را از `data-list-item-id` سل کانال بگیرید |
+| `SYNC_APP_DIR` | `setup_env.sh` به‌طور خودکار دایرکتوری واقعی برنامه را می‌گذارد |
 
-تولید کلید تصادفی امن:
+ویرایش دستی بعدی:
+
+```bash
+nano /home/file/public_html/s/.env
+bash setup_env.sh --check          # پس از هر ویرایش
+```
+
+تولید کلید تصادفی امن (اگر خواستید دستی بگذارید):
 
 ```bash
 head -c 48 /dev/urandom | base64 | tr -d '/+=\n' | cut -c1-40
+openssl rand -hex 16                # جایگزین
 ```
 
 دریافت `BALE_ADMIN_CHAT_ID` عددی:
 
 ```bash
-TOKEN='<BALE_BOT_TOKEN>'
+TOKEN="$(sed -nE 's/^BALE_BOT_TOKEN=(.*)$/\1/p' /home/file/public_html/s/.env)"
 curl -s "https://tapi.bale.ai/bot${TOKEN}/getUpdates" | jq '.result[-1].message.chat | {id, title, username}'
 ```
 
 > اگر پاسخ خالی بود، ابتدا یک پیام به بات بدهید یا بات را ادمین کانال کنید، سپس دوباره `getUpdates` را بخوانید.
 
+**رفتار سیستم وقتی `.env` ناقص است**
+
+| وضعیت | رفتار |
+|---|---|
+| `.env` وجود ندارد | `config.php` پیش‌فرض‌های غیرحساس را استفاده می‌کند؛ توکن‌ها خالی می‌مانند |
+| `SECURITY_KEY` خالی | داشبورد `500` با پیام «پیکربندی ناقص: … `bash setup_env.sh`» |
+| `BALE_BOT_TOKEN` خالی | بله `code:0` + `پیکربندی ناقص است؛ این کلیدها در .env مقدار ندارند: BALE_BOT_TOKEN` |
+| `RUBIKA_BOT_TOKEN` خالی | روبیکا `status: NOT_CONFIGURED` با همان پیام |
+| کانال سروش مشخص نباشد | اسکریپت Node کد `NO_CHANNEL` برمی‌گرداند |
+
 ### ۷.۲ اعتبارسنجی سینتکس پس از هر ویرایش
 
 ```bash
-ea-php81 -l /home/file/public_html/s/sync_manual.php
+APP=/home/file/public_html/s
+for f in config.php sync_manual.php cli_run.php send_test.php test.php test_rubika.php test_rubika_media.php test_soroush.php sync_daemon.php; do
+  printf '%-24s ' "$f"; ea-php81 -l "$APP/$f" | tail -1
+done
 ```
 
-خروجی لازم: `No syntax errors detected in /home/file/public_html/s/sync_manual.php`
+خروجی لازم برای همه: `No syntax errors detected in …`
 
 > 🔴 **این گام را هرگز رد نکنید.** سابقهٔ خطای ثبت‌شده در `error_log`:
 > ```
@@ -555,18 +616,27 @@ ea-php81 -l /home/file/public_html/s/sync_manual.php
 > ```
 > یک backslash خام در رشتهٔ قالب بود که داشبورد را کاملاً از کار انداخت. §۷.۱ [`ARCHITECTURE.md`](ARCHITECTURE.md) را ببینید.
 
-### ۷.۳ مسیرهای مطلق
+### ۷.۳ مسیرها
 
-کد از مسیر مطلق `/home/file/public_html/s/...` استفاده می‌کند (در `SOROUSH_SCRIPT`، `IGAP_SCRIPT` و `userDataDir` هر دو اسکریپت Node). اگر نام کاربری یا مسیر شما متفاوت است، این چهار نقطه را ویرایش کنید:
+مسیرها دیگر در کد hard-code نیستند: `config.php` از `SYNC_APP_DIR` (که `setup_env.sh` آن را روی دایرکتوری واقعی برنامه تنظیم می‌کند) همهٔ این‌ها را می‌سازد — `STATE_DB_PATH`، `LOG_DIR`، `SOROUSH_PROFILE_DIR`، `IGAP_PROFILE_DIR`، `SOROUSH_SCRIPT`، `IGAP_SCRIPT`. سمت Node هم `APP_DIR` را از همان `.env` می‌گیرد و مسیر پیش‌فرض پروفایل را بر اساس آن می‌سازد.
+
+پس اگر نام کاربری یا مسیر شما متفاوت است، کافی است یک کلید را تغییر دهید:
 
 ```bash
-grep -rn '/home/file/public_html/s' --include='*.php' --include='*.js' --include='*.sh' .
+sed -i 's#^SYNC_APP_DIR=.*#SYNC_APP_DIR=/home/USER/public_html/s#' /home/file/public_html/s/.env
+bash /home/file/public_html/s/setup_env.sh --show | grep -E 'SYNC_APP_DIR|SCRIPT|PROFILE|STATE_DB|LOG_DIR'
 ```
 
-جایگزینی دسته‌جمعی (با پشتیبان‌گیری):
+کنترل اینکه هیچ مسیر مطلق قدیمی در کد باقی نمانده باشد (فقط باید در مستندات و کامنت‌ها باشد):
 
 ```bash
 cd /home/file/public_html/s
+grep -rn '/home/file/public_html/s' --include='*.php' --include='*.js' --include='*.sh' . | grep -v '^\./\.env'
+```
+
+اگر مجبور به جایگزینی دسته‌جمعی شدید (پیش از مهاجرت به `.env`):
+
+```bash
 cp -a . ../s.bak.$(date +%F)
 grep -rl '/home/file/public_html/s' --include='*.php' --include='*.js' --include='*.sh' . \
   | xargs -r sed -i 's#/home/file/public_html/s#/home/USER/public_html/s#g'
@@ -928,8 +998,6 @@ journalctl -u eitaa-daemon -f
 
 ### ۹.۵ چرخش لاگ
 
-### ۹.۵ چرخش لاگ
-
 فایل `logrotate.conf` آماده در ریپو است؛ فقط نصبش کنید:
 
 ```bash
@@ -954,8 +1022,6 @@ ls -l /home/file/public_html/s/logs/
 ---
 
 ## ۱۰. مانیتورینگ و بررسی سلامت <a id="s10"></a>
-
-### ۱۰.۱ `health_check.sh`
 
 ### ۱۰.۱ `health_check.sh`
 

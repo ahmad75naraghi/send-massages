@@ -5,41 +5,36 @@ date_default_timezone_set('Asia/Tehran');
 ini_set('display_errors', '1');
 error_reporting(E_ALL);
 
-const SECURITY_KEY       = '1';
-const EITAA_CHANNEL_ID   = 'shamimeashena';
-const MAX_MESSAGES_LIMIT = 7;
-
-// تنظیمات بله
-const BALE_BOT_TOKEN     = '74580067:QneNhGu2LENUy5RatIeEiSzugYztXyGYmLs';
-const BALE_CHANNEL_ID    = '@testforme';
-const BALE_ADMIN_CHAT_ID = '1598432451';
-
-// تنظیمات روبیکا
-const RUBIKA_BOT_TOKEN   = 'CEJCFE0FCBZKUIGMNMOODEZXQAVAFDOLNFHMSBDFUVDAQMAFIYQDUMJWDODELSWZ';
-const RUBIKA_CHANNEL_ID  = '@shamimeashena1';
-
-// تنظیمات سروش‌پلاس
-const SOROUSH_CHANNEL_ID   = 'shamimeashena1';
-const SOROUSH_CHANNEL_NAME = 'شمیم آشنا';   // نام نمایشی کانال برای تأیید باز شدن چت درست
-const SOROUSH_SCRIPT       = '/home/file/public_html/s/send_soroush.js';
-
-// تنظیمات آیگپ
-const IGAP_CHANNEL_ID      = 'shamimeashena';
-const IGAP_CHANNEL_NAME    = 'شمیم آشنا';   // نام نمایشی کانال در لیست گفت‌وگوهای آی‌گپ
-const IGAP_SCRIPT          = '/home/file/public_html/s/send_igap.js';
-
-const NODE_BIN             = '/usr/bin/node';
-const USERBOT_TIMEOUT_SEC  = 240;           // کرانهٔ سخت هر اجرای UserBot (جلوگیری از worker گیرکرده)
-const MEDIA_MAX_RETRY      = 3;             // سقف تلاش برای دانلود رسانهٔ یک پست پیش از انتشار بدون رسانه
+// ============================================================
+//  پیکربندی: همهٔ مقدارها (به‌ویژه توکن‌ها) از فایل .env کنار برنامه
+//  خوانده می‌شوند. ساخت .env:  bash setup_env.sh
+//  هیچ secret ای در این فایل باقی نمانده است.
+// ============================================================
+require_once __DIR__ . '/config.php';
 
 // اعتبارسنجی توکن دسترسی
-if (($_REQUEST['key'] ?? '') !== SECURITY_KEY and php_sapi_name() !== 'cli') {
-    http_response_code(403);
-    die("<h3 style='color:red;'>Access Denied</h3>");
+if (php_sapi_name() !== 'cli') {
+    if (SECURITY_KEY === '') {
+        http_response_code(500);
+        die("<h3 style='color:#b91c1c;'>پیکربندی ناقص: SECURITY_KEY در فایل .env مقدار ندارد.<br>"
+          . "روی سرور اجرا کنید: <code>bash setup_env.sh</code> سپس <code>chmod 600 .env</code></h3>");
+    }
+    if (($_REQUEST['key'] ?? '') !== SECURITY_KEY) {
+        http_response_code(403);
+        die("<h3 style='color:red;'>Access Denied</h3>");
+    }
+    if (DASHBOARD_ALLOWED_IP !== '') {
+        $allowed = array_map('trim', explode(',', DASHBOARD_ALLOWED_IP));
+        $client  = $_SERVER['REMOTE_ADDR'] ?? '';
+        if (!in_array($client, $allowed, true)) {
+            http_response_code(403);
+            die("<h3 style='color:red;'>Access Denied (IP)</h3>");
+        }
+    }
 }
 
 // پایگاه داده وضعیت
-$dbPath = __DIR__ . '/state.sqlite';$db = new PDO("sqlite:{$dbPath}");
+$dbPath = STATE_DB_PATH;$db = new PDO("sqlite:{$dbPath}");
 $db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);$db->exec("CREATE TABLE IF NOT EXISTS sync_state (channel TEXT PRIMARY KEY, last_msg_id INTEGER NOT NULL)");
 $db->exec("CREATE TABLE IF NOT EXISTS media_fail (msg_id INTEGER PRIMARY KEY, fails INTEGER NOT NULL DEFAULT 0, last_reason TEXT, updated_at TEXT)");
 
@@ -184,7 +179,11 @@ function callApi(string $url, mixed$data, bool $isMultipart, array$headers = [])
     return ['code' => $code, 'res' => json_decode((string)$res, true) ?? $res];
 }
 
-function sendToBale(string $text, ?string $file, ?string $type, string $fileName): array {$cleanToken = preg_replace('/^bot/i', '', trim(BALE_BOT_TOKEN));
+function sendToBale(string $text, ?string $file, ?string $type, string $fileName): array {
+    if (BALE_BOT_TOKEN === '') {
+        return ['code' => 0, 'res' => ['ok' => false, 'description' => envMissingMessage(envMissing(['BALE_BOT_TOKEN']))]];
+    }
+    $cleanToken = preg_replace('/^bot/i', '', trim(BALE_BOT_TOKEN));
     $base = "https://tapi.bale.ai/bot{$cleanToken}/";
     if ($file and file_exists($file)) {$cFile = new CURLFile($file, '',$fileName);
         $caption = mb_substr($text, 0, 1000);
@@ -195,7 +194,11 @@ function sendToBale(string $text, ?string $file, ?string $type, string $fileName
     return callApi($base . 'sendMessage', json_encode(['chat_id' => BALE_CHANNEL_ID, 'text' =>$text]), false, ['Content-Type: application/json']);
 }
 
-function sendToRubika(string $text, ?string $file, ?string $type, string $fileName): array {$base = "https://botapi.rubika.ir/v3/" . RUBIKA_BOT_TOKEN . "/";
+function sendToRubika(string $text, ?string $file, ?string $type, string $fileName): array {
+    if (RUBIKA_BOT_TOKEN === '') {
+        return ['code' => 0, 'res' => ['status' => 'NOT_CONFIGURED', 'error_message' => envMissingMessage(envMissing(['RUBIKA_BOT_TOKEN']))]];
+    }
+    $base = "https://botapi.rubika.ir/v3/" . RUBIKA_BOT_TOKEN . "/";
     $caption = mb_substr($text, 0, 1000);
     if ($file and file_exists($file)) {$rType = match($type) { 'video' => 'Video', 'audio' => 'Music', 'voice' => 'Voice', 'document' => 'File', default => 'Image' };$req = callApi($base . 'requestSendFile', json_encode(['type' =>$rType]), false, ['Content-Type: application/json']);
         $uploadUrl = is_array($req['res']['data'] ?? null) ? ($req['res']['data']['upload_url'] ?? '') : (string)($req['res']['data'] ?? '');
@@ -224,7 +227,7 @@ function sendToRubika(string $text, ?string $file, ?string $type, string $fileNa
  *  ۴) وضعیت UNVERIFIED (ارسال شد ولی تأیید نشد) به‌صورت شکستِ صادقانه
  *     نگاشت می‌شود، نه OK کاذب.
  */
-function runUserbot(string $script, string $profileDir, string $channel, string $channelName, string $text, ?string $filePath, ?string $mediaType): array {
+function runUserbot(string $script, string $profileDir, string $channel, string $channelName, string $text, ?string $filePath, ?string $mediaType, array $extraArgs = []): array {
     if (trim($text) === '' and (!$filePath or !file_exists($filePath))) {
         return ['success' => true, 'message' => 'SKIP: محتوایی برای ارسال نیست', 'skipped' => true];
     }
@@ -244,6 +247,12 @@ function runUserbot(string $script, string $profileDir, string $channel, string 
     if ($filePath and file_exists($filePath)) {
         $cmd .= ' --file=' . escapeshellarg($filePath);
         $cmd .= ' --type=' . escapeshellarg((string)($mediaType ?? ''));
+    }
+    foreach ($extraArgs as $flag => $value) {
+        if ($value === null or $value === '') {
+            continue;
+        }
+        $cmd .= ' --' . $flag . '=' . escapeshellarg((string)$value);
     }
 
     $output = shell_exec($cmd . ' 2>&1');
@@ -275,11 +284,11 @@ function runUserbot(string $script, string $profileDir, string $channel, string 
 }
 
 function sendToSoroush(string $channel, string $text = '', ?string $filePath = null, ?string $mediaType = null): array {
-    return runUserbot(SOROUSH_SCRIPT, '/home/file/public_html/s/soroush_profile', $channel, SOROUSH_CHANNEL_NAME, $text, $filePath, $mediaType);
+    return runUserbot(SOROUSH_SCRIPT, SOROUSH_PROFILE_DIR, $channel, SOROUSH_CHANNEL_NAME, $text, $filePath, $mediaType);
 }
 
 function sendToIgap(string $channel, string $text = '', ?string $filePath = null, ?string $mediaType = null): array {
-    return runUserbot(IGAP_SCRIPT, '/home/file/public_html/s/igap_profile', $channel, IGAP_CHANNEL_NAME, $text, $filePath, $mediaType);
+    return runUserbot(IGAP_SCRIPT, IGAP_PROFILE_DIR, $channel, IGAP_CHANNEL_NAME, $text, $filePath, $mediaType, ['item-id' => IGAP_ITEM_ID]);
 }
 
 $action =$_GET['action'] ?? '';
@@ -461,12 +470,25 @@ if ($action === 'send_report') {
     $payload = json_decode(readRequestBody(), true);
     $reportItems =$payload['report'] ?? [];
 
-    if (!empty(BALE_ADMIN_CHAT_ID) and !empty($reportItems)) {
-        $reportText = "📊 گزارش همگام‌سازی ۴ کانال:\nزمان: " . date('Y-m-d H:i:s') . "\nتعداد پست‌ها: " . count($reportItems) . "\n\n" . implode("\n\n", $reportItems);$adminUrl = "https://tapi.bale.ai/bot" . preg_replace('/^bot/i', '', trim(BALE_BOT_TOKEN)) . "/sendMessage";
-        callApi($adminUrl, json_encode(['chat_id' => BALE_ADMIN_CHAT_ID, 'text' =>$reportText]), false, ['Content-Type: application/json']);
+    $reportSent  = false;
+    $reportError = '';
+
+    if (!empty($reportItems)) {
+        $missing = envMissing(['BALE_BOT_TOKEN', 'BALE_ADMIN_CHAT_ID']);
+        if ($missing) {
+            $reportError = envMissingMessage($missing);
+        } else {
+            $reportText = "📊 گزارش همگام‌سازی ۴ کانال:\nزمان: " . date('Y-m-d H:i:s') . "\nتعداد پست‌ها: " . count($reportItems) . "\n\n" . implode("\n\n", $reportItems);
+            $adminUrl = "https://tapi.bale.ai/bot" . preg_replace('/^bot/i', '', trim(BALE_BOT_TOKEN)) . "/sendMessage";
+            $sent = callApi($adminUrl, json_encode(['chat_id' => BALE_ADMIN_CHAT_ID, 'text' =>$reportText]), false, ['Content-Type: application/json']);
+            $reportSent  = ($sent['code'] === 200 and ($sent['res']['ok'] ?? false));
+            $reportError = $reportSent ? '' : ('ارسال گزارش به مدیر ناموفق بود (HTTP ' . ($sent['code'] ?? 0) . ')');
+        }
+    } else {
+        $reportError = 'گزارشی برای ارسال وجود ندارد';
     }
 
-    echo json_encode(['success' => true]);
+    echo json_encode(['success' => $reportSent, 'error' => $reportError], JSON_UNESCAPED_UNICODE);
     exit;
 }
 ?>

@@ -148,11 +148,17 @@ sequenceDiagram
 ```
 /home/file/public_html/s/
 │
+├── 🔑 پیکربندی
+│   ├── .env                     ← ⭐ همهٔ توکن‌ها و رمزها (git-ignored، مجوز ۶۰۰)
+│   ├── .env.example             ← الگوی کامل کلیدها با توضیح فارسی (بدون مقدار حساس)
+│   ├── config.php               ← خواندن .env و تعریف ثابت‌ها برای همهٔ اسکریپت‌های PHP
+│   └── setup_env.sh             ← ساخت خودکار .env + مهاجرت از تاریخ Git + کلید تصادفی
+│
 ├── 🌐 لایه وب / ارکستراسیون
 │   ├── sync_manual.php          ← ⭐ نقطه ورود اصلی: داشبورد + ۳ اندپوینت AJAX
 │   ├── cli_run.php              ← ⭐ پل CLI: اجرای همان action ها بدون Apache (cron)
 │   ├── sync_daemon.php          ← جایگزین CLI: حلقه daemon با فاصله ۳۰ ثانیه (legacy)
-│   └── .htaccess                ← محافظت از state/profile/اسکرین‌شات‌ها (لیست سفید)
+│   └── .htaccess                ← محافظت از state/profile/.env (لیست سفید)
 │
 ├── 🤖 لایه خودکارسازی مرورگر (Node.js + Playwright)
 │   ├── lib/
@@ -176,6 +182,7 @@ sequenceDiagram
 │   ├── acceptance.sh            ← پوشش جدول T-1..T-18 (همان smoke_test.sh)
 │   ├── health_check.sh          ← بررسی سلامت روزانه + هشدار به مدیر در بله
 │   ├── collect_diagnostics.sh   ← جمع‌آوری یکجای شواهد برای گزارش خطا
+│   ├── .cron_key                ← کلید حالت HTTP در cron (git-ignored، ساختهٔ setup_env.sh)
 │   ├── logrotate.conf           ← چرخش لاگ‌ها (کپی به /etc/logrotate.d/eitaa-sync)
 │   └── deploy/systemd/          ← eitaa-sync.{service,timer} و eitaa-health.{service,timer}
 │
@@ -321,29 +328,96 @@ sudo -u file bash cron_sync.sh
 
 ## ۸. پیکربندی
 
-همهٔ تنظیمات به‌صورت `const` در بالای [`sync_manual.php`](sync_manual.php) تعریف شده‌اند:
+همهٔ پیکربندی — به‌ویژه **همهٔ توکن‌ها و رمزها** — در یک فایل `.env` کنار برنامه نگه داشته می‌شود و هیچ secret ای در کد باقی نمانده است. سه فایل این لایه را می‌سازند:
 
-| ثابت | مقدار فعلی | نقش |
+| فایل | نقش | در Git؟ |
 |---|---|---|
-| `SECURITY_KEY` | *(در کد — باید تغییر کند)* | کلید دسترسی کوئری‌استرینگ `?key=` |
+| `.env.example` | الگوی کامل همهٔ کلیدها با توضیح فارسی (بدون مقدار حساس) | ✅ بله |
+| `config.php` | خواندن `.env` و تعریف ثابت‌ها + توابع `env()/envInt()/envBool()/envMissing()` | ✅ بله |
+| `lib/pw_common.js` | خواندن همان `.env` سمت Node (برای مقدارهای پیش‌فرض کانال و مسیرها) | ✅ بله |
+| `.env` | مقدارهای واقعی استقرار شما | ❌ هرگز (git-ignored + مسدود در `.htaccess`) |
+
+### ۸.۱ ساخت `.env` (یک دستور)
+
+```bash
+cd /home/file/public_html/s
+bash setup_env.sh              # ساخت .env + مهاجرت خودکار مقدارها + کلید تصادفی
+bash setup_env.sh --show       # نمایش خلاصه با مقدارهای پوشیده
+bash setup_env.sh --check      # اعتبارسنجی کلیدهای ضروری و مجوز ۶۰۰
+chmod 600 .env && chown file:file .env
+```
+
+`setup_env.sh` این کارها را می‌کند: ساخت `.env` از روی `.env.example`، بیرون کشیدن مقدارهای قدیمی از درخت کاری و **تاریخ Git** (تا توکن‌ها را دوباره تایپ نکنید)، ساخت `SECURITY_KEY` تصادفی ۳۲ نویسه‌ای (مقدار قدیمی `1` بود)، هم‌تراز کردن همهٔ مسیرها با دایرکتوری واقعی برنامه، ساخت `.cron_key`، و ست کردن مجوز `600`.
+
+> 🔴 این توکن‌ها در تاریخ Git نیز وجود دارند؛ پس از استقرار حتماً **چرخش** کنید (revoke + ساخت مجدد در پنل هر پیام‌رسان). برای حذف کامل از تاریخ: `git filter-repo` یا BFG. جزئیات در [`ARCHITECTURE.md`](ARCHITECTURE.md) §۹.
+
+### ۸.۲ اولویت مقدارها
+
+```text
+متغیر محیطی واقعی (systemd / cron / shell)   >   .env   >   پیش‌فرض داخل config.php
+```
+
+یعنی برای یک اجرای آزمایشی می‌توانید بدون دست زدن به `.env` فقط یک مقدار را override کنید:
+
+```bash
+IGAP_CHANNEL_NAME="کانال آزمایش" sudo -u file --preserve-env=IGAP_CHANNEL_NAME \
+  /usr/bin/node send_igap.js --text="تست"
+```
+
+### ۸.۳ جدول کلیدها
+
+**اعتبارنامه‌ها و دسترسی (فقط از `.env` — پیش‌فرض خالی است)**
+
+| کلید | نقش |
+|---|---|
+| `SECURITY_KEY` | کلید داشبورد و اندپوینت‌های AJAX (`?key=`) |
+| `DASHBOARD_ALLOWED_IP` | محدودسازی IP داشبورد (چند مقدار با کاما؛ خالی = بدون محدودیت) |
+| `BALE_BOT_TOKEN` | توکن بات بله |
+| `BALE_ADMIN_CHAT_ID` | گیرندهٔ گزارش مدیریتی در بله |
+| `RUBIKA_BOT_TOKEN` | توکن بات روبیکا |
+| `RUBIKA_CHAT_ID_GUID` | شناسهٔ یکتا (GUID) کانال روبیکا — برای آزمون تفکیک GUID/username |
+| `SOROUSH_BOT_TOKEN`, `SOROUSH_CHAT_ID` | مسیر Bot API سروش (اختیاری؛ مسیر اصلی UserBot است) |
+
+**مبدأ و مقصدها (پیش‌فرض امن دارند)**
+
+| کلید | پیش‌فرض | نقش |
+|---|---|---|
 | `EITAA_CHANNEL_ID` | `shamimeashena` | کانال مبدأ در ایتا (بدون `@`) |
 | `MAX_MESSAGES_LIMIT` | `7` | سقف پست‌های پردازشی در هر اجرا |
-| `BALE_BOT_TOKEN` | *(محرمانه)* | توکن بات بله |
 | `BALE_CHANNEL_ID` | `@testforme` | کانال مقصد بله |
-| `BALE_ADMIN_CHAT_ID` | `1598432451` | گیرندهٔ گزارش مدیریتی |
-| `RUBIKA_BOT_TOKEN` | *(محرمانه)* | توکن بات روبیکا |
 | `RUBIKA_CHANNEL_ID` | `@shamimeashena1` | کانال مقصد روبیکا |
 | `SOROUSH_CHANNEL_ID` | `shamimeashena1` | کانال مقصد سروش‌پلاس (بدون `@`) |
-| `SOROUSH_CHANNEL_NAME` | `شمیم آشنا` | **نام نمایشی** کانال سروش؛ معیار تأیید «باز شدن چت درست» (`--channel-name`) |
-| `SOROUSH_SCRIPT` | `/home/file/public_html/s/send_soroush.js` | مسیر مطلق اسکریپت Node |
+| `SOROUSH_CHANNEL_NAME` | `شمیم آشنا` | **نام نمایشی**؛ معیار تأیید «باز شدن چت درست» |
 | `IGAP_CHANNEL_ID` | `shamimeashena` | کانال مقصد آی‌گپ |
-| `IGAP_CHANNEL_NAME` | `شمیم آشنا` | نام نمایشی کانال در لیست گفت‌وگوهای آی‌گپ (`--channel-name`) |
-| `IGAP_SCRIPT` | `/home/file/public_html/s/send_igap.js` | مسیر مطلق اسکریپت Node |
-| `NODE_BIN` | `/usr/bin/node` | باینری Node مورد استفاده در `shell_exec` |
-| `USERBOT_TIMEOUT_SEC` | `240` | کرانهٔ سخت هر اجرای UserBot (`timeout` دور subprocess) |
-| `MEDIA_MAX_RETRY` | `3` | سقف تلاش برای دانلود رسانه پیش از انتشار بدون رسانه ([`TROUBLESHOOTING.md`](TROUBLESHOOTING.md) §۳.۳) |
+| `IGAP_CHANNEL_NAME` | `شمیم آشنا` | نام نمایشی کانال در لیست گفت‌وگوهای آی‌گپ |
+| `IGAP_ITEM_ID` | `16200343869985976` | `data-list-item-id` سل کانال در آی‌گپ |
 
-> 🔒 **هشدار امنیتی:** توکن‌ها در حال حاضر hard-code هستند. پیش از هر استقرار عمومی، بخش «امنیت» در [`ARCHITECTURE.md`](ARCHITECTURE.md) §۹ و گام ۹ [`DEPLOYMENT.md`](DEPLOYMENT.md) را اجرا کنید (انتقال به `.env` / `config.local.php` و **چرخش توکن‌ها**، چون در تاریخ Git ثبت شده‌اند).
+**مسیرها و زمان اجرا**
+
+| کلید | پیش‌فرض | نقش |
+|---|---|---|
+| `SYNC_APP_DIR` | دایرکتوری خود برنامه | ریشهٔ همهٔ مسیرها (پروفایل‌ها، `logs/`، state) |
+| `NODE_BIN` | `/usr/bin/node` | باینری Node در `shell_exec` |
+| `SYNC_CHROMIUM_BIN` | `/usr/bin/chromium-browser` | باینری کرومیوم (خالی = تشخیص خودکار) |
+| `PHP_BIN` | *(خالی = تشخیص خودکار)* | باینری PHP برای `cron_sync.sh` |
+| `SOROUSH_SCRIPT` / `IGAP_SCRIPT` | `<APP>/send_*.js` | مسیر اسکریپت‌های Node |
+| `SOROUSH_PROFILE_DIR` / `IGAP_PROFILE_DIR` | `<APP>/*_profile` | پروفایل پایدار کرومیوم |
+| `STATE_DB_PATH` / `LOG_DIR` | `<APP>/state.sqlite` و `<APP>/logs` | پایگاه دادهٔ وضعیت و لاگ‌ها |
+
+**زمان‌بندی، تحمل خطا و اشکال‌زدایی**
+
+| کلید | پیش‌فرض | نقش |
+|---|---|---|
+| `USERBOT_TIMEOUT_SEC` | `240` | کرانهٔ سخت هر اجرای UserBot (`timeout` دور subprocess) |
+| `MEDIA_MAX_RETRY` | `3` | سقف تلاش دانلود رسانه پیش از انتشار بدون رسانه ([`TROUBLESHOOTING.md`](TROUBLESHOOTING.md) §۳.۳) |
+| `SYNC_GAP_SEC` | `5` | فاصلهٔ بین پست‌ها در `cron_sync.sh` |
+| `CHECK_INTERVAL_SEC` | `30` | فاصلهٔ بررسی در `sync_daemon.php` (legacy) |
+| `SYNC_BASE_URL` | *(خالی = حالت CLI)* | پایهٔ URL برای حالت HTTP در `cron_sync.sh` |
+| `SYNC_USER_AGENT` | *(خالی)* | override کردن UA کرومیوم — توصیه نمی‌شود |
+| `SYNC_HEADED` | `0` | `1` = اجرای غیر headless برای ورود تعاملی |
+| `ENABLE_SOROUSH_BOT` | `false` | فعال‌سازی مسیر Bot API سروش در daemon |
+
+> ⚠️ اگر `SECURITY_KEY` خالی باشد، داشبورد با پیام «پیکربندی ناقص» بالا نمی‌آید و اگر `BALE_BOT_TOKEN` یا `RUBIKA_BOT_TOKEN` خالی باشد، همان پلتفرم با پیام `پیکربندی ناقص است؛ این کلیدها در .env مقدار ندارند: …` شکست می‌خورد — **نه** ارسال اشتباه یا OK کاذب.
 
 ---
 
@@ -438,6 +512,9 @@ ACTION=sync_single SYNC_BODY_FILE=/tmp/body.json php cli_run.php
 | 12 | افزودن `login_igap.js` (ورود تعاملی آی‌گپ با قالب شمارهٔ ملی/بین‌المللی) و `dump_dom.js` (یافتن سلکتور جایگزین پس از تغییر وب‌کلاینت) | ✨ ابزار جدید | `login_igap.js`, `dump_dom.js` |
 | 13 | افزودن فایل‌های عملیاتی آمادهٔ اجرا: `cron_sync.sh` (حالت CLI بدون وابستگی به تایم‌اوت Apache)، `cli_run.php`، `smoke_test.sh`، `acceptance.sh`، `health_check.sh`، `collect_diagnostics.sh`، `logrotate.conf`، `.htaccess`، واحدهای `deploy/systemd/` | ⚙️ Ops | ۹ فایل جدید |
 | 14 | **رفع حفرهٔ امنیتی CDP**: `start_browser.sh` پیش‌تر `--remote-debugging-address=0.0.0.0` داشت (دسترسی کامل به session از بیرون)؛ اکنون فقط `127.0.0.1` و فقط پروفایل هدف را `pkill` می‌کند | 🔒 امنیتی | `start_browser.sh` |
+| 15 | **خروج همهٔ رمزها از کد**: فایل `.env` کنار برنامه تنها منبع اعتبارنامه‌ها شد؛ `config.php` آن را برای همهٔ اسکریپت‌های PHP می‌خواند و `lib/pw_common.js` همان فایل را برای Node. `setup_env.sh` مقدارها را از تاریخ Git مهاجرت می‌دهد و `SECURITY_KEY` تصادفی می‌سازد | 🔒 امنیتی | `config.php`, `.env.example`, `setup_env.sh`, همهٔ `*.php`, `lib/pw_common.js` |
+| 16 | **شکست صریح به‌جای رفتار مبهم** وقتی پیکربندی ناقص است: داشبورد با پیام «پیکربندی ناقص» بالا نمی‌آید، بله/روبیکا `NOT_CONFIGURED` برمی‌گردانند و sender ها `NO_CHANNEL` می‌دهند | ✨ قابلیت | `sync_manual.php`, `send_soroush.js`, `test_*.php` |
+| 17 | افزودن `DASHBOARD_ALLOWED_IP` (محدودسازی IP داشبورد از `.env`) و `IGAP_ITEM_ID` (انتقال `--item-id` به Node) | ✨ قابلیت | `config.php`, `sync_manual.php` |
 
 ---
 

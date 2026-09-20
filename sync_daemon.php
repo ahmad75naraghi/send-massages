@@ -6,21 +6,12 @@ date_default_timezone_set('Asia/Tehran');
 // ==========================================
 // تنظیمات اتصال
 // ==========================================
-const EITAA_CHANNEL_ID    = 'shamimeashena';
-const CHECK_INTERVAL_SEC  = 30; // فاصله بررسی به ثانیه
+require_once __DIR__ . '/config.php';
 
-// بله
-const BALE_BOT_TOKEN      = '74580067:QneNhGu2LENUy5RatIeEiSzugYztXyGYmLs'; // توکن بات بله
-const BALE_CHAT_ID        = '@shamimeashena';     // آیدی یا عدد کانال بله
+// همهٔ مقدارها از .env می‌آیند:
+//   EITAA_CHANNEL_ID، CHECK_INTERVAL_SEC، BALE_BOT_TOKEN، BALE_CHANNEL_ID،
+//   RUBIKA_BOT_TOKEN، RUBIKA_CHANNEL_ID، ENABLE_SOROUSH_BOT، SOROUSH_BOT_TOKEN، SOROUSH_CHAT_ID
 
-// روبیکا
-const RUBIKA_BOT_TOKEN    = 'CEJCFE0FCBZKUIGMNMOODEZXQAVAFDOLNFHMSBDFUVDAQMAFIYQDUMJWDODELSWZ';
-const RUBIKA_CHAT_ID      = '@shamimeashena';
-
-// سروش‌پلاس (فعلاً به دلیل باگ سمت سرور غیرفعال است)
-const ENABLE_SOROUSH      = false;
-const SOROUSH_BOT_TOKEN   = '70022669:QMFqHjA8guTKl6WuUOyPp2f1PFAPp8nrV_4';
-const SOROUSH_CHAT_ID     = '@shamimeashena';
 
 // ==========================================
 // پایگاه داده وضعیت (State Persistence)
@@ -173,7 +164,7 @@ class Broadcaster
         $this->sendToBale($msg, $localFile);
         $this->sendToRubika($msg, $localFile);
 
-        if (ENABLE_SOROUSH) {
+        if (ENABLE_SOROUSH_BOT) {
             $this->sendToSoroush($msg, $localFile);
         }
 
@@ -192,7 +183,7 @@ class Broadcaster
         if ($localFile && file_exists($localFile)) {
             $url = "https://tapi.bale.ai/bot{$cleanToken}/sendPhoto";
             $postData = [
-                'chat_id' => BALE_CHAT_ID,
+                'chat_id' => BALE_CHANNEL_ID,
                 'caption' => mb_substr($msg->text, 0, 1000),
                 'photo'   => new CURLFile($localFile, 'image/jpeg', 'photo.jpg')
             ];
@@ -200,7 +191,7 @@ class Broadcaster
         } elseif (!empty($msg->text)) {
             $url = "https://tapi.bale.ai/bot{$cleanToken}/sendMessage";
             $payload = [
-                'chat_id' => BALE_CHAT_ID,
+                'chat_id' => BALE_CHANNEL_ID,
                 'text'    => $msg->text
             ];
             $this->execCurl($url, json_encode($payload), false, ['Content-Type: application/json']);
@@ -213,7 +204,7 @@ class Broadcaster
         if ($localFile && file_exists($localFile)) {
             $url = "https://botapi.rubika.ir/v3/" . RUBIKA_BOT_TOKEN . "/sendPhoto";
             $postData = [
-                'chat_id' => RUBIKA_CHAT_ID,
+                'chat_id' => RUBIKA_CHANNEL_ID,
                 'caption' => mb_substr($msg->text, 0, 1000),
                 'photo'   => new CURLFile($localFile, 'image/jpeg', 'photo.jpg')
             ];
@@ -221,7 +212,7 @@ class Broadcaster
         } elseif (!empty($msg->text)) {
             $url = "https://botapi.rubika.ir/v3/" . RUBIKA_BOT_TOKEN . "/sendMessage";
             $payload = [
-                'chat_id' => RUBIKA_CHAT_ID,
+                'chat_id' => RUBIKA_CHANNEL_ID,
                 'text'    => $msg->text
             ];
             $this->execCurl($url, json_encode($payload), false, ['Content-Type: application/json']);

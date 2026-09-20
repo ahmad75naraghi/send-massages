@@ -31,6 +31,10 @@
 | `Call to undefined function shell_exec()` / بدون خروجی | [§۵.۳](#s5-3) |
 | `Allowed memory size exhausted` | [§۵.۴](#s5-4) |
 | `.htaccess` باعث ۵۰۰ شد | [§۵.۵](#s5-5) |
+| داشبورد `500`: «پیکربندی ناقص» | [§۵.۶](#s5-6) |
+| `پیکربندی ناقص است؛ این کلیدها در .env مقدار ندارند: …` | [§۵.۶](#s5-6) |
+| `NO_CHANNEL` از `send_soroush.js` / `send_igap.js` | [§۵.۶](#s5-6) |
+| `Permission denied` هنگام خواندن `.env` از PHP | [§۵.۶](#s5-6) |
 | `database is locked` / `SQLITE_BUSY` | [§۶.۱](#s6-1) |
 | `near "ON": syntax error` در UPSERT | [§۶.۲](#s6-2) |
 | توکن‌ها نشت کرده‌اند / در Git هستند | [§۷.۱](#s7-1) |
@@ -1085,6 +1089,92 @@ curl -s -o /dev/null -w '%{http_code}\n' "https://your-domain/s/sync_manual.php?
 
 ---
 
+### ۵.۶ پیکربندی ناقص: `.env` ساخته نشده یا کلیدی خالی است <a id="s5-6"></a>
+
+**علامت‌ها**
+
+| علامت | معنا |
+|---|---|
+| داشبورد `HTTP 500` با متن «پیکربندی ناقص: SECURITY_KEY …» | `.env` نیست یا `SECURITY_KEY` خالی است |
+| `{"success":false,...,"info":"پیکربندی ناقص است؛ این کلیدها در .env مقدار ندارند: BALE_BOT_TOKEN"}` | توکن بله در `.env` نیست |
+| `"status": "NOT_CONFIGURED"` در پاسخ روبیکا | توکن روبیکا در `.env` نیست |
+| `{"status":"ERROR","code":"NO_CHANNEL",...}` از sender های Node | `SOROUSH_CHANNEL_ID`/`SOROUSH_CHANNEL_NAME` (یا معادل آی‌گپ) خالی است |
+| `curl .../sync_manual.php?key=...` → `401`/«کلید نامعتبر» | کلید URL با `SECURITY_KEY` در `.env` یکی نیست |
+
+**ریشه‌های رایج**
+
+1. `.env` هرگز ساخته نشده (فقط `.env.example` در ریپو است) — رایج‌ترین علت پس از `git clone`.
+2. `.env` با مجوز `600` و مالک دیگری ساخته شده، پس کاربر وب‌سرور نمی‌تواند بخواند.
+3. کلید با فاصله/نقل‌قول اضافی نوشته شده: `KEY = "value"` یا `KEY='value' # کامنت`.
+4. `SYNC_APP_DIR` اشتباه است ⇒ `STATE_DB_PATH`/`LOG_DIR` به مسیر غیرقابل‌نوشتن اشاره می‌کنند.
+5. فایل `.env` روی سرور دیگر ویرایش شده ولی مقدار در shell جاری override شده (متغیر محیطی اولویت دارد).
+
+**تشخیص — سه دستور**
+
+```bash
+APP=/home/file/public_html/s
+ls -l "$APP/.env"                                   # وجود + مجوز + مالک
+bash "$APP/setup_env.sh" --check                     # کلیدهای ضروری و مجوز ۶۰۰
+bash "$APP/setup_env.sh" --show                      # کدام کلیدها ست/خالی‌اند (مقدار پوشیده)
+```
+
+خواندن دقیقاً همان چیزی که PHP می‌بیند (بدون چاپ مقدار حساس):
+
+```bash
+sudo -u file bash -c "cd $APP && php -r '
+require "config.php";
+foreach (["SECURITY_KEY","BALE_BOT_TOKEN","BALE_CHANNEL_ID","RUBIKA_BOT_TOKEN",
+          "SOROUSH_CHANNEL_ID","IGAP_CHANNEL_ID","SYNC_APP_DIR","STATE_DB_PATH"] as \$k)
+  printf("%-22s %s\\n", \$k, defined(\$k) && constant(\$k) !== "" ? "SET" : "EMPTY");
+'"
+```
+
+اگر همه `EMPTY` هستند ⇒ `.env` خوانده نشده است (مسیر/مجوز). اگر فقط یکی `EMPTY` است ⇒ همان کلید در `.env` نیست.
+
+**رفع**
+
+```bash
+APP=/home/file/public_html/s
+cd "$APP"
+
+# حالت ۱: .env وجود ندارد → بسازید (مقدارهای قدیمی از تاریخ Git مهاجرت می‌شوند)
+bash setup_env.sh
+
+# حالت ۲: .env هست ولی ناقص/خراب → از الگو بازسازی و مقدارها را منتقل کنید
+cp .env .env.bak.$(date +%s)
+bash setup_env.sh --force            # ⚠️ SECURITY_KEY تازه تصادفی می‌سازد؛ .cron_key را هم به‌روز کنید
+
+# حالت ۳: مجوز/مالکیت
+chown file:file .env .cron_key && chmod 600 .env .cron_key
+# اگر PHP با mod_php و کاربر www-data اجرا می‌شود:
+#   chown file:www-data .env && chmod 640 .env
+
+# حالت ۴: فرمت نادرست یک خط (فاصله/نقل‌قول/کامنت چسبیده)
+grep -nE '^\s*(export\s+)?[A-Z_]+\s+=' .env        # فاصله دور = ممنوع
+sed -i -E 's/^\s*export\s+//; s/\s*=\s*/=/; s/\s+#.*$//' .env
+
+# حالت ۵: مسیر برنامه
+sed -i "s#^SYNC_APP_DIR=.*#SYNC_APP_DIR=$APP#" .env
+bash setup_env.sh --show | grep -E 'SYNC_APP_DIR|STATE_DB_PATH|LOG_DIR'
+```
+
+سپس تأیید کنید:
+
+```bash
+bash "$APP/setup_env.sh" --check && echo "CONFIG OK ✅"
+bash "$APP/smoke_test.sh" 2>&1 | sed -n '1,25p'      # §۰ = بررسی پیکربندی
+KEY=$(cat "$APP/.cron_key")
+curl -s -o /dev/null -w 'dashboard: %{http_code}\n' "https://دامنه/s/sync_manual.php?key=${KEY}"
+```
+
+> 🔴 **`.env` را هرگز `git add` نکنید.** بررسی: `git check-ignore -v .env` باید قاعدهٔ `.gitignore` را نشان دهد. اگر قبلاً کامیت شده: `git rm --cached .env` و سپس چرخش همهٔ توکن‌ها (§۷.۱).
+>
+> 📌 پس از تغییر `SECURITY_KEY`، هم URL داشبورد و هم `.cron_key` باید هم‌مقدار شوند، وگرنه cron با «کلید نامعتبر» شکست می‌خورد.
+
+**پیشگیری** — `smoke_test.sh` §۰ و `health_check.sh` این موارد را بررسی می‌کنند؛ آن‌ها را در cron بگذارید تا پیکربندی ناقص پیش از کاربر کشف شود.
+
+---
+
 ## ۶. پایگاه داده
 
 ### ۶.۱ قفل پایگاه داده <a id="s6-1"></a>
@@ -1261,24 +1351,37 @@ git rev-list --all | while read c; do git grep -lI -e 'bot[0-9]\{6,\}:' "$c" 2>/
 | روبیکا | در پنل توسعه‌دهندگان روبیکا: باطل‌سازی و صدور توکن جدید |
 | سروش‌پلاس | در اپ: «دستگاه‌های فعال» → پایان دادن به session وب → ورود مجدد با `login_soroush.js` |
 | آی‌گپ | در اپ: «نشست‌های فعال» → خاتمهٔ همه → ورود مجدد با `login_igap.js` |
-| `SECURITY_KEY` | تولید کلید تازه: `head -c 48 /dev/urandom \| base64 \| tr -d '/+=\n' \| cut -c1-40` |
+| `SECURITY_KEY` | تولید کلید تازه: `openssl rand -hex 16` یا `head -c 48 /dev/urandom \| base64 \| tr -d '/+=\n' \| cut -c1-40` |
+
+از این نسخه، **هیچ توکنی در کد نیست**؛ همه در `.env` هستند. پس چرخش یعنی ویرایش `.env`:
 
 ```bash
 APP=/home/file/public_html/s
-NEWKEY=$(head -c 48 /dev/urandom | base64 | tr -d '/+=\n' | cut -c1-40)
-echo "$NEWKEY" > "$APP/.cron_key" && chown file:file "$APP/.cron_key" && chmod 600 "$APP/.cron_key"
-sed -i "s/^const SECURITY_KEY       = '.*';/const SECURITY_KEY       = '${NEWKEY}';/" "$APP/sync_manual.php"
-grep -n 'SECURITY_KEY' "$APP/sync_manual.php" | head -3
-ea-php81 -l "$APP/sync_manual.php"
+
+# ۱) توکن‌های چرخش‌یافته را در .env بگذارید
+nano "$APP/.env"          # BALE_BOT_TOKEN=, RUBIKA_BOT_TOKEN=, SOROUSH_BOT_TOKEN=
+
+# ۲) کلید داشبورد را تازه کنید (هر دو فایل باید هم‌مقدار باشند)
+NEWKEY=$(openssl rand -hex 16)
+sed -i "s/^SECURITY_KEY=.*/SECURITY_KEY=${NEWKEY}/" "$APP/.env"
+printf '%s\n' "$NEWKEY" > "$APP/.cron_key"
+chown file:file "$APP/.env" "$APP/.cron_key" && chmod 600 "$APP/.env" "$APP/.cron_key"
+
+# ۳) اعتبارسنجی — هیچ ویرایش دستی در کد لازم نیست
+bash "$APP/setup_env.sh" --check
+curl -s -o /dev/null -w '%{http_code}\n' "https://دامنه/s/sync_manual.php?key=${NEWKEY}"   # باید 200
 ```
+
+> ⚠️ URL داشبورد را هم به‌روز کنید (bookmark / cron) چون `?key=` عوض شده است. `cron_sync.sh` خودش `.cron_key` را می‌خواند، پس به تغییر دستی نیاز ندارد.
 
 **رفع — گام ۲: خارج‌سازی از ردیابی (انجام شده در این نسخه)**
 
 ```bash
 cd /home/file/public_html/s
 cat .gitignore | head -20
-git ls-files | wc -l        # باید ~۱۷–۲۲ باشد
-git status --porcelain | head
+git ls-files | grep -E '\.env$|\.cron_key$'      # باید خروجی خالی بدهد
+git check-ignore -v .env .cron_key                 # باید هر دو را ignore شده نشان دهد
+git status --porcelain | head                      # .env نباید در فهرست باشد
 ```
 
 **رفع — گام ۳: پاک‌سازی تاریخچه (اختیاری، مخرب)**
@@ -1370,7 +1473,8 @@ ssh -N -L 9222:127.0.0.1:9222 file@server
 
 ```bash
 BASE="https://your-domain/s"
-for u in state.sqlite soroush_session.json igap_dump.html error_log \
+for u in .env .env.example .cron_key config.php cli_run.php \
+         state.sqlite soroush_session.json igap_dump.html error_log \
          step2.jpg step3.jpg last_igap_send.jpg last_media_send.jpg \
          start_browser.sh send_soroush.js send_igap.js .git/config \
          backups/ logs/ soroush_profile/Default/Cookies igap_profile/Default/Cookies; do
@@ -1380,14 +1484,22 @@ for u in state.sqlite soroush_session.json igap_dump.html error_log \
 done
 ```
 
-هر موردی که `200` داد، یک **نشت فعال** است.
+هر موردی که `200` داد، یک **نشت فعال** است. مهم‌ترین آن‌ها `.env` است: اگر `200` بدهد، **همهٔ توکن‌های شما عمومی شده‌اند** و باید فوراً §۷.۱ (چرخش) را اجرا کنید.
 
 **رفع**
 
 ```bash
 APP=/home/file/public_html/s
+# ۰) مجوز و مالکیت .env
+ls -l "$APP"/.env "$APP"/.cron_key           # باید -rw------- و مالک file:file باشد
+chmod 600 "$APP"/.env "$APP"/.cron_key
+grep -qE '^\.env$' "$APP/.gitignore" || echo "🔴 .env در .gitignore نیست"
+git -C "$APP" ls-files --error-unmatch .env 2>/dev/null \
+  && echo "🔴 .env در Git ردیابی می‌شود — git rm --cached .env"
+
 # ۱) اطمینان از وجود .htaccess
 test -f "$APP/.htaccess" || echo "🔴 .htaccess وجود ندارد — DEPLOYMENT.md §۶.۳ را اجرا کنید"
+grep -q 'config\\.php' "$APP/.htaccess" || echo "🔴 قاعدهٔ انکار config.php/.env در .htaccess نیست"
 
 # ۲) اگر فهرست‌برداری دایرکتوری باز است
 grep -n 'Options -Indexes' "$APP/.htaccess" || sed -i '1i Options -Indexes' "$APP/.htaccess"
@@ -1412,17 +1524,31 @@ sed -i 's#\$APP/backups#/home/file/backups_app#g' "$APP"/*.sh 2>/dev/null
 
 ```bash
 APP=/home/file/public_html/s
+
 echo "=== فایل‌هایی که نباید عمومی باشند ==="
-find "$APP" -maxdepth 1 \( -name '*.sqlite' -o -name '*session*.json' -o -name '.cron_key' -o -name 'config.local.php' \) -printf '%m %u:%g %p\n'
-echo "=== کلیدهای hard-code باقی‌مانده ==="
-grep -rnE "BOT_TOKEN\s*=\s*'[A-Za-z0-9:]{10,}'" "$APP"/*.php | sed -E "s/'[^']{6,}'/'***REDACTED***'/g"
+find "$APP" -maxdepth 1 \( -name '*.sqlite' -o -name '*session*.json' -o -name '.cron_key' \
+       -o -name '.env' -o -name '.cron_env' -o -name 'config.local.php' \) -printf '%m %u:%g %p\n'
+# انتظار: .env و .cron_key با مجوز 600
+
+echo "=== کلیدهای hard-code باقی‌مانده در کد (باید خالی باشد) ==="
+grep -rnE "(BOT_TOKEN|SECURITY_KEY|ADMIN_CHAT_ID)\s*=\s*'[A-Za-z0-9:]{8,}'" \
+     "$APP"/*.php "$APP"/lib/*.js 2>/dev/null | sed -E "s/'[^']{6,}'/'***REDACTED***'/g"
+grep -rnE "define\('(BALE|RUBIKA|SOROUSH)_(BOT_TOKEN|ADMIN_CHAT_ID)', *'[^']" "$APP"/*.php 2>/dev/null
+
+echo "=== .env در Git ردیابی نمی‌شود؟ (باید خالی باشد) ==="
+git -C "$APP" ls-files | grep -E '^\.env$|^\.cron_key$'
+
 echo "=== SSL verify غیرفعال ==="
 grep -rn 'CURLOPT_SSL_VERIFYPEER => false' "$APP"/*.php | wc -l
+
 echo "=== کلید دسترسی ضعیف ==="
-grep -n "SECURITY_KEY" "$APP/sync_manual.php" | head -1
+KEY=$(sed -nE 's/^SECURITY_KEY=(.*)$/\1/p' "$APP/.env" | tr -d '\"\x27')
+echo "طول کلید: ${#KEY}"          # باید ≥ ۳۲ باشد؛ ۰ یا ۱ = 🔴
+[ "${#KEY}" -lt 32 ] && echo "🔴 کلید ضعیف است — §۷.۱ را اجرا کنید"
 ```
 
-اگر `SECURITY_KEY` هنوز `'1'` است، **همین حالا** §۷.۱ را اجرا کنید.
+> ✅ معیار سالم بودن: فایل‌های حساس `600`، هیچ grep ای خروجی ندهد، طول `SECURITY_KEY` ≥ ۳۲.
+> دستور `bash $APP/setup_env.sh --check` همین بررسی‌ها را یکجا انجام می‌دهد.
 
 ---
 

@@ -100,11 +100,23 @@ async function countCards(page) {
 
 (async () => {
     const opts = C.parseArgs(process.argv);
+    // اولویت: آرگومان خط فرمان > .env (IGAP_*) > متغیرهای محیطی قدیمی > پیش‌فرض
     // نام کانال پیش از ورود به سلکتور از کاراکترهای شکننده پاک می‌شود
-    const name = String(opts.channelName || process.env.SYNC_IGAP_CHANNEL_NAME || DEFAULT_CHANNEL_NAME).replace(/["\\]/g, '');
-    const itemId = String(opts.itemId || process.env.SYNC_IGAP_ITEM_ID || DEFAULT_ITEM_ID).replace(/["\\]/g, '');
+    const name = String(
+        opts.channelName
+        || C.env('IGAP_CHANNEL_NAME')
+        || C.env('SYNC_IGAP_CHANNEL_NAME')
+        || DEFAULT_CHANNEL_NAME
+    ).replace(/["\\]/g, '');
+    const itemId = String(
+        opts.itemId
+        || C.env('IGAP_ITEM_ID')
+        || C.env('SYNC_IGAP_ITEM_ID')
+        || DEFAULT_ITEM_ID
+    ).replace(/["\\]/g, '');
+    const channel = opts.channel || C.env('IGAP_CHANNEL_ID');
     const log = new C.RunLog('igap');
-    log.step(`args: channel=${opts.channel || '-'} name="${name}" item-id=${itemId} text=${opts.text.length}ch file=${opts.file || '-'} type=${opts.type || '-'}`);
+    log.step(`args: channel=${channel || '-'} name="${name}" item-id=${itemId} text=${opts.text.length}ch file=${opts.file || '-'} type=${opts.type || '-'} env=${C.ENV_FILE || 'none'}`);
 
     let browser = null;
     let exitCode = 0;

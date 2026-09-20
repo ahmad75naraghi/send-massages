@@ -2,9 +2,10 @@
 #  .htaccess — محافظت از مسیر استقرار
 #  اصل: «همه‌چیز بسته، مگر آنچه صریحاً باز شده»
 #
-#  نکتهٔ حیاتی: cli_run.php عمداً بسته است؛ این فایل SECURITY_KEY را
+#  نکتهٔ حیاتی ۱: cli_run.php عمداً بسته است؛ این فایل SECURITY_KEY را
 #  نمی‌پرسد (فقط برای CLI است) و اگر از وب قابل دسترس باشد، هر کسی
 #  می‌تواند sync_single اجرا کند.
+#  نکتهٔ حیاتی ۲: .env و config.php حاوی همهٔ توکن‌ها هستند و بسته‌اند.
 # ============================================================
 
 Options -Indexes -ExecCGI
@@ -13,8 +14,14 @@ Options -Indexes -ExecCGI
 Require all denied
 
 # ۲) فقط نقاط ورود مجاز وب باز می‌شوند
+#    (config.php و cli_run.php عمداً در این فهرست نیستند)
 <FilesMatch "^(sync_manual|test|test_rubika|test_rubika_media|test_soroush|send_test)\.php$">
     Require all granted
+</FilesMatch>
+
+# ۲-ب) لایهٔ صریح برای فایل‌های پیکربندی و اعتبارنامه (دفاع دوم)
+<FilesMatch "^(\.env|\.env\..*|\.cron_key|\.cron_env|config\.php|cli_run\.php)$">
+    Require all denied
 </FilesMatch>
 
 # ۳) محدودسازی IP داشبورد (اکیداً توصیه‌شده؛ IP خود را جایگزین کنید)

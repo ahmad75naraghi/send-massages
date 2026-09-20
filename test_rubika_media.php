@@ -3,8 +3,16 @@ declare(strict_types=1);
 
 header('Content-Type: application/json; charset=utf-8');
 
-const RUBIKA_BOT_TOKEN  = 'CEJCFE0FCBZKUIGMNMOODEZXQAVAFDOLNFHMSBDFUVDAQMAFIYQDUMJWDODELSWZ';
-const RUBIKA_CHANNEL_ID = '@shamimeashena1';
+require_once __DIR__ . '/config.php';
+
+// مقدارها از .env می‌آیند (RUBIKA_BOT_TOKEN، RUBIKA_CHANNEL_ID)
+$missing = envMissing(['RUBIKA_BOT_TOKEN', 'RUBIKA_CHANNEL_ID']);
+if ($missing) {
+    http_response_code(500);
+    echo json_encode(['status' => 'error', 'error' => envMissingMessage($missing)], JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
 
 // ایجاد یا استفاده از تصویر تستی
 $testImgPath = __DIR__ . '/test_img.jpg';

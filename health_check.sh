@@ -21,10 +21,30 @@ chk() {  # chk "شرح" "شرط"
   fi
 }
 
-PHP_BIN=""
-for c in ea-php83 ea-php82 ea-php81 php; do command -v "$c" >/dev/null 2>&1 && { PHP_BIN="$(command -v "$c")"; break; }; done
+# .env همان منبع پیکربندی PHP/Node/Shell است
+if [[ -r "$APP_DIR/.env" ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source "$APP_DIR/.env"
+  set +a
+fi
+
+PHP_BIN="${PHP_BIN:-}"
+if [[ -z "$PHP_BIN" ]]; then
+  for c in ea-php83 ea-php82 ea-php81 php; do command -v "$c" >/dev/null 2>&1 && { PHP_BIN="$(command -v "$c")"; break; }; done
+fi
+[[ -z "$PHP_BIN" ]] && PHP_BIN="php"
 
 echo "=== $(date '+%F %T') بررسی سلامت ===" | tee -a "$LOG_FILE"
+
+chk "فایل .env موجود است"               'test -f '"$APP_DIR"'/.env'
+chk ".env مجوز ۶۰۰ دارد"                'test "$(stat -c %a '"$APP_DIR"'/.env 2>/dev/null)" = "600"'
+chk "SECURITY_KEY تنظیم شده"            'test -n "${SECURITY_KEY:-}"'
+chk "SECURITY_KEY پیش‌فرض «1» نیست"      'test "${SECURITY_KEY:-1}" != "1"'
+chk "BALE_BOT_TOKEN تنظیم شده"          'test -n "${BALE_BOT_TOKEN:-}"'
+chk "RUBIKA_BOT_TOKEN تنظیم شده"        'test -n "${RUBIKA_BOT_TOKEN:-}"'
+chk "هیچ توکنی در کد PHP نمانده"        'test -z "$(grep -rhoE "const[[:space:]]+(BALE|RUBIKA|SOROUSH)_BOT_TOKEN" --include="*.php" '"$APP_DIR"' 2>/dev/null)"'
+chk "config.php سالم است"               '"$PHP_BIN" -l '"$APP_DIR"'/config.php | grep -q "No syntax errors"'
 
 chk "باینری node"                 'test -x /usr/bin/node'
 chk "باینری chromium-browser"     'test -x /usr/bin/chromium-browser'

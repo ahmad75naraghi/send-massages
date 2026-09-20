@@ -129,20 +129,27 @@ function parseArgs(argv) {
 
 | آرگومان | نوع | پیش‌فرض | ملاحظات |
 |---|---|---|---|
-| `--channel=<id>` | string | سروش: `''` / آی‌گپ: `''` | `@` ابتدایی و کوتیشن جفت‌شده حذف می‌شود |
-| `--channel-name=<نام نمایشی>` | string | آی‌گپ: `شمیم آشنا` | **ستون فقرات تأیید**: باز شدن چت درست با دیدن این نام در هدر/لیست تأیید می‌شود |
+| `--channel=<id>` | string | از `.env`: `SOROUSH_CHANNEL_ID` / `IGAP_CHANNEL_ID` | `@` ابتدایی و کوتیشن جفت‌شده حذف می‌شود |
+| `--channel-name=<نام نمایشی>` | string | از `.env`: `SOROUSH_CHANNEL_NAME` / `IGAP_CHANNEL_NAME` | **ستون فقرات تأیید**: باز شدن چت درست با دیدن این نام در هدر/لیست تأیید می‌شود |
 | `--text=<string>` | string | `''` | چندخطی، فارسی و ایموجی مجاز است |
 | `--file=<abs path>` | string | `null` | با `fs.existsSync` تأیید می‌شود؛ وگرنه `FILE_MISSING` |
 | `--type=<image\|video\|document\|audio>` | string | `''` | نوع رسانه از لایهٔ scraping؛ در نبود آن از پسوند حدس زده می‌شود |
-| `--item-id=<id>` | string | آی‌گپ: `16200343869985976` | شناسهٔ `data-list-item-id` سل کانال در آی‌گپ |
+| `--item-id=<id>` | string | از `.env`: `IGAP_ITEM_ID` (پیش‌فرض `16200343869985976`) | شناسهٔ `data-list-item-id` سل کانال در آی‌گپ |
+
+> 📌 اگر کانال سروش/آی‌گپ نه با آرگومان و نه در `.env` مشخص باشد، اسکریپت **پیش از راه‌اندازی مرورگر** با کد `NO_CHANNEL` خارج می‌شود — رفتار پیشین «باز کردن اولین چت لیست» حذف شده است ([`TROUBLESHOOTING.md`](TROUBLESHOOTING.md) §۵.۶).
+
+**منبع مقدارها:** `lib/pw_common.js` هنگام require، فایل `.env` کنار ریپو را می‌خواند (`loadDotEnv()`)؛ مسیرش با `SYNC_ENV_FILE` قابل override است. اولویت: **متغیر محیطی واقعی > `.env` > پیش‌فرض کد**.
 
 | متغیر محیطی | نقش |
 |---|---|
-| `SYNC_APP_DIR` | مسیر استقرار (پیش‌فرض `/home/file/public_html/s`)؛ محل پروفایل‌ها، `logs/` و اسکرین‌شات‌ها |
+| `SYNC_ENV_FILE` | مسیر فایل `.env` (پیش‌فرض `<repo>/.env`) |
+| `SYNC_APP_DIR` | مسیر استقرار؛ محل پروفایل‌ها، `logs/` و اسکرین‌شات‌ها (از `.env` می‌آید) |
 | `SYNC_CHROMIUM_BIN` | باینری کرومیوم؛ در نبود آن `resolveChromium()` مسیرهای رایج را می‌آزماید |
 | `SYNC_USER_AGENT` | override کردن UA — **به‌طور پیش‌فرض خاموش** (نمونه‌های کاری پروژه بدون override موفق بودند) |
 | `SYNC_HEADED=1` | اجرای غیر headless (برای ورود تعاملی روی ماشین دارای نمایشگر) |
-| `SYNC_IGAP_CHANNEL_NAME` / `SYNC_IGAP_ITEM_ID` | جایگزین `--channel-name` / `--item-id` در آی‌گپ |
+| `SOROUSH_CHANNEL_ID` / `SOROUSH_CHANNEL_NAME` | پیش‌فرض `--channel` / `--channel-name` در سروش (از `.env`) |
+| `IGAP_CHANNEL_ID` / `IGAP_CHANNEL_NAME` / `IGAP_ITEM_ID` | پیش‌فرض همان آرگومان‌ها در آی‌گپ (از `.env`) |
+| `SYNC_IGAP_CHANNEL_NAME` / `SYNC_IGAP_ITEM_ID` | مسیر override موقت (اولویت پایین‌تر از `IGAP_*`) |
 
 > **چرا `split('=').slice(1).join('=')`؟** اگر متن حاوی `=` باشد (مثلاً لینک `https://shamiim.ir/?a=b`)، `split('=')[1]` متن را می‌بُرد. این الگو همهٔ بخش‌های بعد از اولین `=` را دوباره به هم می‌چسباند.
 

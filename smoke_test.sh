@@ -21,10 +21,39 @@ t() {  # t "عنوان" "دستور شرط"
   else echo "FAIL ❌"; FAIL=$((FAIL+1)); fi
 }
 
-PHP_BIN=""
-for c in ea-php83 ea-php82 ea-php81 php; do command -v "$c" >/dev/null 2>&1 && { PHP_BIN="$(command -v "$c")"; break; }; done
+PHP_BIN="${PHP_BIN:-}"
+if [[ -z "$PHP_BIN" ]]; then
+  for c in ea-php83 ea-php82 ea-php81 php; do command -v "$c" >/dev/null 2>&1 && { PHP_BIN="$(command -v "$c")"; break; }; done
+fi
+if [[ -z "$PHP_BIN" ]]; then PHP_BIN="php"; fi
 
-echo "=== ۱) محیط زمان اجرا ==="
+envval() {  # envval KEY → مقدار از محیط یا .env
+  local k="$1" v=""
+  v="${!k:-}"
+  if [[ -z "$v" && -r "$APP_DIR/.env" ]]; then
+    v="$(sed -nE "s/^${k}=([^\r]*)$/\1/p" "$APP_DIR/.env" | tail -1)"
+    v="${v%\#*}"; v="$(printf '%s' "$v" | sed -E 's/[[:space:]]+$//; s/^"(.*)"$/\1/; s/^'\''(.*)'\''$/\1/')"
+  fi
+  printf '%s' "$v"
+}
+
+echo; echo "=== ۰) پیکربندی (.env) ==="
+t ".env وجود دارد"                     'test -f "$APP_DIR/.env"'
+t ".env مجوز ۶۰۰ دارد"                 'test "$(stat -c %a "$APP_DIR/.env" 2>/dev/null)" = "600"'
+t ".env در .gitignore است"              'git -C "$APP_DIR" check-ignore -q .env 2>/dev/null || grep -qx ".env" "$APP_DIR/.gitignore"'
+t "SECURITY_KEY مقدار دارد"             'test -n "$(envval SECURITY_KEY)"'
+t "BALE_BOT_TOKEN مقدار دارد"           'test -n "$(envval BALE_BOT_TOKEN)"'
+t "BALE_ADMIN_CHAT_ID مقدار دارد"       'test -n "$(envval BALE_ADMIN_CHAT_ID)"'
+t "RUBIKA_BOT_TOKEN مقدار دارد"         'test -n "$(envval RUBIKA_BOT_TOKEN)"'
+t "نام کانال سروش مقدار دارد"            'test -n "$(envval SOROUSH_CHANNEL_NAME)"'
+t "نام کانال آی‌گپ مقدار دارد"            'test -n "$(envval IGAP_CHANNEL_NAME)"'
+t "هیچ توکنی در کد PHP نمانده"           'test -z "$(grep -rhoE "const[[:space:]]+(BALE|RUBIKA|SOROUSH)_BOT_TOKEN" --include="*.php" "$APP_DIR" 2>/dev/null)"'
+t "config.php قابل require است"        '"$PHP_BIN" -r "require \"$APP_DIR/config.php\"; echo function_exists(\"env\") ? \"ok\" : \"no\";" | grep -q ok'
+if [[ ! -f "$APP_DIR/.env" ]]; then
+  echo "    → برای ساخت خودکار: bash setup_env.sh"
+fi
+
+echo; echo "=== ۱) محیط زمان اجرا ==="
 t "node v20+ در /usr/bin/node"        'test -x /usr/bin/node && /usr/bin/node -v | grep -qE "v(2[0-9])"'
 t "chromium-browser موجود است"        'test -x /usr/bin/chromium-browser'
 t "وابستگی‌های کرومیوم کامل است"       'test "$(ldd /usr/bin/chromium-browser 2>/dev/null | grep -c "not found")" -eq 0'
@@ -43,6 +72,9 @@ t "jq موجود است"                      'command -v jq'
 echo; echo "=== ۲) سینتکس و یکپارچگی کد ==="
 t "php -l sync_manual.php"             '"$PHP_BIN" -l sync_manual.php | grep -q "No syntax errors"'
 t "php -l cli_run.php"                 '"$PHP_BIN" -l cli_run.php | grep -q "No syntax errors"'
+t "php -l config.php"                  '"$PHP_BIN" -l config.php | grep -q "No syntax errors"'
+t "php -l sync_daemon.php"             '"$PHP_BIN" -l sync_daemon.php | grep -q "No syntax errors"'
+t "bash -n setup_env.sh"               'bash -n setup_env.sh'
 t "node --check send_soroush.js"       'node --check send_soroush.js'
 t "node --check send_igap.js"          'node --check send_igap.js'
 t "node --check login_soroush.js"      'node --check login_soroush.js'
@@ -77,37 +109,40 @@ if [[ "$LIVE" == "--live" ]]; then
   echo; echo "=== ۶) ارسال زندهٔ تستی ==="
   STAMP="$(date '+%H:%M:%S')"
 
-  BTOKEN=$(grep -oP "const BALE_BOT_TOKEN\s*=\s*'\K[^']+" sync_manual.php | head -1)
-  BCHAT=$(grep -oP "const BALE_CHANNEL_ID\s*=\s*'\K[^']+" sync_manual.php | head -1)
+  BTOKEN="$(envval BALE_BOT_TOKEN)"
+  BCHAT="$(envval BALE_CHANNEL_ID)"
+  [[ -z "$BCHAT" ]] && BCHAT="@testforme"
   printf '  %-46s ' "بله: sendMessage زنده"
   if [[ -n "$BTOKEN" ]] && curl -s -X POST "https://tapi.bale.ai/bot${BTOKEN}/sendMessage" \
        -H 'Content-Type: application/json' -d "{\"chat_id\":\"${BCHAT}\",\"text\":\"smoke $STAMP\"}" | jq -e .ok >/dev/null 2>&1; then
     echo "PASS ✅"; PASS=$((PASS+1)); else echo "FAIL ❌"; FAIL=$((FAIL+1)); fi
 
-  RTOKEN=$(grep -oP "const RUBIKA_BOT_TOKEN\s*=\s*'\K[^']+" sync_manual.php | head -1)
-  RCHAT=$(grep -oP "const RUBIKA_CHANNEL_ID\s*=\s*'\K[^']+" sync_manual.php | head -1)
+  RTOKEN="$(envval RUBIKA_BOT_TOKEN)"
+  RCHAT="$(envval RUBIKA_CHANNEL_ID)"
   printf '  %-46s ' "روبیکا: sendMessage زنده"
   if [[ -n "$RTOKEN" ]] && curl -s -X POST "https://botapi.rubika.ir/v3/${RTOKEN}/sendMessage" \
        -H 'Content-Type: application/json' -d "{\"chat_id\":\"${RCHAT}\",\"text\":\"smoke $STAMP\"}" | jq -e '.status == "OK"' >/dev/null 2>&1; then
     echo "PASS ✅"; PASS=$((PASS+1)); else echo "FAIL ❌"; FAIL=$((FAIL+1)); fi
 
-  SCH=$(grep -oP "const SOROUSH_CHANNEL_ID\s*=\s*'\K[^']+" sync_manual.php | head -1)
-  SNAME=$(grep -oP "const SOROUSH_CHANNEL_NAME\s*=\s*'\K[^']+" sync_manual.php | head -1)
+  SCH="$(envval SOROUSH_CHANNEL_ID)"
+  SNAME="$(envval SOROUSH_CHANNEL_NAME)"
   printf '  %-46s ' "سروش‌پلاس: ارسال متن زنده"
   OUT=$(sudo -u "${SUDO_USER:-file}" /usr/bin/node send_soroush.js --channel="$SCH" --channel-name="$SNAME" --text="smoke $STAMP" 2>/dev/null | tail -1)
   if jq -e '.status == "OK"' <<<"$OUT" >/dev/null 2>&1; then echo "PASS ✅ (${OUT})"; PASS=$((PASS+1));
   else echo "FAIL ❌ (${OUT:0:160})"; FAIL=$((FAIL+1)); fi
 
-  ICH=$(grep -oP "const IGAP_CHANNEL_ID\s*=\s*'\K[^']+" sync_manual.php | head -1)
-  INAME=$(grep -oP "const IGAP_CHANNEL_NAME\s*=\s*'\K[^']+" sync_manual.php | head -1)
+  ICH="$(envval IGAP_CHANNEL_ID)"
+  INAME="$(envval IGAP_CHANNEL_NAME)"
+  IITEM="$(envval IGAP_ITEM_ID)"
+  [[ -n "$IITEM" ]] && IGAP_EXTRA="--item-id=$IITEM" || IGAP_EXTRA=""
   printf '  %-46s ' "آی‌گپ: ارسال متن زنده"
-  OUT=$(sudo -u "${SUDO_USER:-file}" /usr/bin/node send_igap.js --channel="$ICH" --channel-name="$INAME" --text="smoke $STAMP" 2>/dev/null | tail -1)
+  OUT=$(sudo -u "${SUDO_USER:-file}" /usr/bin/node send_igap.js --channel="$ICH" --channel-name="$INAME" $IGAP_EXTRA --text="smoke $STAMP" 2>/dev/null | tail -1)
   if jq -e '.status == "OK"' <<<"$OUT" >/dev/null 2>&1; then echo "PASS ✅ (${OUT})"; PASS=$((PASS+1));
   else echo "FAIL ❌ (${OUT:0:160})"; FAIL=$((FAIL+1)); fi
 
   if [[ -f test_img.jpg ]]; then
     printf '  %-46s ' "آی‌گپ: ارسال رسانه زنده"
-    OUT=$(sudo -u "${SUDO_USER:-file}" /usr/bin/node send_igap.js --channel="$ICH" --channel-name="$INAME" --text="smoke media $STAMP" --file="$APP_DIR/test_img.jpg" --type=image 2>/dev/null | tail -1)
+    OUT=$(sudo -u "${SUDO_USER:-file}" /usr/bin/node send_igap.js --channel="$ICH" --channel-name="$INAME" $IGAP_EXTRA --text="smoke media $STAMP" --file="$APP_DIR/test_img.jpg" --type=image 2>/dev/null | tail -1)
     if jq -e '.status == "OK"' <<<"$OUT" >/dev/null 2>&1; then echo "PASS ✅ (${OUT})"; PASS=$((PASS+1));
     else echo "FAIL ❌ (${OUT:0:160})"; FAIL=$((FAIL+1)); fi
   fi
