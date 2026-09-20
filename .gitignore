@@ -1,0 +1,91 @@
+# ============================================================
+#  Content Syndication System — .gitignore
+#  هیچ‌گاه نباید credentials، session مرورگر یا state runtime
+#  وارد Git شود. (به DEPLOYMENT.md §۹ و TROUBLESHOOTING.md §۷ مراجعه کنید)
+# ============================================================
+
+# --- ۱. کلیدها و توکن‌ها (Secrets) ---
+.env
+.env.*
+!.env.example
+config.local.php
+secrets.php
+*_token*
+*.pem
+*.key
+*.p12
+
+# --- ۲. Session های ذخیره‌شده مرورگر (کوکی/LocalStorage/IndexedDB) ---
+soroush_session.json
+igap_session.json
+*_session.json
+soroush_profile/
+igap_profile/
+*_profile/
+
+# --- ۳. پایگاه داده وضعیت و فایل‌های قفل SQLite ---
+state.sqlite
+*.sqlite
+*.sqlite3
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+*.db
+
+# --- ۴. وابستگی‌های Node ---
+node_modules/
+npm-debug.log*
+yarn-error.log*
+.pnp.*
+
+# --- ۵. artifacts زمان اجرا: اسکرین‌شات‌های شاهد و دامپ DOM ---
+last_*.jpg
+last_*.png
+step*.jpg
+step*.png
+igap_attach_menu.jpg
+igap_popup_opened.jpg
+igap_state.jpg
+igap_dump.html
+*_dump.html
+screenshot*.png
+
+# --- ۶. لاگ‌ها ---
+error_log
+*.log
+logs/
+
+# --- ۷. فایل‌های موقت رسانه (دانلود شده از CDN ایتا) ---
+# نکته: downloadMedia() در sys_get_temp_dir() (/tmp) می‌نویسد، نه در ریپو؛
+# این الگوها فقط برای حالتی است که TMPDIR به داخل پروژه نگاشت شود.
+tmp/
+temp/
+media_cache/
+/tmp/sync_*
+/tmp/eitaa_media_*
+
+# --- ۸. قفل‌های Singleton کرومیوم ---
+SingletonLock
+SingletonCookie
+SingletonSocket
+Singleton*
+
+# --- ۹. سیستم‌عامل / ویرایشگر ---
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.sublime-workspace
+
+# --- ۱۰. فایل‌های پشتیبان cPanel ---
+*.bak
+*.backup
+*.tar.gz
+*.zip
+backup_*
+cpmove-*
+home_*

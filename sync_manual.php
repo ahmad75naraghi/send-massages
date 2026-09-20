@@ -73,6 +73,26 @@ function downloadMedia(string $url, string$targetFilename): ?string {
     return null;
 }
 
+// استخراج آخرین JSON معتبر از خروجی اسکریپت Node
+// (هشدارهای Playwright/Chromium که با 2>&1 به stdout می‌آیند، json_decode کل رشته را نامعتبر می‌کنند)
+function parseNodeJsonOutput(string $output): ?array {
+    $lines = preg_split('/\R/', trim($output));
+    if (!is_array($lines)) {
+        return null;
+    }
+    foreach (array_reverse($lines) as $line) {
+        $line = trim($line);
+        if ($line === '' || $line[0] !== '{') {
+            continue;
+        }
+        $decoded = json_decode($line, true);
+        if (is_array($decoded)) {
+            return $decoded;
+        }
+    }
+    return null;
+}
+
 function callApi(string $url, mixed$data, bool $isMultipart, array$headers = []): array {
     $ch = curl_init($url);
     curl_setopt_array($ch, [
@@ -119,30 +139,46 @@ function sendToRubika(string $text, ?string $file, ?string $type, string $fileNa
 
 function sendToSoroush(string $channel, string $text = '', ?string $filePath = null): array {
     $cleanChannel = ltrim($channel, '@');
-    @array_map('unlink', glob('/home/file/public_html/s/soroush_profile/Singleton*') ?: []);
-    $cmd = sprintf('\%s \%s --channel=\%s', escapeshellcmd(NODE_BIN), escapeshellarg(SOROUSH_SCRIPT), escapeshellarg($cleanChannel));
-    if ($text !== '') $cmd .= ' --text=' . escapeshellarg($text);
-    if ($filePath and file_exists($filePath)) $cmd .= ' --file=' . escapeshellarg($filePath);
+    $profileDir   = '/home/file/public_html/s/soroush_profile';
+    @array_map('unlink', glob($profileDir . '/Singleton*') ?: []);
+
+    $cmd = escapeshellarg(NODE_BIN) . ' ' . escapeshellarg(SOROUSH_SCRIPT) . ' --channel=' . escapeshellarg($cleanChannel);
+    if ($text !== '') {
+        $cmd .= ' --text=' . escapeshellarg($text);
+    }
+    if ($filePath and file_exists($filePath)) {
+        $cmd .= ' --file=' . escapeshellarg($filePath);
+    }
+
     $output = shell_exec($cmd . ' 2>&1');
-    @array_map('unlink', glob('/home/file/public_html/s/soroush_profile/Singleton*') ?: []);
-    $result = json_decode(trim((string)$output), true);
-    return (isset($result['status']) and$result['status'] === 'OK')
-        ? ['success' => true, 'message' => $result['message']]
-        : ['success' => false, 'message' => $result['error'] ?? ($output ?: 'Fail')];
+    @array_map('unlink', glob($profileDir . '/Singleton*') ?: []);
+
+    $result = parseNodeJsonOutput((string)$output);
+    return (isset($result['status']) and $result['status'] === 'OK')
+        ? ['success' => true, 'message' => $result['message'] ?? 'OK']
+        : ['success' => false, 'message' => $result['error'] ?? ($output !== null && trim((string)$output) !== '' ? trim((string)$output) : 'Fail')];
 }
 
 function sendToIgap(string $channel, string $text = '', ?string $filePath = null): array {
     $cleanChannel = ltrim($channel, '@');
-    @array_map('unlink', glob('/home/file/public_html/s/igap_profile/Singleton*') ?: []);
-    $cmd = sprintf('\%s \%s --channel=\%s', escapeshellcmd(NODE_BIN), escapeshellarg(IGAP_SCRIPT), escapeshellarg($cleanChannel));
-    if ($text !== '') $cmd .= ' --text=' . escapeshellarg($text);
-    if ($filePath and file_exists($filePath)) $cmd .= ' --file=' . escapeshellarg($filePath);
+    $profileDir   = '/home/file/public_html/s/igap_profile';
+    @array_map('unlink', glob($profileDir . '/Singleton*') ?: []);
+
+    $cmd = escapeshellarg(NODE_BIN) . ' ' . escapeshellarg(IGAP_SCRIPT) . ' --channel=' . escapeshellarg($cleanChannel);
+    if ($text !== '') {
+        $cmd .= ' --text=' . escapeshellarg($text);
+    }
+    if ($filePath and file_exists($filePath)) {
+        $cmd .= ' --file=' . escapeshellarg($filePath);
+    }
+
     $output = shell_exec($cmd . ' 2>&1');
-    @array_map('unlink', glob('/home/file/public_html/s/igap_profile/Singleton*') ?: []);
-    $result = json_decode(trim((string)$output), true);
-    return (isset($result['status']) and$result['status'] === 'OK')
-        ? ['success' => true, 'message' => $result['message']]
-        : ['success' => false, 'message' => $result['error'] ?? ($output ?: 'Fail')];
+    @array_map('unlink', glob($profileDir . '/Singleton*') ?: []);
+
+    $result = parseNodeJsonOutput((string)$output);
+    return (isset($result['status']) and $result['status'] === 'OK')
+        ? ['success' => true, 'message' => $result['message'] ?? 'OK']
+        : ['success' => false, 'message' => $result['error'] ?? ($output !== null && trim((string)$output) !== '' ? trim((string)$output) : 'Fail')];
 }
 
 $action =$_GET['action'] ?? '';
