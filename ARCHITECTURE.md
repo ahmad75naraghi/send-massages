@@ -797,7 +797,9 @@ flowchart LR
     OS ==>|اولویت بالاتر| PW
     CP --> P["همهٔ *.php"]
     PW --> N["همهٔ *.js"]
-    E --> SH["cron_sync.sh / health_check.sh<br/>(source .env با set -a)"]
+    DS["lib/dotenv.sh<br/>load_dotenv — بدون اجرای فایل"]
+    E --> DS
+    DS --> SH["cron_sync.sh / health_check.sh<br/>collect_diagnostics.sh / smoke_test.sh"]
 ```
 
 **قاعدهٔ اولویت** (یکسان در PHP و Node):
@@ -828,7 +830,7 @@ if ($missing) return ['ok' => false, 'code' => 0, 'info' => envMissingMessage($m
 |---|---|---|
 | خواندن از PHP | ✅ | ✅ |
 | خواندن از Node | ✅ (بدون subprocess) | ❌ نیاز به `php -r` دارد |
-| خواندن از Bash (cron) | ✅ `set -a; source` | ❌ |
+| خواندن از Bash (cron) | ✅ `lib/dotenv.sh` (لودر خط‌به‌خط) | ❌ |
 | تزریق از systemd `Environment=` | ✅ هم‌نام | باید دستی map شود |
 | ریسک اجرای کد دلخواه | ❌ (فقط key=value) | ⚠️ PHP اجرا می‌شود |
 
@@ -871,10 +873,13 @@ RewriteRule \.(sqlite|sqlite3|sqlite-journal|sqlite-wal|json|log|sh|env|ini|key|
 | `.env`, `.cron_key` | `file:file` | `600` | حاوی همهٔ توکن‌ها (`640` + گروه `www-data` فقط در حالت `mod_php`) |
 | `.env.example`, `config.php` | `file:file` | `644` | بدون مقدار حساس |
 | `setup_env.sh`, `cron_sync.sh`, `health_check.sh` | `file:file` | `750` | اجرایی فقط برای مالک |
+| `lib/dotenv.sh` | `file:file` | `644` | کتابخانهٔ source‌شدنی (اجرایی نیست) |
 | `soroush_profile/`, `igap_profile/` | `file:file` | `700` | session = اعتبارنامه |
 | `state.sqlite` | `file:file` | `660` | نیاز به نوشتن توسط PHP **و** CLI |
 | `logs/` | `file:file` | `750` | نوشتن توسط هر دو مسیر وب و CLI |
 | `/tmp/sync_*` | `file:file` | `600` (خودکار) | رسانهٔ موقت |
+
+**چرا `source .env` ممنوع است؟** مقدارهای فارسیِ دارای فاصله (مثل `SOROUSH_CHANNEL_NAME=شمیم آشنا`) در bash به `VAR=کلمهٔاول` + اجرای `کلمهٔدوم` ترجمه می‌شوند ⇒ `command not found` و در `set -e` مرگ اسکریپت. `lib/dotenv.sh` فایل را خط‌به‌خط می‌خواند و **هیچ دستوری اجرا نمی‌کند**؛ کوتیشن تکی/دوجمله‌ای، `export`، کامنت انتهایی و مقدار فارسی را درست تحلیل می‌کند و متغیر محیطیِ از قبل ست‌شده را بازنویسی نمی‌کند. `setup_env.sh` هم مقدارهای دارای فاصله را خودش کوتیشن می‌گذارد تا حتی `source` خام هم نشکند.
 
 **قاعدهٔ لاگ:** هیچ اسکریپتی مقدار یک secret را چاپ نمی‌کند. `setup_env.sh --show` و `collect_diagnostics.sh` فقط «نام کلید + وضعیت (ست شده/خالی) + چند نویسهٔ اول» را نشان می‌دهند.
 

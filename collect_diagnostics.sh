@@ -6,16 +6,21 @@
 # ============================================================
 set -uo pipefail
 
-APP="${SYNC_APP_DIR:-/home/file/public_html/s}"
+SELF_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/dotenv.sh
+[[ -r "$SELF_DIR/lib/dotenv.sh" ]] && source "$SELF_DIR/lib/dotenv.sh"
+APP="${SYNC_APP_DIR:-}"
+if [[ -z "$APP" ]]; then
+  if declare -F dotenv_app_dir >/dev/null 2>&1; then APP="$(dotenv_app_dir)"
+  else APP="$SELF_DIR"; fi
+fi
 OUT="$APP/logs/diag_$(date +%F_%H%M%S).txt"
 mkdir -p "$APP/logs"
 exec > >(tee -a "$OUT") 2>&1
 
-if [[ -r "$APP/.env" ]]; then
-  set -a
-  # shellcheck disable=SC1091
-  source "$APP/.env"
-  set +a
+if [[ -r "${SYNC_ENV_FILE:-$APP/.env}" ]]; then
+  if declare -F load_dotenv >/dev/null 2>&1; then load_dotenv "${SYNC_ENV_FILE:-$APP/.env}"
+  else set -a; . "${SYNC_ENV_FILE:-$APP/.env}"; set +a; fi
 fi
 PHP_BIN="${PHP_BIN:-}"
 if [[ -z "$PHP_BIN" ]]; then

@@ -340,7 +340,7 @@ test_rubika.php
 test_rubika_media.php
 test_soroush.php
 acceptance.sh  collect_diagnostics.sh  cron_sync.sh  health_check.sh  logrotate.conf
-lib/            (pw_common.js و ابزارهای مشترک)
+lib/            (pw_common.js، dotenv.sh و ابزارهای مشترک)
 backups/   logs/   node_modules/   soroush_profile/   igap_profile/   state.sqlite
 ```
 
@@ -362,10 +362,11 @@ chown -R file:file "$APP"
 find "$APP" -type d -exec chmod 755 {} \;
 find "$APP" -type f -exec chmod 644 {} \;
 
-# ۳) اسکریپت‌های اجرایی
+# ۳) اسکریپت‌های اجرایی (lib/dotenv.sh اجرایی نیست — ۶۴۴ می‌ماند)
 chmod 750 "$APP"/start_browser.sh "$APP"/cron_sync.sh "$APP"/health_check.sh \
           "$APP"/smoke_test.sh "$APP"/acceptance.sh "$APP"/collect_diagnostics.sh \
           "$APP"/setup_env.sh 2>/dev/null
+chmod 644 "$APP"/lib/dotenv.sh 2>/dev/null
 
 # ۳-ب) 🔴 .env و فایل‌های کلید — گام ۲ آن‌ها را ۶۴۴ کرد؛ باید محدود شوند
 chmod 600 "$APP"/.env "$APP"/.cron_key "$APP"/.cron_env 2>/dev/null

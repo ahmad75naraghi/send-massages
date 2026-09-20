@@ -12,7 +12,14 @@
 # ============================================================
 set -euo pipefail
 
-APP="${SYNC_APP_DIR:-/home/file/public_html/s}"
+SELF_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/dotenv.sh
+[[ -r "$SELF_DIR/lib/dotenv.sh" ]] && source "$SELF_DIR/lib/dotenv.sh"
+APP="${SYNC_APP_DIR:-}"
+if [[ -z "$APP" ]]; then
+  if declare -F dotenv_app_dir >/dev/null 2>&1; then APP="$(dotenv_app_dir)"
+  else APP="$SELF_DIR"; fi
+fi
 TARGET="${1:-soroush}"
 MODE="${2:-headless}"
 

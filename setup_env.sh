@@ -64,14 +64,38 @@ sane_value() {
   return 0
 }
 
-read_env_value() {  # خواندن مقدار فعلی از .env
+read_env_value() {  # خواندن مقدار فعلی از .env (کوتیشن و کامنت انتهایی حذف می‌شود)
   [[ -r "$ENV_FILE" ]] || return 0
-  sed -nE "s/^${1}=([^\r]*)$/\1/p" "$ENV_FILE" | tail -1
+  local v
+  v="$(sed -nE "s/^${1}=([^\r]*)$/\1/p" "$ENV_FILE" | tail -1)"
+  v="${v%"${v##*[![:space:]]}"}"                       # trim راست
+  case "$v" in
+    '"'*'"')   v="${v:1:${#v}-2}" ;;                    # کوتیشن دوجمله‌ای
+    "'"*"'" ) v="${v:1:${#v}-2}" ;;                     # کوتیشن تکی
+    *)        v="${v%%[[:space:]]#*}"; v="${v%"${v##*[![:space:]]}"}" ;;
+  esac
+  printf '%s' "$v"
+}
+
+quote_if_needed() {  # اگر مقدار فاصله داشت، در کوتیشن دوجمله‌ای بپیچ
+  # (نام کانال فارسی مثل «شمیم آشنا» فاصله دارد؛ بدون کوتیشن، `source .env`
+  #  کلمهٔ دوم را دستور فرض می‌کند. لودرهای config.php / pw_common.js /
+  #  lib/dotenv.sh کوتیشن را خودشان حذف می‌کنند.)
+  local v="$1"
+  case "$v" in
+    '"'*'"')  printf '%s' "$v" ;;                       # قبلاً کوتیشن دارد
+    *[[:space:]]*) printf '"%s"' "$v" ;;                 # فاصله دارد → بپیچ
+    *)        printf '%s' "$v" ;;
+  esac
 }
 
 set_env_value() {   # $1=کلید $2=مقدار
   local k="$1" v="$2"
   [[ -f "$ENV_FILE" ]] || return 1
+  # مقدارهای دارای فاصله (مثل نام فارسی کانال) باید کوتیشن داشته باشند تا
+  # حتی `source .env` هم نشکند؛ لودرهای config.php / pw_common.js / dotenv.sh
+  # کوتیشن را خودشان حذف می‌کنند.
+  v="$(quote_if_needed "$v")"
   if grep -qE "^${k}=" "$ENV_FILE"; then
     # استفاده از فایل موقت تا از sed -i با مقدارهای دارای کاراکتر خاص آسیب نبینیم
     local tmp; tmp="$(mktemp)"

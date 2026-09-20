@@ -335,6 +335,7 @@ sudo -u file bash cron_sync.sh
 | `.env.example` | الگوی کامل همهٔ کلیدها با توضیح فارسی (بدون مقدار حساس) | ✅ بله |
 | `config.php` | خواندن `.env` و تعریف ثابت‌ها + توابع `env()/envInt()/envBool()/envMissing()` | ✅ بله |
 | `lib/pw_common.js` | خواندن همان `.env` سمت Node (برای مقدارهای پیش‌فرض کانال و مسیرها) | ✅ بله |
+| `lib/dotenv.sh` | خواندن امن همان `.env` در Bash (برای `cron_sync.sh`، `health_check.sh` و…) | ✅ بله |
 | `.env` | مقدارهای واقعی استقرار شما | ❌ هرگز (git-ignored + مسدود در `.htaccess`) |
 
 ### ۸.۱ ساخت `.env` (یک دستور)
@@ -416,6 +417,8 @@ IGAP_CHANNEL_NAME="کانال آزمایش" sudo -u file --preserve-env=IGAP_CHA
 | `SYNC_USER_AGENT` | *(خالی)* | override کردن UA کرومیوم — توصیه نمی‌شود |
 | `SYNC_HEADED` | `0` | `1` = اجرای غیر headless برای ورود تعاملی |
 | `ENABLE_SOROUSH_BOT` | `false` | فعال‌سازی مسیر Bot API سروش در daemon |
+
+> 📝 **مقدار دارای فاصله را در کوتیشن بگذارید.** نام کانال‌ها فارسی و دارای فاصله‌اند (`SOROUSH_CHANNEL_NAME="شمیم آشنا"`). `setup_env.sh` این کوتیشن را خودش می‌گذارد و هر سه لودر (`config.php`، `lib/pw_common.js`، `lib/dotenv.sh`) آن را حذف می‌کنند؛ ولی اگر دستی ویرایش کردید، بدون کوتیشن ممکن است `source .env` در shell بشکند.
 
 > ⚠️ اگر `SECURITY_KEY` خالی باشد، داشبورد با پیام «پیکربندی ناقص» بالا نمی‌آید و اگر `BALE_BOT_TOKEN` یا `RUBIKA_BOT_TOKEN` خالی باشد، همان پلتفرم با پیام `پیکربندی ناقص است؛ این کلیدها در .env مقدار ندارند: …` شکست می‌خورد — **نه** ارسال اشتباه یا OK کاذب.
 
@@ -514,7 +517,9 @@ ACTION=sync_single SYNC_BODY_FILE=/tmp/body.json php cli_run.php
 | 14 | **رفع حفرهٔ امنیتی CDP**: `start_browser.sh` پیش‌تر `--remote-debugging-address=0.0.0.0` داشت (دسترسی کامل به session از بیرون)؛ اکنون فقط `127.0.0.1` و فقط پروفایل هدف را `pkill` می‌کند | 🔒 امنیتی | `start_browser.sh` |
 | 15 | **خروج همهٔ رمزها از کد**: فایل `.env` کنار برنامه تنها منبع اعتبارنامه‌ها شد؛ `config.php` آن را برای همهٔ اسکریپت‌های PHP می‌خواند و `lib/pw_common.js` همان فایل را برای Node. `setup_env.sh` مقدارها را از تاریخ Git مهاجرت می‌دهد و `SECURITY_KEY` تصادفی می‌سازد | 🔒 امنیتی | `config.php`, `.env.example`, `setup_env.sh`, همهٔ `*.php`, `lib/pw_common.js` |
 | 16 | **شکست صریح به‌جای رفتار مبهم** وقتی پیکربندی ناقص است: داشبورد با پیام «پیکربندی ناقص» بالا نمی‌آید، بله/روبیکا `NOT_CONFIGURED` برمی‌گردانند و sender ها `NO_CHANNEL` می‌دهند | ✨ قابلیت | `sync_manual.php`, `send_soroush.js`, `test_*.php` |
-| 17 | افزودن `DASHBOARD_ALLOWED_IP` (محدودسازی IP داشبورد از `.env`) و `IGAP_ITEM_ID` (انتقال `--item-id` به Node) | ✨ قابلیت | `config.php`, `sync_manual.php` |
+| 17 | `lib/dotenv.sh`: لودر امن `.env` برای Bash — جایگزین `source .env` که روی مقدارهای فارسیِ دارای فاصله (`شمیم آشنا`) با «command not found» می‌شکست | 🐛 رفع باگ | `lib/dotenv.sh`, `cron_sync.sh`, `health_check.sh`, `collect_diagnostics.sh`, `smoke_test.sh`, `start_browser.sh` |
+| 18 | `smoke_test.sh` صادق‌تر شد: حالت `SKIP` برای پیش‌نیازهای نصب‌نشده (PHP/Node/Chromium)، مسیر باینری‌ها از `.env` با fallback به `PATH`، و شمارش دقیق فرایندهای کرومیوم از `/proc/*/exe` (بدون مثبت کاذب) | ✨ قابلیت | `smoke_test.sh` |
+| 19 | افزودن `DASHBOARD_ALLOWED_IP` (محدودسازی IP داشبورد از `.env`) و `IGAP_ITEM_ID` (انتقال `--item-id` به Node) | ✨ قابلیت | `config.php`, `sync_manual.php` |
 
 ---
 

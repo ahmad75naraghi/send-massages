@@ -6,7 +6,14 @@
 # ============================================================
 set -uo pipefail
 
-APP_DIR="${SYNC_APP_DIR:-/home/file/public_html/s}"
+SELF_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/dotenv.sh
+[[ -r "$SELF_DIR/lib/dotenv.sh" ]] && source "$SELF_DIR/lib/dotenv.sh"
+APP_DIR="${SYNC_APP_DIR:-}"
+if [[ -z "$APP_DIR" ]]; then
+  if declare -F dotenv_app_dir >/dev/null 2>&1; then APP_DIR="$(dotenv_app_dir)"
+  else APP_DIR="$SELF_DIR"; fi
+fi
 LOG_FILE="$APP_DIR/logs/health.log"
 export LANG="${LANG:-en_US.UTF-8}"
 mkdir -p "$APP_DIR/logs"
@@ -22,11 +29,9 @@ chk() {  # chk "شرح" "شرط"
 }
 
 # .env همان منبع پیکربندی PHP/Node/Shell است
-if [[ -r "$APP_DIR/.env" ]]; then
-  set -a
-  # shellcheck disable=SC1091
-  source "$APP_DIR/.env"
-  set +a
+if [[ -r "${SYNC_ENV_FILE:-$APP_DIR/.env}" ]]; then
+  if declare -F load_dotenv >/dev/null 2>&1; then load_dotenv "${SYNC_ENV_FILE:-$APP_DIR/.env}"
+  else set -a; . "${SYNC_ENV_FILE:-$APP_DIR/.env}"; set +a; fi
 fi
 
 PHP_BIN="${PHP_BIN:-}"
@@ -46,9 +51,12 @@ chk "RUBIKA_BOT_TOKEN تنظیم شده"        'test -n "${RUBIKA_BOT_TOKEN:-}"
 chk "هیچ توکنی در کد PHP نمانده"        'test -z "$(grep -rhoE "const[[:space:]]+(BALE|RUBIKA|SOROUSH)_BOT_TOKEN" --include="*.php" '"$APP_DIR"' 2>/dev/null)"'
 chk "config.php سالم است"               '"$PHP_BIN" -l '"$APP_DIR"'/config.php | grep -q "No syntax errors"'
 
-chk "باینری node"                 'test -x /usr/bin/node'
-chk "باینری chromium-browser"     'test -x /usr/bin/chromium-browser'
-chk "ماژول playwright"            'cd '"$APP_DIR"' && node -e "require(\"playwright\")"'
+# باینری‌ها از .env (NODE_BIN و SYNC_CHROMIUM_BIN) — همان چیزی که PHP استفاده می‌کند
+NODE_BIN="${NODE_BIN:-/usr/bin/node}"
+CHROME_BIN="${SYNC_CHROMIUM_BIN:-/usr/bin/chromium-browser}"
+chk "باینری node ($NODE_BIN)"                 'test -x "$NODE_BIN"'
+chk "باینری کرومیوم ($CHROME_BIN)"            'test -x "$CHROME_BIN"'
+chk "ماژول playwright"            'cd '"$APP_DIR"' && "$NODE_BIN" -e "require(\"playwright\")"'
 chk "اکستنشن pdo_sqlite"           '"$PHP_BIN" -m | grep -qx pdo_sqlite'
 chk "اکستنشن curl"                 '"$PHP_BIN" -m | grep -qx curl'
 chk "اکستنشن dom"                  '"$PHP_BIN" -m | grep -qx dom'

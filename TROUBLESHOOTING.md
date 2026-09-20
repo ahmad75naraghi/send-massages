@@ -1108,6 +1108,7 @@ curl -s -o /dev/null -w '%{http_code}\n' "https://your-domain/s/sync_manual.php?
 3. کلید با فاصله/نقل‌قول اضافی نوشته شده: `KEY = "value"` یا `KEY='value' # کامنت`.
 4. `SYNC_APP_DIR` اشتباه است ⇒ `STATE_DB_PATH`/`LOG_DIR` به مسیر غیرقابل‌نوشتن اشاره می‌کنند.
 5. فایل `.env` روی سرور دیگر ویرایش شده ولی مقدار در shell جاری override شده (متغیر محیطی اولویت دارد).
+6. اسکریپت shell قدیمی با `source .env` مقدار فارسیِ دارای فاصله را می‌شکند: `bash: آشنا: command not found` و `SOROUSH_CHANNEL_NAME` فقط `شمیم` می‌شود.
 
 **تشخیص — سه دستور**
 
@@ -1148,6 +1149,12 @@ bash setup_env.sh --force            # ⚠️ SECURITY_KEY تازه تصادفی
 chown file:file .env .cron_key && chmod 600 .env .cron_key
 # اگر PHP با mod_php و کاربر www-data اجرا می‌شود:
 #   chown file:www-data .env && chmod 640 .env
+
+# حالت ۴-ب) مقدار دارای فاصله بدون کوتیشن (فارسی) — باید کوتیشن داشته باشد
+grep -nE '^[A-Z_]+=[^"\x27]*[[:space:]]+[^#]' .env      # خطوط مشکوک
+sed -i -E 's/^((SOROUSH|IGAP)_CHANNEL_NAME=)([^"\x27#]*[^"\x27#[:space:]])[[:space:]]*$/\1"\3"/' .env
+# اسکریپت‌های shell باید از lib/dotenv.sh استفاده کنند، نه source .env
+grep -rn 'source .*\.env\|^\. .*\.env' *.sh | grep -v dotenv.sh
 
 # حالت ۴: فرمت نادرست یک خط (فاصله/نقل‌قول/کامنت چسبیده)
 grep -nE '^\s*(export\s+)?[A-Z_]+\s+=' .env        # فاصله دور = ممنوع

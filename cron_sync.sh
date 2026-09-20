@@ -15,8 +15,15 @@
 # ============================================================
 set -uo pipefail
 
-APP_DIR="${SYNC_APP_DIR:-/home/file/public_html/s}"
-LOG_DIR="$APP_DIR/logs"
+SELF_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/dotenv.sh
+[[ -r "$SELF_DIR/lib/dotenv.sh" ]] && source "$SELF_DIR/lib/dotenv.sh"
+APP_DIR="${SYNC_APP_DIR:-}"
+if [[ -z "$APP_DIR" ]]; then
+  if declare -F dotenv_app_dir >/dev/null 2>&1; then APP_DIR="$(dotenv_app_dir)"
+  else APP_DIR="$SELF_DIR"; fi
+fi
+LOG_DIR="${LOG_DIR:-$APP_DIR/logs}"
 LOG_FILE="$LOG_DIR/cron_sync.log"
 LOCK_FILE="/tmp/cron_sync.lock"
 ENV_FILE="$APP_DIR/.cron_env"
@@ -39,26 +46,30 @@ fi
 
 # ---------- پیکربندی از .env (و سپس .cron_env برای سازگاری با نسخهٔ قبل) ----------
 # .env همان فایلی است که config.php و lib/pw_common.js هم می‌خوانند.
-DOT_ENV="$APP_DIR/.env"
+DOT_ENV="${SYNC_ENV_FILE:-$APP_DIR/.env}"
 if [[ -r "$DOT_ENV" ]]; then
-  set -a
-  # shellcheck disable=SC1090
-  source "$DOT_ENV"
-  set +a
+  # هرگز `source .env` نکنید: مقدارهای فارسیِ دارای فاصله (مثل نام کانال)
+  # باعث «command not found» می‌شوند. لودر خط‌به‌خط امن است.
+  if declare -F load_dotenv >/dev/null 2>&1; then
+    load_dotenv "$DOT_ENV"
+  else
+    set -a; . "$DOT_ENV"; set +a
+  fi
   log "config: $DOT_ENV"
 else
   log "WARN: فایل .env پیدا نشد ($DOT_ENV) — از مقدارهای پیش‌فرض و محیط استفاده می‌شود"
 fi
 if [[ -r "$ENV_FILE" ]]; then
-  set -a
-  # shellcheck disable=SC1090
-  source "$ENV_FILE"
-  set +a
+  if declare -F load_dotenv >/dev/null 2>&1; then
+    load_dotenv "$ENV_FILE"
+  else
+    set -a; . "$ENV_FILE"; set +a
+  fi
 fi
 BASE_URL="${SYNC_BASE_URL:-}"
 
 # ---------- انتخاب باینری PHP ----------
-# اگر در .env مقدار PHP_BIN ست شده باشد، همان اولویت دارد (پس از source خوانده شده).
+# اگر در .env مقدار PHP_BIN ست شده باشد، همان اولویت دارد (پس از load_dotenv خوانده شده).
 PHP_BIN="${PHP_BIN:-}"
 if [[ -z "$PHP_BIN" ]]; then
   for c in ea-php83 ea-php82 ea-php81 php php83 php82 php81; do
