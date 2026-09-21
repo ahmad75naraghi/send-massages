@@ -18,6 +18,7 @@
 | فرایندهای chromium باقی‌مانده پس از اجرا | [§۱.۴](#s1-4) |
 | `Error while loading shared libraries: libnss3.so` | [§۱.۵](#s1-5) |
 | `Cannot find module 'playwright'` / `MODULE_NOT_FOUND` | [§۱.۶](#s1-6) |
+| بله/روبیکا می‌روند ولی سروش/آی‌گپ نه (تشخیص یک‌دستوری) | `diagnose_userbot.sh` → [§۰](#s0) |
 | پس از `git checkout` سروش/آی‌گپ از کار افتاد یا session پرید | [§۱.۶](#s1-6) |
 | `NODE_DEPS_MISSING` در JSON پاسخ | [§۱.۶](#s1-6) |
 | صفحهٔ ورود در اسکرین‌شات / کانال در لیست نیست | [§۲](#s2) |
@@ -59,7 +60,7 @@
 
 ---
 
-## ۰. تشخیص سریع (اول این را اجرا کنید)
+## ۰. تشخیص سریع (اول این را اجرا کنید) <a id="s0"></a>
 
 ```bash
 cat > /home/file/public_html/s/collect_diagnostics.sh <<'SCRIPT'

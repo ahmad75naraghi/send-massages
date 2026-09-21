@@ -530,6 +530,7 @@ ACTION=sync_single SYNC_BODY_FILE=/tmp/body.json php cli_run.php
 | `smoke_test.sh` | آزمون پذیرش ۶ بخشی (محیط، سینتکس، مجوز، شبکه، صف، ارسال زنده) | `bash smoke_test.sh [--live]` |
 | `acceptance.sh` | پوشش جدول آزمون T-1..T-18 (پوششی بر `smoke_test.sh`) | `bash acceptance.sh` |
 | `health_check.sh` | سلامت روزانهٔ زیرساخت + هشدار خودکار به مدیر در بله | `bash health_check.sh` |
+| `diagnose_userbot.sh` | تشخیص اختصاصی «چرا سروش/آی‌گپ نمی‌فرستد»: پیکربندی، Node/playwright/کرومیوم، پروفایل و مجوزها، قفل Singleton، فرایندهای رقیب، سپس یک ارسال آزمایشی با ترجمهٔ کد خطا به راه‌حل + ۲۵ خط آخر لاگ + اسکرین‌شات شاهد. گزینه‌ها: `--no-send`، `--platform=soroush\|igap` |
 | `collect_diagnostics.sh` | جمع‌آوری یکجای شواهد (سیستم، مجوز، فرایند، state، شبکه، لاگ) | `bash collect_diagnostics.sh` |
 | `cli_run.php` | اجرای هر action از `sync_manual.php` در CLI (بدون Apache/کلید) | `ACTION=get_pending php cli_run.php` |
 | `cron_sync.sh` | چرخهٔ کامل خودکار: صف → ارسال → گزارش | `bash cron_sync.sh` |
