@@ -216,6 +216,45 @@ function sendToRubika(string $text, ?string $file, ?string $type, string $fileNa
 }
 
 /**
+ * پیش‌بررسی محیط Node پیش از راه‌اندازی subprocess.
+ *
+ * چرا لازم است؟ اگر `node_modules` پاک شود (مثلاً با `git checkout` به برنچی
+ * که آن را ردیابی نمی‌کند)، Node با `MODULE_NOT_FOUND` می‌میرد و کاربر فقط یک
+ * stack trace خام می‌بیند. اینجا پیش از اجرا بررسی و پیامِ قابل‌اقدام می‌دهیم.
+ *
+ * خروجی: رشتهٔ خالی = سالم؛ در غیر این صورت پیام فارسیِ راهنما.
+ */
+function nodeEnvProblem(string $script): string {
+    if (!is_file($script)) {
+        return "اسکریپت Node پیدا نشد: $script\n"
+             . 'رفع: مطمئن شوید فایل‌های پروژه کامل روی سرور هستند (git status / ls -l).';
+    }
+    if (!is_file(SYNC_APP_DIR . '/lib/pw_common.js')) {
+        return 'فایل lib/pw_common.js پیدا نشد (کتابخانهٔ مشترک اسکریپت‌های Node).\n'
+             . 'رفع: پوشهٔ lib/ را همراه بقیهٔ پروژه روی سرور بگذارید.';
+    }
+    $nodeBin = NODE_BIN;
+    if ($nodeBin !== '' && !is_executable($nodeBin) && !file_exists($nodeBin)) {
+        return "باینری Node در مسیر پیکربندی‌شده پیدا نشد: $nodeBin\n"
+             . 'رفع: `command -v node` را ببینید و NODE_BIN را در .env اصلاح کنید.';
+    }
+    foreach ([SYNC_APP_DIR . '/node_modules/playwright', __DIR__ . '/node_modules/playwright'] as $dir) {
+        if (is_dir($dir)) {
+            return '';
+        }
+    }
+    return 'وابستگی Node «playwright» نصب نیست (node_modules/playwright وجود ندارد).\n'
+         . 'این معمولاً وقتی رخ می‌دهد که `git checkout` به برنچ جدید، node_modules را\n'
+         . 'که در کامیت قدیمی ردیابی می‌شد، از دیسک پاک کرده باشد.\n'
+         . 'رفع (بدون نیاز به اینترنت، از همان ریپو):\n'
+         . '    cd ' . SYNC_APP_DIR . '\n'
+         . '    git restore --source=e5e4708 --worktree -- node_modules\n'
+         . '    # یا اگر git restore نبود:  git checkout e5e4708 -- node_modules && git reset -q HEAD node_modules\n'
+         . 'رفع (با اینترنت):  cd ' . SYNC_APP_DIR . ' && npm install --no-audit --no-fund\n'
+         . 'تأیید:  node -e "require(\'playwright\'); console.log(\'OK\')"';
+}
+
+/**
  * اجرای یک UserBot به‌عنوان subprocess ایمن.
  *
  * نکاتی که این تابع را با نسخهٔ پیشین متفاوت (و درست) می‌کند:
@@ -230,6 +269,12 @@ function sendToRubika(string $text, ?string $file, ?string $type, string $fileNa
 function runUserbot(string $script, string $profileDir, string $channel, string $channelName, string $text, ?string $filePath, ?string $mediaType, array $extraArgs = []): array {
     if (trim($text) === '' and (!$filePath or !file_exists($filePath))) {
         return ['success' => true, 'message' => 'SKIP: محتوایی برای ارسال نیست', 'skipped' => true];
+    }
+
+    // پیش‌بررسی: اگر playwright/Node نباشد، به‌جای stack trace خام، پیام روشن بده
+    $envProblem = nodeEnvProblem($script);
+    if ($envProblem !== '') {
+        return ['success' => false, 'code' => 'NODE_DEPS_MISSING', 'message' => $envProblem];
     }
 
     $cleanChannel = ltrim($channel, '@');
@@ -261,6 +306,28 @@ function runUserbot(string $script, string $profileDir, string $channel, string 
     $result = parseNodeJsonOutput((string)$output);
     $status = $result['status'] ?? null;
 
+    // اگر Node به خاطر ماژول گم‌شده مرده باشد، JSON قرارداد تولید نمی‌شود؛
+    // پس خودمان تشخیص می‌دهیم و پیامِ قابل‌اقدام می‌دهیم (نه stack trace خام).
+    if ($status !== 'OK' && preg_match("/Cannot find (?:module|package) '([^']+)'/u", (string)$output, $mm)) {
+        return [
+            'success' => false,
+            'code'    => 'NODE_DEPS_MISSING',
+            'message' => 'ماژول Node «' . $mm[1] . '» پیدا نشد.'
+                       . ' وابستگی‌ها را نصب/بازیابی کنید:  cd ' . SYNC_APP_DIR
+                       . ' && git restore --source=e5e4708 --worktree -- node_modules'
+                       . '   (یا: npm install --no-audit --no-fund)',
+        ];
+    }
+    if ($status !== 'OK' && str_contains((string)$output, 'MODULE_NOT_FOUND')) {
+        return [
+            'success' => false,
+            'code'    => 'NODE_DEPS_MISSING',
+            'message' => 'وابستگی‌های Node ناقص‌اند (MODULE_NOT_FOUND).'
+                       . ' رفع:  cd ' . SYNC_APP_DIR . ' && git restore --source=e5e4708 --worktree -- node_modules'
+                       . '   (یا: npm install --no-audit --no-fund)',
+        ];
+    }
+
     if ($status === 'OK') {
         return [
             'success'  => true,
@@ -277,10 +344,77 @@ function runUserbot(string $script, string $profileDir, string $channel, string 
 
     return [
         'success' => false,
+        'code'    => $code !== '' ? $code : 'RUNTIME',
         'message' => ($code !== '' ? '[' . $code . '] ' : '')
                    . ($detail !== '' ? $detail : ($raw !== '' ? mb_substr($raw, -300) : 'Fail'))
                    . $logRef,
     ];
+}
+
+/**
+ * ارسال یک پست به «پلتفرم‌های انتخاب‌شده».
+ *
+ * $only خالی یا نامعتبر = هر چهار پلتفرم (رفتار پیشین، بدون تغییر).
+ * کلیدهای مجاز: bale, rubika, soroush, igap
+ *
+ * چرا لازم است؟ اگر فقط یک مقصد شکست بخورد (مثلاً سروش به خاطر نبودِ
+ * node_modules)، پست در state «دیده‌شده» ثبت می‌شود و دیگر به صف برنمی‌گردد؛
+ * با این تابع و action=resend می‌توان فقط همان مقصدها را دوباره فرستاد،
+ * بدون اینکه در بله/روبیکا پست تکراری برود.
+ *
+ * شکل خروجی دقیقاً همان چیزی است که داشبورد انتظار دارد:
+ *   ['bale' => ['ok' => bool|null, 'info' => mixed], ...]
+ * پلتفرم‌های ردشده: ['ok' => null, 'info' => 'SKIPPED']
+ */
+function dispatchToPlatforms(array $only, string $text, ?string $localFile, ?string $mediaType, string $fileName): array {
+    $all = ['bale', 'rubika', 'soroush', 'igap'];
+    $only = array_values(array_unique(array_filter(
+        array_map(fn($x) => strtolower(trim((string)$x)), $only),
+        fn($x) => in_array($x, $all, true)
+    )));
+    if ($only === []) {
+        $only = $all;
+    }
+
+    $out = [];
+    foreach ($all as $platform) {
+        if (!in_array($platform, $only, true)) {
+            $out[$platform] = ['ok' => null, 'info' => 'SKIPPED'];
+        }
+    }
+
+    if (in_array('bale', $only, true)) {
+        $r = sendToBale($text, $localFile, $mediaType, $fileName);
+        $out['bale'] = [
+            'ok'   => ($r['code'] === 200 and (bool)($r['res']['ok'] ?? false)),
+            'info' => $r['code'] ?? 'ERR',
+        ];
+    }
+    if (in_array('rubika', $only, true)) {
+        $r = sendToRubika($text, $localFile, $mediaType, $fileName);
+        $out['rubika'] = [
+            'ok'   => ($r['code'] === 200 and (($r['res']['status'] ?? '') === 'OK')),
+            'info' => $r['code'] ?? 'ERR',
+        ];
+    }
+    if (in_array('soroush', $only, true)) {
+        $r = sendToSoroush(SOROUSH_CHANNEL_ID, $text, $localFile, $mediaType);
+        $out['soroush'] = [
+            'ok'   => ($r['success'] === true),
+            'info' => $r['message'] ?? 'ERR',
+            'code' => $r['code'] ?? '',
+        ];
+    }
+    if (in_array('igap', $only, true)) {
+        $r = sendToIgap(IGAP_CHANNEL_ID, $text, $localFile, $mediaType);
+        $out['igap'] = [
+            'ok'   => ($r['success'] === true),
+            'info' => $r['message'] ?? 'ERR',
+            'code' => $r['code'] ?? '',
+        ];
+    }
+
+    return $out;
 }
 
 function sendToSoroush(string $channel, string $text = '', ?string $filePath = null, ?string $mediaType = null): array {
@@ -293,11 +427,14 @@ function sendToIgap(string $channel, string $text = '', ?string $filePath = null
 
 $action =$_GET['action'] ?? '';
 
-// ۱. لیست پیام‌های جدید ایتا
-if ($action === 'get_pending') {
-    header('Content-Type: application/json; charset=utf-8');
-    $lastSeenId = getLastSeenId($db, EITAA_CHANNEL_ID);
-
+/**
+ * scrape نمای وب کانال ایتا و برگرداندن همهٔ پست‌های دیده‌شده.
+ *
+ * نکتهٔ مهم: لینک رسانه‌ها در ایتا «امضاشده و زمان‌دار» هستند، پس هر بار
+ * باید پیش از دانلود، scrape تازه انجام شود (نه استفاده از لینک قدیمی).
+ * خروجی: ['ok' => bool, 'error' => string, 'messages' => array] مرتب‌شده بر اساس id
+ */
+function fetchEitaaPosts(): array {
     $ch = curl_init("https://eitaa.com/" . EITAA_CHANNEL_ID);
     curl_setopt_array($ch, [
         CURLOPT_RETURNTRANSFER => true,
@@ -309,8 +446,7 @@ if ($action === 'get_pending') {
     curl_close($ch);
 
     if (empty($html)) {
-        echo json_encode(['success' => false, 'error' => 'عدم دسترسی به ایتا']);
-        exit;
+        return ['ok' => false, 'error' => 'عدم دسترسی به ایتا', 'messages' => []];
     }
 
     $dom = new DOMDocument();
@@ -362,7 +498,22 @@ if ($action === 'get_pending') {
         }
     }
 
-    usort($allMessages, fn($a, $b) =>$a['id'] <=> $b['id']);$newMessages = array_values(array_filter($allMessages, fn($m) => $m['id'] >$lastSeenId));
+    usort($allMessages, fn($a, $b) =>$a['id'] <=> $b['id']);
+    return ['ok' => true, 'error' => '', 'messages' => $allMessages];
+}
+
+// ۱. لیست پیام‌های جدید ایتا
+if ($action === 'get_pending') {
+    header('Content-Type: application/json; charset=utf-8');
+    $lastSeenId = getLastSeenId($db, EITAA_CHANNEL_ID);
+
+    $scrape = fetchEitaaPosts();
+    if (!$scrape['ok']) {
+        echo json_encode(['success' => false, 'error' => $scrape['error']], JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+
+    $newMessages = array_values(array_filter($scrape['messages'], fn($m) => $m['id'] > $lastSeenId));
     if (count($newMessages) > MAX_MESSAGES_LIMIT) {
         $newMessages = array_slice($newMessages, -MAX_MESSAGES_LIMIT);
     }
@@ -426,15 +577,10 @@ if ($action === 'sync_single') {
         }
     }
 
-    $bale = sendToBale($text, $localFile,$mediaType, $fileName);$baleOk = ($bale['code'] === 200 and ($bale['res']['ok'] ?? false));
-
-    $rubika = sendToRubika($text, $localFile,$mediaType, $fileName);$rubikaOk = ($rubika['code'] === 200 and (($rubika['res']['status'] ?? '') === 'OK'));
-
-    $soroush = sendToSoroush(SOROUSH_CHANNEL_ID, $text, $localFile, $mediaType);
-    $soroushOk = ($soroush['success'] === true);
-
-    $igap = sendToIgap(IGAP_CHANNEL_ID, $text, $localFile, $mediaType);
-    $igapOk = ($igap['success'] === true);
+    // «only» اختیاری: اگر داده شود، فقط همان مقصدها ارسال می‌شوند (برای
+    // جبران شکست جزئی، بدون پست تکراری در بقیهٔ پلتفرم‌ها).
+    $only = is_array($payload['only'] ?? null) ? (array)$payload['only'] : [];
+    $sent = dispatchToPlatforms($only, $text, $localFile, $mediaType, (string)$fileName);
 
     if ($localFile and file_exists($localFile)) {
         @unlink($localFile);
@@ -455,11 +601,12 @@ if ($action === 'sync_single') {
     echo json_encode([
         'success' => true,
         'id'      => $msgId,
+        'only'    => $only === [] ? ['bale', 'rubika', 'soroush', 'igap'] : array_values($only),
         'media'   => ['ok' => $mediaOk, 'info' => $mediaInfo],
-        'bale'    => ['ok' => $baleOk, 'info' =>$bale['code'] ?? 'ERR'],
-        'rubika'  => ['ok' => $rubikaOk, 'info' =>$rubika['code'] ?? 'ERR'],
-        'soroush' => ['ok' => $soroushOk, 'info' =>$soroush['message'] ?? 'ERR'],
-        'igap'    => ['ok' => $igapOk, 'info' =>$igap['message'] ?? 'ERR'],
+        'bale'    => ['ok' => $sent['bale']['ok'], 'info' => $sent['bale']['info']],
+        'rubika'  => ['ok' => $sent['rubika']['ok'], 'info' => $sent['rubika']['info']],
+        'soroush' => ['ok' => $sent['soroush']['ok'], 'info' => $sent['soroush']['info']],
+        'igap'    => ['ok' => $sent['igap']['ok'], 'info' => $sent['igap']['info']],
     ], JSON_UNESCAPED_UNICODE);
     exit;
 }
@@ -489,6 +636,147 @@ if ($action === 'send_report') {
     }
 
     echo json_encode(['success' => $reportSent, 'error' => $reportError], JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
+// ۴. ارسالِ دوبارهٔ پست‌های «دیده‌شده» به مقصدهای انتخابی
+//    کاربرد: وقتی پستی به بله/روبیکا رفته ولی سروش/آی‌گپ شکست خورده،
+//    بدون پست تکراری در مقصدهای موفق، فقط مقصدهای جاافتاده جبران می‌شوند.
+//    بدنهٔ JSON:
+//      {"ids":[74136,74137]}                یا  {"from":74136,"to":74142}
+//      {"only":["soroush","igap"]}          (پیش‌فرض: soroush,igap)
+//      {"advance":false}                    (پیش‌فرض: last_msg_id دست نمی‌خورد)
+if ($action === 'resend') {
+    set_time_limit(1200);
+    header('Content-Type: application/json; charset=utf-8');
+
+    $payload = json_decode(readRequestBody(), true);
+    if (!is_array($payload)) {
+        $payload = [];
+    }
+
+    $ids = [];
+    if (isset($payload['ids']) && is_array($payload['ids'])) {
+        $ids = array_values(array_filter(array_map('intval', $payload['ids']), fn($x) => $x > 0));
+    }
+    $from = isset($payload['from']) ? (int)$payload['from'] : 0;
+    $to   = isset($payload['to'])   ? (int)$payload['to']   : 0;
+
+    if ($ids === [] && $from <= 0) {
+        http_response_code(400);
+        echo json_encode([
+            'success' => false,
+            'error'   => 'BAD_REQUEST',
+            'message' => 'باید "ids":[...] یا "from":<id> (و اختیاری "to":<id>) در بدنهٔ JSON باشد.',
+        ], JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+
+    $only = is_array($payload['only'] ?? null) ? (array)$payload['only'] : ['soroush', 'igap'];
+    $advance = !empty($payload['advance']);
+
+    // scrape تازه: لینک رسانهٔ ایتا امضاشده و زمان‌دار است، پس لینک قدیمی به درد نمی‌خورد
+    $scrape = fetchEitaaPosts();
+    if (!$scrape['ok']) {
+        echo json_encode(['success' => false, 'error' => 'SCRAPE_FAILED', 'message' => $scrape['error']], JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+
+    $selected = array_values(array_filter($scrape['messages'], function (array $m) use ($ids, $from, $to) {
+        if ($ids !== []) {
+            return in_array($m['id'], $ids, true);
+        }
+        if ($to > 0) {
+            return $m['id'] >= $from && $m['id'] <= $to;
+        }
+        return $m['id'] >= $from;
+    }));
+
+    if ($selected === []) {
+        $visible = array_map(fn($m) => $m['id'], $scrape['messages']);
+        echo json_encode([
+            'success' => false,
+            'error'   => 'POSTS_NOT_VISIBLE',
+            'message' => 'پست‌های خواسته‌شده در نمای وب ایتا پیدا نشدند (ایتا فقط پست‌های اخیر را نشان می‌دهد).',
+            'visible' => $visible,
+        ], JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+
+    $results = [];
+    $maxId   = 0;
+    foreach ($selected as $index => $m) {
+        if ($index > 0 && SYNC_GAP_SEC > 0) {
+            sleep(SYNC_GAP_SEC);
+        }
+        $msgId    = (int)$m['id'];
+        $maxId    = max($maxId, $msgId);
+        $text     = (string)($m['text'] ?? '');
+        $mediaUrl = $m['mediaUrl'] ?? null;
+        $mediaType = $m['mediaType'] ?? null;
+        $fileName = (string)($m['fileName'] ?? 'file.bin');
+
+        $localFile = null;
+        $mediaReason = null;
+        $mediaInfo = 'none';
+        if ($mediaUrl) {
+            $localFile = downloadMedia((string)$mediaUrl, $fileName !== '' ? $fileName : 'file.bin', $mediaReason);
+            if (!$localFile) {
+                sleep(2);
+                $localFile = downloadMedia((string)$mediaUrl, $fileName !== '' ? $fileName : 'file.bin', $mediaReason);
+            }
+            $mediaInfo = $localFile ? 'downloaded' : ('FAILED:' . (string)$mediaReason);
+        }
+
+        $sent = dispatchToPlatforms($only, $text, $localFile, $mediaType, $fileName !== '' ? $fileName : 'file.bin');
+
+        if ($localFile and file_exists($localFile)) {
+            @unlink($localFile);
+        }
+
+        $results[] = [
+            'id'      => $msgId,
+            'media'   => ['ok' => $mediaInfo === 'none' ? null : ($mediaInfo === 'downloaded'), 'info' => $mediaInfo],
+            'bale'    => $sent['bale'],
+            'rubika'  => $sent['rubika'],
+            'soroush' => $sent['soroush'],
+            'igap'    => $sent['igap'],
+        ];
+    }
+
+    if ($advance && $maxId > 0) {
+        setLastSeenId($db, EITAA_CHANNEL_ID, $maxId);
+    }
+
+    echo json_encode([
+        'success'    => true,
+        'only'       => $only,
+        'count'      => count($results),
+        'lastSeenId' => getLastSeenId($db, EITAA_CHANNEL_ID),
+        'results'    => $results,
+    ], JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
+// ۵. عقب بردن last_msg_id (تا پست‌ها دوباره در صف داشبورد ظاهر شوند)
+//    بدنهٔ JSON: {"id":74135}   یا کوئری: ?action=rewind&key=…&id=74135
+if ($action === 'rewind') {
+    header('Content-Type: application/json; charset=utf-8');
+    $payload = json_decode(readRequestBody(), true);
+    $id = (int)($payload['id'] ?? ($_GET['id'] ?? -1));
+    if ($id < 0) {
+        http_response_code(400);
+        echo json_encode(['success' => false, 'error' => 'BAD_REQUEST', 'message' => 'شناسهٔ پست لازم است: {"id":74135}'], JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+    $before = getLastSeenId($db, EITAA_CHANNEL_ID);
+    setLastSeenId($db, EITAA_CHANNEL_ID, $id);
+    echo json_encode([
+        'success'    => true,
+        'before'     => $before,
+        'lastSeenId' => getLastSeenId($db, EITAA_CHANNEL_ID),
+        'note'       => 'پست‌های بزرگ‌تر از این شناسه دوباره در صف داشبورد ظاهر می‌شوند.',
+    ], JSON_UNESCAPED_UNICODE);
     exit;
 }
 ?>
@@ -694,16 +982,25 @@ if ($action === 'send_report') {
                 const mediaState = result.media
                     ? (result.media.ok ? '✅' : `❌ ${result.media.info}`)
                     : (m.mediaUrl ? '⚠️ نامشخص' : '—');
-                reportList.push(`🔹 پست ${m.id} [${mediaDesc}]:\n  بله: ${result.bale?.ok ? "✅" : "❌"} | روبیکا: ${result.rubika?.ok ? "✅" : "❌"}\n  سروش: ${result.soroush?.ok ? "✅" : "❌"} | آیگپ: ${result.igap?.ok ? "✅" : "❌"}\n  رسانه: ${mediaState}`);
+                const mark = r => (r?.ok === true ? '✅' : (r?.ok === null || /\bSKIPPED\b/.test(r?.info || '') ? '—' : '❌'));
+                reportList.push(`🔹 پست ${m.id} [${mediaDesc}]:\n  بله: ${mark(result.bale)} | روبیکا: ${mark(result.rubika)}\n  سروش: ${mark(result.soroush)} | آیگپ: ${mark(result.igap)}\n  رسانه: ${mediaState}`);
 
                 const sInfo = result.soroush?.info || '';
                 const gInfo = result.igap?.info || '';
-                log(`پست ID ${m.id} پردازش شد. (سروش: ${result.soroush?.ok ? 'OK' : (/UNVERIFIED/i.test(sInfo) ? 'تأیید نشد' : 'خطا')} | آیگپ: ${result.igap?.ok ? 'OK' : (/UNVERIFIED/i.test(gInfo) ? 'تأیید نشد' : 'خطا')})`);
+                const word = (ok, info) => (ok === true ? 'OK'
+                    : (ok === null || /\bSKIPPED\b/.test(info) ? 'رد شد'
+                    : (/UNVERIFIED/i.test(info) ? 'تأیید نشد' : 'خطا')));
+                log(`پست ID ${m.id} پردازش شد. (سروش: ${word(result.soroush?.ok, sInfo)} | آیگپ: ${word(result.igap?.ok, gInfo)})`);
                 if (result.media && result.media.ok === false) {
                     log(`⚠️ رسانهٔ پست ${m.id} منتشر نشد: ${result.media.info}`, '#fbbf24');
                 }
-                if (!result.soroush?.ok) log(`   سروش: ${sInfo}`, '#fca5a5');
-                if (!result.igap?.ok) log(`   آیگپ: ${gInfo}`, '#fca5a5');
+                if (!result.soroush?.ok && result.soroush?.ok !== null) log(`   سروش: ${sInfo}`, '#fca5a5');
+                if (!result.igap?.ok && result.igap?.ok !== null) log(`   آیگپ: ${gInfo}`, '#fca5a5');
+                if (!window.__depsWarned && /NODE_DEPS_MISSING|MODULE_NOT_FOUND|Cannot find (?:module|package)|playwright/i.test(`${sInfo} ${gInfo}`)) {
+                    window.__depsWarned = true;
+                    log('🔴 وابستگی Node (playwright) روی سرور نیست؛ احتمالاً با git checkout پاک شده.', '#fca5a5');
+                    log('   برای بازیابی، روی سرور اجرا کنید:  cd <?= htmlspecialchars(SYNC_APP_DIR, ENT_QUOTES) ?> && bash restore_runtime.sh', '#fca5a5');
+                }
 
             } catch (err) {
                 log(`خطا در درخواست پست ${m.id}: ${err.message}`, '#f87171');
@@ -732,13 +1029,20 @@ if ($action === 'send_report') {
         document.getElementById('startBtn').disabled = false;
     }
 
-    // سه حالت بصری: ✓ موفق تأییدشده، ؟ ارسال‌شده ولی تأیید‌نشده (UNVERIFIED)، ✕ شکست
+    // چهار حالت بصری: ✓ موفق تأییدشده، ؟ ارسال‌شده ولی تأیید‌نشده (UNVERIFIED)،
+    //                 — ردشده (فیلتر only / SKIPPED)، ✕ شکست
     function updateBadge(elId, isOk, name, info) {
         const el = document.getElementById(elId);
         if (!el) return;
         const detail = typeof info === 'string' ? info : '';
         if (detail) el.title = detail;
         const unverified = /UNVERIFIED|SEND_NOT_VERIFIED/i.test(detail);
+        if (isOk === null || /\bSKIPPED\b/.test(detail)) {
+            el.className = 'badge';
+            el.style.background = '#334155';
+            el.innerText = `${name} —`;
+            return;
+        }
         if (isOk) {
             el.className = 'badge ok';
             el.innerText = `${name} ✓`;

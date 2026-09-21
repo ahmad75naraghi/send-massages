@@ -17,6 +17,9 @@
 | `Target page, context or browser has been closed` / crash | [§۱.۳](#s1-3) |
 | فرایندهای chromium باقی‌مانده پس از اجرا | [§۱.۴](#s1-4) |
 | `Error while loading shared libraries: libnss3.so` | [§۱.۵](#s1-5) |
+| `Cannot find module 'playwright'` / `MODULE_NOT_FOUND` | [§۱.۶](#s1-6) |
+| پس از `git checkout` سروش/آی‌گپ از کار افتاد یا session پرید | [§۱.۶](#s1-6) |
+| `NODE_DEPS_MISSING` در JSON پاسخ | [§۱.۶](#s1-6) |
 | صفحهٔ ورود در اسکرین‌شات / کانال در لیست نیست | [§۲](#s2) |
 | «ورود جدید به حساب کاربری» از آی‌گپ | [§۲.۴](#s2-4) |
 | `{"success":false,"error":"عدم دسترسی به ایتا"}` | [§۳.۱](#s3-1) |
@@ -346,6 +349,94 @@ dnf install -y nss atk at-spi2-atk at-spi2-core cups-libs libdrm libxkbcommon \
   google-noto-sans-arabic-fonts google-noto-naskh-arabic-fonts google-noto-color-emoji-fonts
 fc-cache -fv
 ldd /usr/bin/chromium-browser | grep -c 'not found'    # باید 0 باشد
+```
+
+### ۱.۶ `Cannot find module 'playwright'` — node_modules با git checkout پاک شده <a id="s1-6"></a>
+
+**علامت‌ها**
+
+- در داشبورد، هر دو badge سروش و آی‌گپ `✕` می‌شوند و در لاگ چیزی شبیه این می‌آید:
+  ```text
+  سروش: ernal/modules/cjs/loader:1266:32)
+  at Module._load (node:internal/modules/cjs/loader:1091:12)
+  code: 'MODULE_NOT_FOUND',
+  requireStack: [ '/home/file/public_html/s/send_soroush.js' ]
+  ```
+- بله و روبیکا سالم کار می‌کنند (چون از cURL/PHP می‌روند، نه Node).
+- اجرای مستقیم هم همان خطا را می‌دهد:
+  ```bash
+  cd /home/file/public_html/s && node -e "require('playwright')"
+  ```
+
+**ریشه** — در کامیت اولیهٔ ریپو (`e5e4708`) این مسیرها **ردیابی‌شده** بودند:
+
+| مسیر | تعداد فایل ردیابی‌شده | اگر پاک شود |
+|---|---|---|
+| `node_modules/` | ۱۷۹ (شامل `playwright` و `playwright-core`) | `MODULE_NOT_FOUND` — سروش/آی‌گپ کلاً از کار می‌افتند |
+| `soroush_profile/` | ۱۹۶۶ | session ورود سروش نابود ⇒ `SESSION_EXPIRED` و نیاز به OTP |
+| `igap_profile/` | ۱۶۶۸ | session ورود آی‌گپ نابود |
+| `state.sqlite` | ۱ | تاریخچهٔ انتشار گم ⇒ `lastSeenId=0` و **انتشار تکراری** همهٔ پست‌ها |
+| `soroush_session.json` | ۱ | فایل پشتیبان session |
+
+در برنچ جدید هیچ‌کدام ردیابی نمی‌شوند (در `.gitignore` هستند)، بنابراین `git checkout` به برنچ جدید آن‌ها را **از دیسک پاک می‌کند**.
+
+**رفع — یک دستور (بدون نیاز به اینترنت)**
+
+```bash
+cd /home/file/public_html/s
+bash restore_runtime.sh --dry-run     # اول ببینید چه چیزی غایب است
+bash restore_runtime.sh               # بازیابی از تاریخ Git + اصلاح مجوزها + تأیید
+```
+
+این اسکریپت فقط موارد **غایب** را برمی‌گرداند (هرگز روی فایل موجود نمی‌نویسد)، کامیت مبدأ را خودش از تاریخچه پیدا می‌کند، مجوزها را درست می‌کند (`700/600` برای پروفایل‌ها، `660` برای sqlite) و در پایان `require('playwright')` را می‌آزماید.
+
+**رفع — دستی**
+
+```bash
+cd /home/file/public_html/s
+git restore --source=e5e4708 --worktree -- node_modules
+# یا در git قدیمی‌تر:
+git checkout e5e4708 -- node_modules && git reset -q HEAD -- node_modules
+
+# اگر از تاریخ Git نشد (clone کم‌عمق یا بدون .git):
+PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm install --no-audit --no-fund
+
+node -e "require('playwright'); console.log('OK')"
+git status --porcelain | head            # باید خالی بماند (node_modules حالا ignore است)
+```
+
+**اگر `state.sqlite` هم پاک شده بود** — دو حالت:
+
+```bash
+# الف) می‌خواهید پست‌های اخیر دوباره پردازش شوند (خطر تکرار در بله/روبیکا)
+bash restore_runtime.sh                        # state.sqlite قدیمی برمی‌گردد
+# ب) می‌خواهید فقط سروش/آی‌گپِ پست‌های از دست رفته جبران شود (تکرار نمی‌کند)
+KEY=$(cat .cron_key)
+curl -s -X POST "https://دامنه/s/sync_manual.php?action=resend&key=$KEY" \
+     -H 'Content-Type: application/json' \
+     -d '{"from":74136,"to":74142,"only":["soroush","igap"]}' | jq .
+# یا از مسیر CLI (بدون کلید وب):
+echo '{"from":74136,"to":74142,"only":["soroush","igap"]}' > /tmp/resend.json
+ACTION=resend SYNC_BODY_FILE=/tmp/resend.json php cli_run.php | jq .
+```
+
+**پیشگیری** — پیش از هر `git checkout`/`git switch` به برنچی که این فایل‌ها را ردیابی نمی‌کند:
+
+```bash
+git ls-files | grep -cE 'node_modules|_profile|state.sqlite'   # اگر >0 است ⇒ اول منتقل کنید
+mkdir -p ~/rt && for p in node_modules soroush_profile igap_profile state.sqlite soroush_session.json; do
+  [ -e "$p" ] && mv "$p" ~/rt/; done
+git checkout -f -B arena/01a0be7e-send-massages origin/arena/01a0be7e-send-massages
+for p in node_modules soroush_profile igap_profile state.sqlite soroush_session.json; do
+  [ -e ~/rt/"$p" ] && mv ~/rt/"$p" .; done
+```
+
+یا به‌جای `checkout` از روش بدون تماس با درخت کاری استفاده کنید:
+
+```bash
+git fetch origin arena/01a0be7e-send-massages
+git reset --mixed FETCH_HEAD     # اشاره‌گر و ایندکس؛ درخت کاری دست‌نخورده
+git checkout -- .                # فقط فایل‌های کد را به‌روز کن
 ```
 
 ---
@@ -1790,6 +1881,7 @@ tail -50 "$APP"/logs/send_soroush_*.log | grep 'args:'
 
 | `code` | `status` | معنا | اقدام |
 |---|---|---|---|
+| `NODE_DEPS_MISSING` | *(از لایهٔ PHP، نه Node)* | `node_modules/playwright` یا خود اسکریپت/`lib/pw_common.js` پیدا نشد؛ Node اصلاً اجرا نشده | `bash restore_runtime.sh` → [§۱.۶](#s1-6) |
 | `EMPTY_PAYLOAD` | ERROR | هم `--text` و هم `--file` خالی | بررسی لایهٔ scraping؛ پستی بدون محتوا نباید به sender برسد |
 | `FILE_MISSING` | ERROR | مسیر `--file` وجود ندارد | خروجی `downloadMedia` را ببینید → [§۳.۳](#s3-3) |
 | `SESSION_EXPIRED` | ERROR | صفحهٔ ورود دیده شد | `login_soroush.js` / `login_igap.js` → [§۲](#s2) |

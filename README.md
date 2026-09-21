@@ -182,6 +182,7 @@ sequenceDiagram
 │   ├── acceptance.sh            ← پوشش جدول T-1..T-18 (همان smoke_test.sh)
 │   ├── health_check.sh          ← بررسی سلامت روزانه + هشدار به مدیر در بله
 │   ├── collect_diagnostics.sh   ← جمع‌آوری یکجای شواهد برای گزارش خطا
+│   ├── restore_runtime.sh       ← ⭐ بازیابی node_modules/پروفایل‌ها/state پس از git checkout
 │   ├── .cron_key                ← کلید حالت HTTP در cron (git-ignored، ساختهٔ setup_env.sh)
 │   ├── logrotate.conf           ← چرخش لاگ‌ها (کپی به /etc/logrotate.d/eitaa-sync)
 │   └── deploy/systemd/          ← eitaa-sync.{service,timer} و eitaa-health.{service,timer}
@@ -431,7 +432,26 @@ IGAP_CHANNEL_NAME="کانال آزمایش" sudo -u file --preserve-env=IGAP_CHA
 | `GET` | `sync_manual.php?action=get_pending&key=<KEY>` | — | `{success, lastSeenId, count, messages:[{id,text,mediaUrl,mediaType,fileName}]}` |
 | `POST` | `sync_manual.php?action=sync_single&key=<KEY>` | بدنهٔ JSON یک پیام | `{success, id, media:{ok,info}, bale:{ok,info}, rubika:{ok,info}, soroush:{ok,info}, igap:{ok,info}}` |
 | `POST` | `sync_manual.php?action=send_report&key=<KEY>` | `{report:[string]}` | `{success:true}` |
+| `POST` | `sync_manual.php?action=resend&key=<KEY>` | `{"ids":[…]}` یا `{"from":74136,"to":74142}` + `{"only":["soroush","igap"]}` | `{success, only, count, lastSeenId, results:[…]}` |
+| `POST` | `sync_manual.php?action=rewind&key=<KEY>` | `{"id":74135}` | `{success, before, lastSeenId}` |
 | `GET` | `sync_manual.php?key=<KEY>` (بدون action) | — | HTML داشبورد |
+
+**`action=resend` — جبران شکست جزئی بدون پست تکراری**
+
+اگر پستی به بله/روبیکا رفته ولی سروش/آی‌گپ شکست خورده باشد، `last_msg_id` جلو رفته و پست دیگر در صف برنمی‌گردد. `resend` کانال ایتا را **دوباره scrape می‌کند** (چون لینک رسانه امضاشده و زمان‌دار است)، پست‌های خواسته‌شده را پیدا می‌کند و فقط به مقصدهای `only` می‌فرستد؛ `last_msg_id` دست نمی‌خورد مگر `"advance":true` بدهید.
+
+```bash
+KEY=$(cat .cron_key)
+curl -s -X POST "https://دامنه/s/sync_manual.php?action=resend&key=$KEY" \
+     -H 'Content-Type: application/json' \
+     -d '{"from":74136,"to":74142,"only":["soroush","igap"]}' | jq .
+
+# مسیر CLI (بدون کلید وب):
+echo '{"ids":[74136,74137],"only":["soroush","igap"]}' > /tmp/resend.json
+ACTION=resend SYNC_BODY_FILE=/tmp/resend.json php cli_run.php | jq .
+```
+
+همین فیلتر در `sync_single` هم هست: `{"id":…,"text":…,"only":["igap"]}`. پلتفرم‌های ردشده در پاسخ `{"ok":null,"info":"SKIPPED"}` می‌گیرند و در داشبورد با `—` نمایش داده می‌شوند.
 
 **دو پاسخ ویژهٔ `sync_single`**
 
@@ -519,7 +539,10 @@ ACTION=sync_single SYNC_BODY_FILE=/tmp/body.json php cli_run.php
 | 16 | **شکست صریح به‌جای رفتار مبهم** وقتی پیکربندی ناقص است: داشبورد با پیام «پیکربندی ناقص» بالا نمی‌آید، بله/روبیکا `NOT_CONFIGURED` برمی‌گردانند و sender ها `NO_CHANNEL` می‌دهند | ✨ قابلیت | `sync_manual.php`, `send_soroush.js`, `test_*.php` |
 | 17 | `lib/dotenv.sh`: لودر امن `.env` برای Bash — جایگزین `source .env` که روی مقدارهای فارسیِ دارای فاصله (`شمیم آشنا`) با «command not found» می‌شکست | 🐛 رفع باگ | `lib/dotenv.sh`, `cron_sync.sh`, `health_check.sh`, `collect_diagnostics.sh`, `smoke_test.sh`, `start_browser.sh` |
 | 18 | `smoke_test.sh` صادق‌تر شد: حالت `SKIP` برای پیش‌نیازهای نصب‌نشده (PHP/Node/Chromium)، مسیر باینری‌ها از `.env` با fallback به `PATH`، و شمارش دقیق فرایندهای کرومیوم از `/proc/*/exe` (بدون مثبت کاذب) | ✨ قابلیت | `smoke_test.sh` |
-| 19 | افزودن `DASHBOARD_ALLOWED_IP` (محدودسازی IP داشبورد از `.env`) و `IGAP_ITEM_ID` (انتقال `--item-id` به Node) | ✨ قابلیت | `config.php`, `sync_manual.php` |
+| 19 | `restore_runtime.sh`: بازیابی `node_modules`، پروفایل‌ها و `state.sqlite` از تاریخ Git وقتی `git checkout` پاکشان کرده (بدون نیاز به اینترنت) | 🛠️ ابزار | `restore_runtime.sh` |
+| 20 | کد خطای `NODE_DEPS_MISSING` + پیش‌بررسی `playwright` پیش از راه‌اندازی Node: به‌جای stack trace خام، پیام فارسیِ قابل‌اقدام | 🐛 رفع باگ | `sync_manual.php` |
+| 21 | دو action جدید `resend` (ارسال دوباره فقط به مقصدهای شکست‌خورده، با scrape تازهٔ رسانه) و `rewind` (عقب بردن `last_msg_id`) + فیلتر `only` در `sync_single` | ✨ قابلیت | `sync_manual.php` |
+| 22 | افزودن `DASHBOARD_ALLOWED_IP` (محدودسازی IP داشبورد از `.env`) و `IGAP_ITEM_ID` (انتقال `--item-id` به Node) | ✨ قابلیت | `config.php`, `sync_manual.php` |
 
 ---
 

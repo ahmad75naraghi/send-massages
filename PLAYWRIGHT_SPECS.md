@@ -1085,6 +1085,7 @@ git commit -m "fix(igap): update channel selector after web.igap.net UI change"
 | `EMPTY_PAYLOAD` | ERROR | متن و فایل هر دو خالی | لایهٔ PHP اکنون چنین فراخوانی‌ای را `SKIP` می‌کند؛ اگر دیدید، پارسر ایتا محتوای پست را نگرفته (§۳.۲ [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md)) |
 | `FILE_MISSING` | ERROR | مسیر `--file` وجود ندارد | `downloadMedia()` را ببینید؛ `/tmp` cleanup در cron |
 | `SESSION_EXPIRED` | ERROR | صفحهٔ ورود دیده شد | `login_soroush.js` / `login_igap.js` |
+| `NODE_DEPS_MISSING` | *(تولیدشده در لایهٔ PHP)* | `node_modules/playwright` نیست ⇒ Node اصلاً اجرا نشده؛ پیش‌بررسی در `runUserbot()` | `bash restore_runtime.sh` ([`TROUBLESHOOTING.md`](TROUBLESHOOTING.md) §۱.۶) |
 | `APP_NOT_LOADED` | ERROR | لیست گفت‌وگوها بارگذاری نشد (آی‌گپ) | شبکه/`web.igap.net`؛ سپس `dump_dom.js igap` |
 | `CHANNEL_NOT_FOUND` | ERROR | هیچ‌یک از سه راهبرد تأیید نشد | `--channel-name` دقیق؛ بررسی اینکه حساب عضو/ادمین کانال است |
 | `ATTACH_BUTTON_NOT_FOUND` | ERROR | دکمهٔ سنجاقک دیده نشد | composer باز نشده یا UI عوض شده → `dump_dom.js --chat` |

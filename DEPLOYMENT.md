@@ -340,6 +340,7 @@ test_rubika.php
 test_rubika_media.php
 test_soroush.php
 acceptance.sh  collect_diagnostics.sh  cron_sync.sh  health_check.sh  logrotate.conf
+restore_runtime.sh   ← بازیابی node_modules/پروفایل‌ها/state.sqlite پس از git checkout
 lib/            (pw_common.js، dotenv.sh و ابزارهای مشترک)
 backups/   logs/   node_modules/   soroush_profile/   igap_profile/   state.sqlite
 ```
@@ -1160,9 +1161,22 @@ sudo -u file bash smoke_test.sh --live
 
 ### ۱۲.۱ رویهٔ به‌روزرسانی ایمن
 
+> 🔴 **پیش از `git pull`/`git checkout` این را بخوانید.** در کامیت اولیهٔ ریپو، `node_modules/`، `soroush_profile/`، `igap_profile/` و `state.sqlite` **ردیابی‌شده** بودند ولی در برنچ‌های جدید ردیابی نمی‌شوند. بنابراین `git checkout` به برنچ جدید آن‌ها را **از دیسک پاک می‌کند** ⇒ `MODULE_NOT_FOUND` در سروش/آی‌گپ، نابودی session و بازنشانی `lastSeenId`. اگر این اتفاق افتاد: `bash restore_runtime.sh` (جزئیات: [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md) §۱.۶).
+
 ```bash
 APP=/home/file/public_html/s
 STAMP=$(date +%F_%H%M)
+
+# ۰) محافظت از دادهٔ runtime پیش از هر دستور git
+git -C "$APP" ls-files | grep -cE 'node_modules|_profile|state\.sqlite'   # >0 ⇒ گام ۰-ب لازم است
+mkdir -p /home/file/rt && chmod 700 /home/file/rt
+for p in node_modules soroush_profile igap_profile state.sqlite soroush_session.json; do
+  [ -e "$APP/$p" ] && mv "$APP/$p" /home/file/rt/ && echo "منتقل شد: $p"
+done
+# ۰-ب) پس از git pull/checkout، بازگردانی:
+#   for p in node_modules soroush_profile igap_profile state.sqlite soroush_session.json; do
+#     [ -e "/home/file/rt/$p" ] && mv "/home/file/rt/$p" "$APP/"; done
+#   (یا ساده‌تر: bash "$APP/restore_runtime.sh")
 
 # ۱) پشتیبان کامل (کد + state + session)
 sudo -u file tar -czf "$APP/backups/pre_deploy_$STAMP.tar.gz" \
@@ -1176,7 +1190,8 @@ crontab -l -u file > "$APP/backups/crontab_$STAMP.txt" 2>/dev/null
 
 # ۳) اعمال تغییرات
 cd "$APP" && sudo -u file git pull --ff-only
-sudo -u file PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm install
+bash "$APP/restore_runtime.sh"          # اگر runtime پاک شده بود، از تاریخ Git برمی‌گرداند
+sudo -u file PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm install   # فقط اگر restore کافی نبود
 
 # ۴) اعتبارسنجی سینتکس (اجباری)
 ea-php81 -l sync_manual.php
