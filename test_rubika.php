@@ -3,9 +3,16 @@ declare(strict_types=1);
 
 header('Content-Type: application/json; charset=utf-8');
 
-const RUBIKA_BOT_TOKEN = 'CEJCFE0FCBZKUIGMNMOODEZXQAVAFDOLNFHMSBDFUVDAQMAFIYQDUMJWDODELSWZ';
-const RUBIKA_CHAT_ID_GUID = 'c0EDtHu01b27726937fae4b43ee17905'; // شناسه یکتا
-const RUBIKA_CHAT_ID_USER = '@shamimeashena1'; // نام کاربری عمومی کانال روبیکا
+require_once __DIR__ . '/config.php';
+
+// مقدارها از .env می‌آیند (RUBIKA_BOT_TOKEN، RUBIKA_CHAT_ID_GUID، RUBIKA_CHAT_ID_USER)
+$missing = envMissing(['RUBIKA_BOT_TOKEN', 'RUBIKA_CHAT_ID_GUID', 'RUBIKA_CHAT_ID_USER']);
+if ($missing) {
+    http_response_code(500);
+    echo json_encode(['status' => 'error', 'error' => envMissingMessage($missing)], JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
 
 // اندپوینت فعال (همان که قبلا 200 داد)
 $url = "https://botapi.rubika.ir/v3/" . RUBIKA_BOT_TOKEN . "/sendMessage";

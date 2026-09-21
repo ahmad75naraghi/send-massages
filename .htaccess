@@ -1,0 +1,50 @@
+# ============================================================
+#  .htaccess — محافظت از مسیر استقرار
+#  اصل: «همه‌چیز بسته، مگر آنچه صریحاً باز شده»
+#
+#  نکتهٔ حیاتی ۱: cli_run.php عمداً بسته است؛ این فایل SECURITY_KEY را
+#  نمی‌پرسد (فقط برای CLI است) و اگر از وب قابل دسترس باشد، هر کسی
+#  می‌تواند sync_single اجرا کند.
+#  نکتهٔ حیاتی ۲: .env و config.php حاوی همهٔ توکن‌ها هستند و بسته‌اند.
+# ============================================================
+
+Options -Indexes -ExecCGI
+
+# ۱) پیش‌فرض: همه‌چیز بسته
+Require all denied
+
+# ۲) فقط نقاط ورود مجاز وب باز می‌شوند
+#    (config.php و cli_run.php عمداً در این فهرست نیستند)
+<FilesMatch "^(sync_manual|test|test_rubika|test_rubika_media|test_soroush|send_test)\.php$">
+    Require all granted
+</FilesMatch>
+
+# ۲-ب) لایهٔ صریح برای فایل‌های پیکربندی و اعتبارنامه (دفاع دوم)
+<FilesMatch "^(\.env|\.env\..*|\.cron_key|\.cron_env|config\.php|cli_run\.php)$">
+    Require all denied
+</FilesMatch>
+
+# ۳) محدودسازی IP داشبورد (اکیداً توصیه‌شده؛ IP خود را جایگزین کنید)
+# <Files "sync_manual.php">
+#     Require ip 203.0.113.45
+# </Files>
+
+# ۴) اجرای PHP در دایرکتوری‌های داده کاملاً ممنوع
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+    RewriteRule ^(lib|logs|backups|soroush_profile|igap_profile)/ - [F,L]
+    RewriteRule \.(sqlite|sqlite3|sqlite-journal|sqlite-wal|json|log|sh|env|ini|key|pem|jpg|jpeg|png|html)$ - [F,L,NC]
+</IfModule>
+
+# ۵) هدرهای امنیتی
+<IfModule mod_headers.c>
+    Header set X-Robots-Tag "noindex, nofollow, noarchive, nosnippet"
+    Header set Referrer-Policy "no-referrer"
+    Header set X-Content-Type-Options "nosniff"
+    Header set X-Frame-Options "DENY"
+</IfModule>
+
+# ۶) هیچ کش‌شدنی برای داشبورد
+<IfModule mod_expires.c>
+    ExpiresActive Off
+</IfModule>

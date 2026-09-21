@@ -3,8 +3,16 @@ declare(strict_types=1);
 
 header('Content-Type: application/json; charset=utf-8');
 
-const SOROUSH_BOT_TOKEN = '70022669:QMFqHjA8guTKl6WuUOyPp2f1PFAPp8nrV_4';
-const SOROUSH_CHAT_ID   = '10024428989'; // یا نام کاربری عمومی مثل @channel
+require_once __DIR__ . '/config.php';
+
+// مقدارها از .env می‌آیند (SOROUSH_BOT_TOKEN، SOROUSH_CHAT_ID)
+$missing = envMissing(['SOROUSH_BOT_TOKEN', 'SOROUSH_CHAT_ID']);
+if ($missing) {
+    http_response_code(500);
+    echo json_encode(['status' => 'error', 'error' => envMissingMessage($missing)], JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
 
 class SoroushClient
 {

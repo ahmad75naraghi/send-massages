@@ -1,0 +1,10 @@
+# /etc/systemd/system/eitaa-health.timer
+[Unit]
+Description=Daily health check of the sync stack
+
+[Timer]
+OnCalendar=*-*-* 07:30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -6,12 +6,19 @@ header('Content-Type: application/json; charset=utf-8');
 // ==========================================
 // تنظیمات اتصال
 // ==========================================
-const EITAA_CHANNEL  = 'shamimeashena';     // کانال ایتا بدون @
-const BALE_BOT_TOKEN = '74580067:QneNhGu2LENUy5RatIeEiSzugYztXyGYmLs'; // توکن بات بله
-const BALE_CHAT_ID   = '@testforme';  // شناسه کانال بله با @
+require_once __DIR__ . '/config.php';
+
+// مقدارها از .env می‌آیند (EITAA_CHANNEL_ID، BALE_BOT_TOKEN، BALE_CHANNEL_ID)
+$missing = envMissing(['BALE_BOT_TOKEN', 'BALE_CHANNEL_ID']);
+if ($missing) {
+    http_response_code(500);
+    echo json_encode(['status' => 'error', 'error' => envMissingMessage($missing)], JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
 
 // 1. واکشی زنده آخرین پست از ایتا جهت دریافت معتبرترین Token مدیا
-$channelUrl = "https://eitaa.com/" . EITAA_CHANNEL;
+$channelUrl = "https://eitaa.com/" . EITAA_CHANNEL_ID;
 $ch = curl_init($channelUrl);
 curl_setopt_array($ch, [
     CURLOPT_RETURNTRANSFER => true,
@@ -72,7 +79,7 @@ curl_setopt_array($ch, [
     CURLOPT_SSL_VERIFYPEER => false,
     CURLOPT_USERAGENT      => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
     CURLOPT_HTTPHEADER     => [
-        'Referer: https://eitaa.com/' . EITAA_CHANNEL,
+        'Referer: https://eitaa.com/' . EITAA_CHANNEL_ID,
         'Accept: image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
         'Accept-Encoding: identity' // جلوگیری از دریافت فشرده‌سازی کنترل‌نشده
     ]
@@ -104,7 +111,7 @@ $baleApiUrl = "https://tapi.bale.ai/bot" . BALE_BOT_TOKEN . "/sendPhoto";
 $caption = mb_substr($targetPost['text'], 0, 1000);
 
 $postData = [
-    'chat_id' => BALE_CHAT_ID,
+    'chat_id' => BALE_CHANNEL_ID,
     'caption' => $caption,
     'photo'   => new CURLFile($tempFilePath, 'image/jpeg', 'image.jpg')
 ];
