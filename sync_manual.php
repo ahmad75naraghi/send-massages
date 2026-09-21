@@ -527,6 +527,46 @@ if ($action === 'get_pending') {
     exit;
 }
 
+// ۱-ب) فهرست N پست آخر کانال (بدون فیلتر «دیده‌شده») — برای پنل ارسال اجباری
+//      ?action=list_posts&key=…&limit=10
+if ($action === 'list_posts') {
+    header('Content-Type: application/json; charset=utf-8');
+
+    $limit = isset($_GET['limit']) ? (int)$_GET['limit'] : 10;
+    if ($limit < 1)  { $limit = 1; }
+    if ($limit > 50) { $limit = 50; }
+
+    $lastSeenId = getLastSeenId($db, EITAA_CHANNEL_ID);
+    $scrape = fetchEitaaPosts();
+    if (!$scrape['ok']) {
+        echo json_encode(['success' => false, 'error' => 'SCRAPE_FAILED', 'message' => $scrape['error']], JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+
+    $tail = array_slice($scrape['messages'], -$limit);
+    $posts = array_map(function (array $m) use ($lastSeenId) {
+        $text = (string)($m['text'] ?? '');
+        return [
+            'id'         => (int)$m['id'],
+            'text'       => $text,
+            'preview'    => mb_substr((string)preg_replace('/\s+/u', ' ', $text), 0, 90),
+            'mediaType'  => $m['mediaType'] ?? null,
+            'fileName'   => $m['fileName'] ?? null,
+            'hasMedia'   => !empty($m['mediaUrl']),
+            'sentBefore' => ((int)$m['id'] <= $lastSeenId),
+        ];
+    }, $tail);
+
+    echo json_encode([
+        'success'    => true,
+        'lastSeenId' => $lastSeenId,
+        'limit'      => $limit,
+        'count'      => count($posts),
+        'posts'      => $posts,
+    ], JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
 // ۲. پردازش منفرد یک پست
 if ($action === 'sync_single') {
     set_time_limit(300);
@@ -674,6 +714,7 @@ if ($action === 'resend') {
 
     $only = is_array($payload['only'] ?? null) ? (array)$payload['only'] : ['soroush', 'igap'];
     $advance = !empty($payload['advance']);
+    $noMedia = !empty($payload['no_media']);
 
     // scrape تازه: لینک رسانهٔ ایتا امضاشده و زمان‌دار است، پس لینک قدیمی به درد نمی‌خورد
     $scrape = fetchEitaaPosts();
@@ -719,7 +760,9 @@ if ($action === 'resend') {
         $localFile = null;
         $mediaReason = null;
         $mediaInfo = 'none';
-        if ($mediaUrl) {
+        if ($mediaUrl && $noMedia) {
+            $mediaInfo = 'skipped';          // کاربر خواسته فقط متن برود
+        } elseif ($mediaUrl) {
             $localFile = downloadMedia((string)$mediaUrl, $fileName !== '' ? $fileName : 'file.bin', $mediaReason);
             if (!$localFile) {
                 sleep(2);
@@ -790,7 +833,14 @@ if ($action === 'rewind') {
     <style>
         * { box-sizing: border-box; font-family: 'Vazirmatn', sans-serif; }
         body { background: #0f172a; color: #e2e8f0; margin: 0; padding: 20px; }
-        .container { max-width: 900px; margin: 0 auto; }
+        .container { max-width: 1320px; margin: 0 auto; }
+        .layout { display: grid; grid-template-columns: minmax(0, 1fr) 384px; gap: 20px; align-items: start; }
+        .main-col { min-width: 0; }
+        .side-col { position: sticky; top: 20px; }
+        @media (max-width: 1040px) {
+            .layout { grid-template-columns: minmax(0, 1fr); }
+            .side-col { position: static; }
+        }
         .header { display: flex; justify-content: space-between; align-items: center; background: #1e293b; padding: 20px; border-radius: 12px; border: 1px solid #334155; margin-bottom: 20px; }
         .header h1 { font-size: 1.25rem; margin: 0; color: #38bdf8; }
         .btn { background: #2563eb; color: #fff; border: none; padding: 10px 20px; border-radius: 8px; font-weight: bold; cursor: pointer; transition: 0.2s; font-size: 0.95rem; }
@@ -813,6 +863,72 @@ if ($action === 'rewind') {
         @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
         .console { background: #000; color: #4ade80; font-family: monospace; padding: 15px; border-radius: 10px; height: 180px; overflow-y: auto; font-size: 0.85rem; border: 1px solid #22c55e33; }
         .console p { margin: 2px 0; }
+
+        /* ============ پنل کناری: بررسی و شروع همگام‌سازی ============ */
+        .panel { background: #1e293b; border: 1px solid #334155; border-radius: 12px; overflow: hidden; }
+        .panel-head { padding: 16px 18px; background: linear-gradient(135deg, #1d4ed8 0%, #0f766e 100%); border-bottom: 1px solid #334155; }
+        .panel-head h2 { margin: 0; font-size: 1.02rem; color: #fff; }
+        .panel-head p { margin: 6px 0 0; font-size: 0.78rem; color: #dbeafe; line-height: 1.6; }
+        .panel-body { padding: 16px 18px 18px; }
+        .section-title { font-size: 0.78rem; font-weight: bold; color: #7dd3fc; margin: 16px 0 8px; padding-bottom: 6px; border-bottom: 1px dashed #334155; letter-spacing: .2px; }
+        .section-title:first-child { margin-top: 0; }
+        .lbl { display: block; font-size: 0.8rem; color: #94a3b8; margin-bottom: 6px; }
+        .lbl.inline { margin: 0; }
+        .row { display: flex; gap: 8px; align-items: center; }
+        .row.space { justify-content: space-between; }
+        input[type="number"] { background: #0f172a; border: 1px solid #334155; color: #e2e8f0; border-radius: 8px; padding: 9px 10px; font-size: 0.9rem; width: 86px; font-family: inherit; }
+        input[type="number"]:focus { outline: none; border-color: #38bdf8; }
+        .hint { font-size: 0.72rem; color: #64748b; line-height: 1.7; margin-top: 8px; }
+        .btn-ghost { background: #334155; color: #e2e8f0; padding: 9px 14px; font-size: 0.85rem; flex: 1; }
+        .btn-ghost:hover { background: #475569; }
+        .btn-block { width: 100%; margin-top: 16px; padding: 12px; font-size: 0.98rem; }
+        .btn-go { background: linear-gradient(135deg, #16a34a, #0d9488); }
+        .btn-go:hover:not(:disabled) { filter: brightness(1.12); }
+        .quick { display: flex; gap: 6px; flex-wrap: wrap; margin: 10px 0 4px; }
+        .quick button { background: #0f172a; border: 1px solid #334155; color: #94a3b8; border-radius: 6px; padding: 4px 9px; font-size: 0.72rem; cursor: pointer; font-family: inherit; transition: .15s; }
+        .quick button:hover { border-color: #38bdf8; color: #7dd3fc; }
+
+        .post-list { max-height: 268px; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; margin-top: 10px; padding-left: 4px; }
+        .post-list::-webkit-scrollbar { width: 6px; }
+        .post-list::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
+        .post-row { background: #0f172a; border: 1px solid #334155; border-radius: 8px; padding: 8px 10px; display: flex; gap: 8px; align-items: flex-start; cursor: pointer; transition: .15s; }
+        .post-row:hover { border-color: #475569; }
+        .post-row.sel { border-color: #38bdf8; background: #0b2436; }
+        .post-row input { margin-top: 3px; accent-color: #38bdf8; cursor: pointer; }
+        .post-main { flex: 1; min-width: 0; }
+        .post-top { display: flex; justify-content: space-between; align-items: center; gap: 6px; }
+        .post-id { font-size: 0.78rem; font-weight: bold; color: #f8fafc; font-family: monospace; }
+        .post-txt { font-size: 0.74rem; color: #94a3b8; margin-top: 3px; line-height: 1.6; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .tag { font-size: 0.63rem; padding: 2px 6px; border-radius: 999px; white-space: nowrap; font-weight: bold; }
+        .tag.new { background: #14532d; color: #86efac; }
+        .tag.old { background: #78350f; color: #fcd34d; }
+        .tag.media { background: #1e3a8a; color: #bfdbfe; }
+        .tag.text { background: #334155; color: #cbd5e1; }
+        .dots { display: flex; gap: 3px; margin-top: 6px; }
+        .dot { width: 100%; text-align: center; font-size: 0.62rem; font-weight: bold; padding: 2px 0; border-radius: 4px; background: #1e293b; color: #64748b; border: 1px solid #334155; }
+        .dot.on { background: #166534; color: #bbf7d0; border-color: #166534; }
+        .dot.bad { background: #991b1b; color: #fecaca; border-color: #991b1b; }
+        .dot.wait { background: #075985; color: #bae6fd; border-color: #075985; animation: pulse 1.2s infinite; }
+        .dot.q { background: #78350f; color: #fde68a; border-color: #78350f; }
+        .dot.skip { background: #1e293b; color: #475569; }
+
+        .platforms { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+        .chk { display: flex; align-items: center; gap: 8px; background: #0f172a; border: 1px solid #334155; border-radius: 8px; padding: 9px 10px; cursor: pointer; font-size: 0.83rem; color: #cbd5e1; transition: .15s; user-select: none; }
+        .chk:hover { border-color: #475569; }
+        .chk input { accent-color: #22c55e; cursor: pointer; }
+        .chk.on { border-color: #22c55e66; background: #0c2a1e; color: #dcfce7; }
+        .chk.wide { grid-column: 1 / -1; }
+        .chk .swatch { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+        .opts { display: flex; flex-direction: column; gap: 8px; }
+        .summary { margin-top: 12px; font-size: 0.76rem; color: #94a3b8; background: #0f172a; border: 1px solid #334155; border-radius: 8px; padding: 9px 11px; line-height: 1.9; }
+        .summary b { color: #7dd3fc; }
+        .warnbox { margin-top: 10px; background: #451a03; border: 1px solid #b45309; color: #fcd34d; border-radius: 8px; padding: 10px 12px; font-size: 0.76rem; line-height: 1.8; }
+        .force-result { margin-top: 12px; display: flex; flex-direction: column; gap: 6px; }
+        .res-line { font-size: 0.76rem; padding: 7px 10px; border-radius: 8px; background: #0f172a; border: 1px solid #334155; color: #cbd5e1; }
+        .res-line.ok { border-color: #16653466; }
+        .res-line.bad { border-color: #991b1b66; }
+        .spin { display: inline-block; width: 12px; height: 12px; border: 2px solid #7dd3fc44; border-top-color: #7dd3fc; border-radius: 50%; animation: sp .8s linear infinite; vertical-align: -2px; margin-left: 6px; }
+        @keyframes sp { to { transform: rotate(360deg); } }
     </style>
 </head>
 <body>
@@ -826,20 +942,83 @@ if ($action === 'rewind') {
         <button id="startBtn" class="btn" onclick="startSync()">بررسی و شروع همگام‌سازی</button>
     </div>
 
-    <div class="progress-box">
-        <div style="display: flex; justify-content: space-between; font-size: 0.9rem;">
-            <span id="statusText">در انتظار شروع...</span>
-            <span id="percentText">0%</span>
+    <div class="layout">
+      <div class="main-col">
+        <div class="progress-box">
+            <div style="display: flex; justify-content: space-between; font-size: 0.9rem;">
+                <span id="statusText">در انتظار شروع...</span>
+                <span id="percentText">0%</span>
+            </div>
+            <div class="progress-bar-bg">
+                <div id="progressFill" class="progress-bar-fill"></div>
+            </div>
         </div>
-        <div class="progress-bar-bg">
-            <div id="progressFill" class="progress-bar-fill"></div>
+
+        <div class="cards-list" id="cardsList"></div>
+
+        <div class="console" id="consoleLogs">
+            <p>[آماده] برای شروع روی دکمه بالا کلیک کنید.</p>
         </div>
-    </div>
+      </div>
 
-    <div class="cards-list" id="cardsList"></div>
+      <aside class="side-col">
+        <div class="panel">
+            <div class="panel-head">
+                <h2>بررسی و شروع همگام‌سازی</h2>
+                <p>ارسال <b>اجباری</b> پست‌های آخر کانال — بدون توجه به اینکه قبلاً رفته‌اند یا نه، با انتخاب مقصدها.</p>
+            </div>
+            <div class="panel-body">
 
-    <div class="console" id="consoleLogs">
-        <p>[آماده] برای شروع روی دکمه بالا کلیک کنید.</p>
+                <div class="section-title">۱) چند پست آخر؟</div>
+                <div class="row">
+                    <input type="number" id="postCount" min="1" max="50" value="5" title="تعداد پست‌های آخر کانال ایتا">
+                    <button class="btn btn-ghost" id="reviewBtn" onclick="reviewPosts()">بررسی پست‌ها</button>
+                </div>
+                <div class="hint" id="reviewHint">کانال ایتا خوانده می‌شود و فهرست پست‌ها با وضعیت «قبلاً رفته / نرفته» نمایش داده می‌شود.</div>
+
+                <div class="quick" id="quickSelect" style="display:none;">
+                    <button type="button" onclick="selAll(true)">انتخاب همه</button>
+                    <button type="button" onclick="selAll(false)">هیچ</button>
+                    <button type="button" onclick="selOnlyNew()">فقط نرفته‌ها</button>
+                    <button type="button" onclick="selInvert()">معکوس</button>
+                </div>
+                <div class="post-list" id="postList"></div>
+
+                <div class="section-title">۲) به کدام پیام‌رسان‌ها برود؟</div>
+                <div class="platforms">
+                    <label class="chk on" data-p="bale"><input type="checkbox" id="p_bale" checked onchange="syncPlatformUI()"><span class="swatch" style="background:#22c55e"></span><span>بله</span></label>
+                    <label class="chk on" data-p="rubika"><input type="checkbox" id="p_rubika" checked onchange="syncPlatformUI()"><span class="swatch" style="background:#f59e0b"></span><span>روبیکا</span></label>
+                    <label class="chk on" data-p="soroush"><input type="checkbox" id="p_soroush" checked onchange="syncPlatformUI()"><span class="swatch" style="background:#38bdf8"></span><span>سروش‌پلاس</span></label>
+                    <label class="chk on" data-p="igap"><input type="checkbox" id="p_igap" checked onchange="syncPlatformUI()"><span class="swatch" style="background:#a78bfa"></span><span>آی‌گپ</span></label>
+                </div>
+
+                <div class="section-title">۳) گزینه‌ها</div>
+                <div class="opts">
+                    <label class="chk wide"><input type="checkbox" id="optMedia" checked><span>رسانهٔ پست هم ارسال شود</span></label>
+                    <label class="chk wide"><input type="checkbox" id="optAdvance"><span>«آخرین پست دیده‌شده» جلو برود (تا این پست‌ها دوباره خودکار نیایند)</span></label>
+                    <div class="row space">
+                        <label class="lbl inline" for="optGap">فاصلهٔ بین پست‌ها (ثانیه)</label>
+                        <input type="number" id="optGap" min="0" max="120" value="<?= SYNC_GAP_SEC ?>">
+                    </div>
+                </div>
+
+                <div class="summary" id="panelSummary">
+                    انتخاب: <b>۰ پست</b> — مقصدها: <b>—</b>
+                </div>
+                <div class="warnbox" id="dupWarn" style="display:none;"></div>
+
+                <button class="btn btn-go btn-block" id="forceBtn" onclick="runForcedSync()" disabled>شروع همگام‌سازی اجباری</button>
+
+                <div id="forceProgress" style="display:none;">
+                    <div class="progress-bar-bg" style="margin-top:14px;">
+                        <div id="forceFill" class="progress-bar-fill" style="width:0%"></div>
+                    </div>
+                    <div class="hint" id="forceStatus" style="margin-top:8px;"></div>
+                </div>
+                <div class="force-result" id="forceResult"></div>
+            </div>
+        </div>
+      </aside>
     </div>
 </div>
 
@@ -1055,6 +1234,238 @@ if ($action === 'rewind') {
             el.innerText = `${name} ✕`;
         }
     }
+
+    /* ==========================================================
+       پنل کناری — «بررسی و شروع همگام‌سازی» (ارسال اجباری)
+       ========================================================== */
+    const PLATFORMS = [
+        { id: 'bale',    fa: 'بله',      dot: 'ب' },
+        { id: 'rubika',  fa: 'روبیکا',   dot: 'ر' },
+        { id: 'soroush', fa: 'سروش',     dot: 'س' },
+        { id: 'igap',    fa: 'آی‌گپ',    dot: 'آ' },
+    ];
+    let forcePosts = [];
+    let forceBusy = false;
+
+    const $ = id => document.getElementById(id);
+    const sleep = ms => new Promise(r => setTimeout(r, ms));
+    const faNum = n => String(n).replace(/\d/g, d => '۰۱۲۳۴۵۶۷۸۹'[d]);
+
+    async function reviewPosts() {
+        if (forceBusy) return;
+        const limit = Math.min(50, Math.max(1, parseInt($('postCount').value, 10) || 5));
+        $('postCount').value = limit;
+        const btn = $('reviewBtn');
+        btn.disabled = true;
+        btn.innerHTML = 'در حال خواندن ایتا<span class="spin"></span>';
+        $('reviewHint').innerText = 'در حال خواندن کانال ایتا…';
+        log(`پنل اجباری: خواندن ${faNum(limit)} پست آخر کانال ایتا…`, '#7dd3fc');
+
+        try {
+            const res = await fetch(`sync_manual.php?action=list_posts&key=${SECURITY_KEY}&limit=${limit}`);
+            const data = await res.json();
+            if (!data.success) {
+                const msg = data.message || data.error || 'خطای نامشخص';
+                $('reviewHint').innerText = '❌ ' + msg;
+                log('پنل اجباری: ' + msg, '#f87171');
+                return;
+            }
+            forcePosts = data.posts || [];
+            if (!forcePosts.length) {
+                $('reviewHint').innerText = 'پستی در نمای وب ایتا پیدا نشد.';
+                log('پنل اجباری: پستی پیدا نشد.', '#fbbf24');
+                return;
+            }
+            renderForceList();
+            $('quickSelect').style.display = 'flex';
+            const news = forcePosts.filter(p => !p.sentBefore).length;
+            $('reviewHint').innerHTML =
+                `${faNum(forcePosts.length)} پست خوانده شد — <b style="color:#86efac">${faNum(news)}</b> نرفته، ` +
+                `<b style="color:#fcd34d">${faNum(forcePosts.length - news)}</b> قبلاً رفته. ` +
+                `آخرین پست دیده‌شده در پایگاه داده: <b style="color:#7dd3fc">${faNum(data.lastSeenId)}</b>`;
+            log(`پنل اجباری: ${faNum(forcePosts.length)} پست یافت شد (lastSeenId=${data.lastSeenId}).`, '#7dd3fc');
+        } catch (e) {
+            $('reviewHint').innerText = '❌ خطای ارتباط با سرور: ' + e.message;
+            log('پنل اجباری: ' + e.message, '#f87171');
+        } finally {
+            btn.disabled = false;
+            btn.innerText = 'بررسی پست‌ها';
+        }
+    }
+
+    function renderForceList() {
+        const box = $('postList');
+        box.innerHTML = '';
+        forcePosts.slice().reverse().forEach(p => {          // جدیدترین بالا
+            const row = document.createElement('label');
+            row.className = 'post-row';
+            row.dataset.id = p.id;
+            const mediaTag = p.hasMedia
+                ? `<span class="tag media">${p.mediaType === 'video' ? '🎬' : p.mediaType === 'audio' ? '🎧' : p.mediaType === 'document' ? '📎' : '🖼'} ${p.mediaType || 'media'}</span>`
+                : '<span class="tag text">متن</span>';
+            const stateTag = p.sentBefore
+                ? '<span class="tag old">قبلاً رفته</span>'
+                : '<span class="tag new">نرفته</span>';
+            row.innerHTML =
+                `<input type="checkbox" data-id="${p.id}" ${p.sentBefore ? '' : 'checked'}>` +
+                `<div class="post-main">` +
+                    `<div class="post-top"><span class="post-id">#${faNum(p.id)}</span><span>${stateTag} ${mediaTag}</span></div>` +
+                    `<div class="post-txt" title="${(p.text || '').replace(/"/g, '&quot;')}">${p.preview || '(بدون متن)'}</div>` +
+                    `<div class="dots">` + PLATFORMS.map(x => `<span class="dot skip" data-dot="${x.id}" title="${x.fa}">${x.dot}</span>`).join('') + `</div>` +
+                `</div>`;
+            row.querySelector('input').addEventListener('change', () => { row.classList.toggle('sel', row.querySelector('input').checked); updateSummary(); });
+            row.classList.toggle('sel', row.querySelector('input').checked);
+            box.appendChild(row);
+        });
+        updateSummary();
+    }
+
+    function eachCheckbox(fn) {
+        document.querySelectorAll('#postList input[type="checkbox"]').forEach(fn);
+    }
+    function selAll(v)    { eachCheckbox(cb => { cb.checked = v; cb.dispatchEvent(new Event('change')); }); }
+    function selOnlyNew() { forcePosts.forEach(p => { const cb = document.querySelector(`#postList input[data-id="${p.id}"]`); if (cb) { cb.checked = !p.sentBefore; cb.dispatchEvent(new Event('change')); } }); }
+    function selInvert()  { eachCheckbox(cb => { cb.checked = !cb.checked; cb.dispatchEvent(new Event('change')); }); }
+
+    function selectedIds() {
+        return Array.from(document.querySelectorAll('#postList input[type="checkbox"]:checked'))
+                    .map(cb => parseInt(cb.dataset.id, 10)).filter(n => n > 0).sort((a, b) => a - b);
+    }
+    function selectedPlatforms() { return PLATFORMS.filter(p => $(`p_${p.id}`).checked).map(p => p.id); }
+
+    function syncPlatformUI() {
+        PLATFORMS.forEach(p => {
+            const on = $(`p_${p.id}`).checked;
+            const lbl = document.querySelector(`.chk[data-p="${p.id}"]`);
+            if (lbl) lbl.classList.toggle('on', on);
+        });
+        updateSummary();
+    }
+
+    function updateSummary() {
+        const ids = selectedIds(), pf = selectedPlatforms();
+        const dupRisk = ids.some(id => (forcePosts.find(p => p.id === id) || {}).sentBefore)
+                        && (pf.includes('bale') || pf.includes('rubika'));
+        $('panelSummary').innerHTML =
+            `انتخاب: <b>${faNum(ids.length)} پست</b> — مقصدها: <b>${pf.length ? pf.map(x => (PLATFORMS.find(p => p.id === x) || {}).fa).join('، ') : '—'}</b>` +
+            `<br>رسانه: <b>${$('optMedia').checked ? 'با رسانه' : 'فقط متن'}</b> — ` +
+            `advance: <b>${$('optAdvance').checked ? 'بله' : 'خیر'}</b> — ` +
+            `فاصله: <b>${faNum($('optGap').value || 0)} ثانیه</b>`;
+        const warn = $('dupWarn');
+        if (dupRisk) {
+            warn.style.display = 'block';
+            warn.innerHTML = '⚠️ بعضی پست‌های انتخابی <b>قبلاً ارسال شده‌اند</b>. ارسال دوباره به <b>بله یا روبیکا</b> یعنی ' +
+                             '<b>پست تکراری</b> در آن کانال‌ها. اگر فقط می‌خواهید سروش/آی‌گپ جبران شود، تیک بله و روبیکا را بردارید.';
+        } else {
+            warn.style.display = 'none';
+        }
+        $('forceBtn').disabled = !(ids.length && pf.length) || forceBusy;
+        return dupRisk;
+    }
+
+    function setDot(id, pf, cls, title) {
+        const el = document.querySelector(`#postList .post-row[data-id="${id}"] .dot[data-dot="${pf}"]`);
+        if (!el) return;
+        el.className = 'dot ' + cls;
+        if (title) el.title = title;
+    }
+
+    async function runForcedSync() {
+        if (forceBusy) return;
+        const ids = selectedIds();
+        const only = selectedPlatforms();
+        if (!ids.length || !only.length) return;
+
+        const dupRisk = updateSummary();
+        if (dupRisk && !confirm('بعضی پست‌های انتخابی قبلاً ارسال شده‌اند و بله/روبیکا هم انتخاب شده است.\n' +
+                               'این کار پست تکراری در آن کانال‌ها می‌گذارد.\n\nادامه می‌دهید؟')) {
+            log('پنل اجباری: توسط کاربر لغو شد (خطر پست تکراری).', '#fbbf24');
+            return;
+        }
+
+        forceBusy = true;
+        $('forceBtn').disabled = true;
+        $('reviewBtn').disabled = true;
+        $('forceProgress').style.display = 'block';
+        $('forceResult').innerHTML = '';
+        const withMedia = $('optMedia').checked;
+        const advance = $('optAdvance').checked;
+        const gap = Math.max(0, parseInt($('optGap').value, 10) || 0);
+        const faOnly = only.map(x => (PLATFORMS.find(p => p.id === x) || {}).fa).join('، ');
+
+        log(`▶ شروع همگام‌سازی اجباری: ${faNum(ids.length)} پست → ${faOnly}${withMedia ? '' : ' (فقط متن)'}`, '#7dd3fc');
+        document.getElementById('statusText').innerText = 'همگام‌سازی اجباری در جریان است…';
+
+        let okCount = 0, failCount = 0;
+        for (let i = 0; i < ids.length; i++) {
+            const id = ids[i];
+            const isLast = (i === ids.length - 1);
+            $('forceFill').style.width = Math.round((i / ids.length) * 100) + '%';
+            $('forceStatus').innerHTML = `پست ${faNum(id)} — ${faNum(i + 1)} از ${faNum(ids.length)}<span class="spin"></span>`;
+            PLATFORMS.forEach(p => setDot(id, p.id, only.includes(p.id) ? 'wait' : 'skip', p.fa));
+
+            try {
+                const res = await fetch(`sync_manual.php?action=resend&key=${SECURITY_KEY}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ ids: [id], only, advance: advance && isLast, no_media: !withMedia }),
+                });
+                const data = await res.json();
+                if (!data.success) {
+                    failCount++;
+                    PLATFORMS.forEach(p => setDot(id, p.id, 'bad', data.message || data.error || ''));
+                    const m = data.message || data.error || 'خطای نامشخص';
+                    $('forceResult').insertAdjacentHTML('beforeend', `<div class="res-line bad">#${faNum(id)} — ${m}</div>`);
+                    log(`پست ${faNum(id)}: ❌ ${m}`, '#f87171');
+                    continue;
+                }
+                const r = (data.results || [])[0] || {};
+                let lineOk = true, parts = [];
+                PLATFORMS.forEach(p => {
+                    const cell = r[p.id] || {};
+                    if (!only.includes(p.id)) { setDot(id, p.id, 'skip', 'رد شد'); return; }
+                    const info = String(cell.info || '');
+                    if (cell.ok === true) {
+                        const unv = /UNVERIFIED/i.test(info);
+                        setDot(id, p.id, unv ? 'q' : 'on', unv ? 'ارسال شد ولی تأیید نشد' : 'موفق');
+                        parts.push(`${p.fa}${unv ? '؟' : '✓'}`);
+                        if (unv) lineOk = false;
+                    } else {
+                        setDot(id, p.id, 'bad', info);
+                        parts.push(`${p.fa}✕`);
+                        lineOk = false;
+                    }
+                });
+                const media = r.media || {};
+                const mediaTxt = media.info === 'none' ? '' : media.info === 'skipped' ? ' | رسانه: رد شد'
+                    : (media.ok ? ' | رسانه ✓' : ` | رسانه ✕ (${media.info})`);
+                if (lineOk) okCount++; else failCount++;
+                $('forceResult').insertAdjacentHTML('beforeend',
+                    `<div class="res-line ${lineOk ? 'ok' : 'bad'}">#${faNum(id)} — ${parts.join(' ')}${mediaTxt}</div>`);
+                log(`پست ${faNum(id)}: ${parts.join(' ')}${mediaTxt}`, lineOk ? '#4ade80' : '#fca5a5');
+            } catch (e) {
+                failCount++;
+                PLATFORMS.forEach(p => setDot(id, p.id, 'bad', e.message));
+                $('forceResult').insertAdjacentHTML('beforeend', `<div class="res-line bad">#${faNum(id)} — خطای شبکه: ${e.message}</div>`);
+                log(`پست ${faNum(id)}: ❌ ${e.message}`, '#f87171');
+            }
+
+            if (!isLast && gap > 0) await sleep(gap * 1000);
+        }
+
+        $('forceFill').style.width = '100%';
+        $('forceStatus').innerHTML = `پایان — موفق: <b style="color:#86efac">${faNum(okCount)}</b> | ناموفق: <b style="color:#fca5a5">${faNum(failCount)}</b>` +
+            (advance ? ' | last_msg_id جلو رفت' : '');
+        log(`■ پایان همگام‌سازی اجباری — موفق: ${faNum(okCount)}، ناموفق: ${faNum(failCount)}`, failCount ? '#fbbf24' : '#4ade80');
+        document.getElementById('statusText').innerText = 'پایان همگام‌سازی اجباری';
+        forceBusy = false;
+        $('reviewBtn').disabled = false;
+        updateSummary();
+    }
+
+    // همگام‌سازی اولیهٔ UI پنل
+    ['optMedia', 'optAdvance', 'optGap'].forEach(id => { const el = $(id); if (el) el.addEventListener('change', updateSummary); });
+    syncPlatformUI();
 </script>
 
 </body>

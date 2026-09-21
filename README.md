@@ -432,7 +432,8 @@ IGAP_CHANNEL_NAME="کانال آزمایش" sudo -u file --preserve-env=IGAP_CHA
 | `GET` | `sync_manual.php?action=get_pending&key=<KEY>` | — | `{success, lastSeenId, count, messages:[{id,text,mediaUrl,mediaType,fileName}]}` |
 | `POST` | `sync_manual.php?action=sync_single&key=<KEY>` | بدنهٔ JSON یک پیام | `{success, id, media:{ok,info}, bale:{ok,info}, rubika:{ok,info}, soroush:{ok,info}, igap:{ok,info}}` |
 | `POST` | `sync_manual.php?action=send_report&key=<KEY>` | `{report:[string]}` | `{success:true}` |
-| `POST` | `sync_manual.php?action=resend&key=<KEY>` | `{"ids":[…]}` یا `{"from":74136,"to":74142}` + `{"only":["soroush","igap"]}` | `{success, only, count, lastSeenId, results:[…]}` |
+| `GET` | `sync_manual.php?action=list_posts&key=<KEY>&limit=10` | — | `{success, lastSeenId, limit, count, posts:[{id,text,preview,mediaType,fileName,hasMedia,sentBefore}]}` |
+| `POST` | `sync_manual.php?action=resend&key=<KEY>` | `{"ids":[…]}` یا `{"from":74136,"to":74142}` + `{"only":[…]}` + `{"no_media":bool,"advance":bool}` | `{success, only, count, lastSeenId, results:[…]}` |
 | `POST` | `sync_manual.php?action=rewind&key=<KEY>` | `{"id":74135}` | `{success, before, lastSeenId}` |
 | `GET` | `sync_manual.php?key=<KEY>` (بدون action) | — | HTML داشبورد |
 
@@ -481,6 +482,35 @@ ACTION=sync_single SYNC_BODY_FILE=/tmp/body.json php cli_run.php
 | آی‌گپ | JSON خروجی اسکریپت: `status === "OK"` **و** `verified === true` (حالت `UNVERIFIED` = شکست) |
 
 > نکته مهم: در `sync_single`، مقدار `last_msg_id` **صرف‌نظر از موفقیت یا شکست پلتفرم‌ها** به‌روزرسانی می‌شود (تنها استثنا: حالت `deferred` که هیچ‌چیز منتشر نشده است). یعنی پستی که مثلاً فقط در آی‌گپ شکست بخورد، دوباره در صف قرار نمی‌گیرد و باید دستی resend شود (نگاه کنید به [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md) §۸).
+
+---
+
+### ۹.۱ پنل «بررسی و شروع همگام‌سازی» (ارسال اجباری)
+
+در کنار داشبورد یک پنل مستقل اضافه شده که جریان عادی (`last_msg_id` → صف) را **دور می‌زند**؛ برای وقتی که می‌خواهید N پست آخر را دستی، به مقصدهای دلخواه و بدون توجه به اینکه قبلاً رفته‌اند، منتشر کنید.
+
+| گام | در پنل | آنچه پشت صحنه رخ می‌دهد |
+|---|---|---|
+| ۱ | «تعداد پست‌های آخر» + **بررسی پست‌ها** | `action=list_posts&limit=N` → scrape تازهٔ کانال، همراه با `sentBefore` (یعنی `id <= last_msg_id`) و نوع رسانه |
+| ۲ | تیک پست‌ها (پیش‌فرض: فقط «نرفته‌ها») + «انتخاب همه / هیچ / فقط نرفته‌ها / معکوس» | — |
+| ۳ | تیک مقصدها: بله، روبیکا، سروش‌پلاس، آی‌گپ | به `only` در درخواست تبدیل می‌شود |
+| ۴ | گزینه‌ها: «رسانه هم ارسال شود»، «`last_msg_id` جلو برود»، «فاصلهٔ بین پست‌ها» | `no_media` / `advance` / sleep سمت کلاینت |
+| ۵ | **شروع همگام‌سازی اجباری** | برای هر پست یک `action=resend` با `{ids:[id], only:[…]}` — پست‌به‌پست تا تایم‌اوت PHP نخورد |
+
+**امنیت و ایمنی**
+
+- اگر پستی `قبلاً رفته` باشد و بله/روبیکا تیک خورده باشند، یک هشدار نارنجی در پنل ظاهر می‌شود و پیش از اجرا هم `confirm` می‌پرسد (چون نتیجه‌اش پست تکراری در کانال عمومی است).
+- `advance` به‌طور پیش‌فرض **خاموش** است؛ فقط روی آخرین پست و در صورت تیک خوردن، `last_msg_id` جلو می‌رود.
+- نتیجهٔ هر پست با چهار نقطهٔ رنگی (ب/ر/س/آ) نشان داده می‌شود: سبز = موفق و تأییدشده، نارنجی `؟` = `UNVERIFIED` (رفته ولی هدر کانال تأیید نشده)، قرمز = شکست، خاکستری = ردشده توسط فیلتر.
+- رسانهٔ هر پست **در همان لحظهٔ ارسال** دوباره scrape و دانلود می‌شود، چون لینک رسانهٔ ایتا امضاشده و زمان‌دار است (لینک قدیمی ۴۰۳ می‌شود).
+
+> نمونهٔ درخواست مستقیم (بدون داشبورد):
+> ```bash
+> KEY=$(cat .cron_key)
+> curl -s -X POST "https://دامنه/s/sync_manual.php?action=resend&key=$KEY" \
+>      -H 'Content-Type: application/json' \
+>      -d '{"ids":[74141,74142],"only":["soroush","igap"],"no_media":false}' | jq .
+> ```
 
 ---
 
@@ -542,7 +572,8 @@ ACTION=sync_single SYNC_BODY_FILE=/tmp/body.json php cli_run.php
 | 19 | `restore_runtime.sh`: بازیابی `node_modules`، پروفایل‌ها و `state.sqlite` از تاریخ Git وقتی `git checkout` پاکشان کرده (بدون نیاز به اینترنت) | 🛠️ ابزار | `restore_runtime.sh` |
 | 20 | کد خطای `NODE_DEPS_MISSING` + پیش‌بررسی `playwright` پیش از راه‌اندازی Node: به‌جای stack trace خام، پیام فارسیِ قابل‌اقدام | 🐛 رفع باگ | `sync_manual.php` |
 | 21 | دو action جدید `resend` (ارسال دوباره فقط به مقصدهای شکست‌خورده، با scrape تازهٔ رسانه) و `rewind` (عقب بردن `last_msg_id`) + فیلتر `only` در `sync_single` | ✨ قابلیت | `sync_manual.php` |
-| 22 | افزودن `DASHBOARD_ALLOWED_IP` (محدودسازی IP داشبورد از `.env`) و `IGAP_ITEM_ID` (انتقال `--item-id` به Node) | ✨ قابلیت | `config.php`, `sync_manual.php` |
+| 22 | پنل کناری «بررسی و شروع همگام‌سازی» در داشبورد: انتخاب N پست آخر، ارسال **اجباری** بدون توجه به `last_msg_id`، انتخاب مقصدها، گزینهٔ بدون رسانه، `advance` اختیاری، فاصلهٔ بین پست‌ها، هشدار پست تکراری و نتیجهٔ رنگی به‌تفکیک پلتفرم + action جدید `list_posts` | ✨ قابلیت | `sync_manual.php` |
+| 23 | افزودن `DASHBOARD_ALLOWED_IP` (محدودسازی IP داشبورد از `.env`) و `IGAP_ITEM_ID` (انتقال `--item-id` به Node) | ✨ قابلیت | `config.php`, `sync_manual.php` |
 
 ---
 
