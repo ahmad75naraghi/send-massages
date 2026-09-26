@@ -58,13 +58,19 @@ const MENU_DOC = [
     '.MenuItem:has-text("فایل (سند)")',
 ];
 
-const MODAL = '.modal-dialog, [role="dialog"]';
+const MODAL = '.modal-dialog, [role="dialog"], .MuiDialog-root, .MuiModal-root';
 const MODAL_SEND = [
     `${MODAL} button:has-text("ارسال")`,
     `${MODAL} button:has-text("Send")`,
     `${MODAL} button:has(i.icon-ig-send-outline)`,
+    `${MODAL} button:has(i[class*="send"])`,
+    `${MODAL} [role="button"]:has(i[class*="send"])`,
+    `${MODAL} button:has(svg)`,
+    `${MODAL} [role="button"]:has(svg)`,
     `${MODAL} button.confirm-dialog-button`,
     `${MODAL} button.btn-primary`,
+    `${MODAL} button`,
+    `${MODAL} [role="button"]`,
 ];
 
 async function firstEnabled(page, selectors, { timeout = 20000, label = 'button' } = {}) {
@@ -82,6 +88,28 @@ async function firstEnabled(page, selectors, { timeout = 20000, label = 'button'
         await C.delay(350);
     } while (Date.now() < deadline);
     return sawDisabled ? { disabled: true, selector: label } : null;
+}
+
+
+async function clickModalBottomRight(page, log, label = 'modal bottom-right') {
+    const box = await page.evaluate(() => {
+        const selectors = ['[role="dialog"]', '.modal-dialog', '.MuiDialog-root [role="dialog"]', '.MuiPaper-root', '.MuiModal-root'];
+        const nodes = [];
+        for (const sel of selectors) nodes.push(...document.querySelectorAll(sel));
+        const visible = nodes
+            .map(el => ({ el, r: el.getBoundingClientRect(), text: (el.innerText || '').slice(0, 120) }))
+            .filter(x => x.r.width > 160 && x.r.height > 120 && x.r.bottom > 0 && x.r.right > 0 && getComputedStyle(x.el).visibility !== 'hidden');
+        visible.sort((a, b) => (b.r.width * b.r.height) - (a.r.width * a.r.height));
+        const x = visible.find(v => /Send File|ارسال|فایل|رسانه/i.test(v.text)) || visible[0];
+        if (!x) return null;
+        return { left: x.r.left, top: x.r.top, right: x.r.right, bottom: x.r.bottom, width: x.r.width, height: x.r.height, text: x.text };
+    }).catch(() => null);
+    if (!box) { log.step(`${label}: modal box not found`); return false; }
+    const x = Math.max(box.left + 20, box.right - 55);
+    const y = Math.max(box.top + 20, box.bottom - 55);
+    await page.mouse.click(x, y);
+    log.step(`${label}: clicked at ${Math.round(x)},${Math.round(y)} box=${Math.round(box.width)}x${Math.round(box.height)} text="${C.RunLog.brief(box.text, 50)}"`);
+    return true;
 }
 
 async function clickChannel(page, locator, name, log, label) {
@@ -268,20 +296,24 @@ async function countCards(page) {
             }
 
             // ---------- ۵) ارسال: فقط از داخل مودال ----------
-            const sendBtn = await firstEnabled(page, MODAL_SEND, { timeout: 25000, label: 'modal send' });
+            const sendBtn = await firstEnabled(page, MODAL_SEND, { timeout: 12000, label: 'modal send' });
             if (sendBtn && !sendBtn.disabled) {
                 await sendBtn.locator.click({ force: true });
                 sentVia = 'modal-button:' + sendBtn.selector;
             } else {
-                if (sendBtn && sendBtn.disabled) log.step('WARNING: modal send button stayed disabled; trying keyboard fallback');
-                await page.keyboard.press('Control+Enter');
-                await C.delay(800);
+                if (sendBtn && sendBtn.disabled) log.step('WARNING: modal send button stayed disabled; trying modal coordinate fallback');
+                const clicked = await clickModalBottomRight(page, log, 'modal send fallback');
+                sentVia = clicked ? 'modal-bottom-right-click' : 'modal-fallback-missing';
+                await C.delay(1200);
                 const modalStill = await page.locator(MODAL).last().isVisible().catch(() => false);
-                if (modalStill) { await page.keyboard.press('Enter'); sentVia = 'enter-last-resort'; }
-                else sentVia = 'ctrl+enter';
+                if (!clicked || modalStill) {
+                    log.step('modal still visible after coordinate fallback; trying Enter');
+                    await page.keyboard.press('Enter');
+                    sentVia += '+enter';
+                }
             }
             log.step(`media submit via ${sentVia}`);
-            await C.delay(3000);
+            await C.delay(4000);
         }
         // ---------- ۶) مسیر متن ساده ----------
         else if (opts.text) {

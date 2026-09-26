@@ -64,6 +64,12 @@ const MODAL_SEND = [
     `${MODAL} button.btn-primary`,
     `${MODAL} button:has-text("ارسال")`,
     `${MODAL} button:has-text("Send")`,
+    `${MODAL} button:has(i[class*="send"])`,
+    `${MODAL} [role="button"]:has(i[class*="send"])`,
+    `${MODAL} button:has(svg)`,
+    `${MODAL} [role="button"]:has(svg)`,
+    `${MODAL} button`,
+    `${MODAL} [role="button"]`,
 ];
 
 const escapeRegex = (s) => String(s || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -117,6 +123,28 @@ async function firstEnabled(page, selectors, { timeout = 20000, label = 'button'
     return sawDisabled ? { disabled: true, selector: label } : null;
 }
 
+
+async function clickModalBottomRight(page, log, label = 'modal bottom-right') {
+    const box = await page.evaluate(() => {
+        const selectors = ['[role="dialog"]', '.modal-dialog', '.Modal'];
+        const nodes = [];
+        for (const sel of selectors) nodes.push(...document.querySelectorAll(sel));
+        const visible = nodes
+            .map(el => ({ el, r: el.getBoundingClientRect(), text: (el.innerText || '').slice(0, 120) }))
+            .filter(x => x.r.width > 160 && x.r.height > 120 && x.r.bottom > 0 && x.r.right > 0 && getComputedStyle(x.el).visibility !== 'hidden');
+        visible.sort((a, b) => (b.r.width * b.r.height) - (a.r.width * a.r.height));
+        const x = visible.find(v => /ارسال|Send|عکس|ویدیو|رسانه/i.test(v.text)) || visible[0];
+        if (!x) return null;
+        return { left: x.r.left, top: x.r.top, right: x.r.right, bottom: x.r.bottom, width: x.r.width, height: x.r.height, text: x.text };
+    }).catch(() => null);
+    if (!box) { log.step(`${label}: modal box not found`); return false; }
+    const x = Math.max(box.left + 20, box.right - 55);
+    const y = Math.max(box.top + 20, box.bottom - 55);
+    await page.mouse.click(x, y);
+    log.step(`${label}: clicked at ${Math.round(x)},${Math.round(y)} box=${Math.round(box.width)}x${Math.round(box.height)} text="${C.RunLog.brief(box.text, 50)}"`);
+    return true;
+}
+
 function currentUrlHash(page) {
     try { return new URL(page.url()).hash || ''; } catch (e) { return ''; }
 }
@@ -150,6 +178,8 @@ async function waitForConcreteChatAfterClick(page, channel, beforeHash, log, lab
 }
 
 const NEW_POST_BUTTONS = [
+    // فقط داخل ستون چت مقصد؛ دکمه‌های عمومی ستون فهرست چت‌ها را لمس نمی‌کنیم
+    // تا اگر کانال اصلی composer ندارد، به چت/کانال دیگری ارسال نشود.
     '.MiddleColumn button:has-text("پیام جدید")',
     '.MiddleColumn [role="button"]:has-text("پیام جدید")',
     '.MiddleColumn a:has-text("پیام جدید")',
@@ -160,20 +190,24 @@ const NEW_POST_BUTTONS = [
     '#MiddleColumn [class*="Button"]:has-text("پیام جدید")',
     '.MiddleColumn [class*="button"]:has-text("پیام جدید")',
     '#MiddleColumn [class*="button"]:has-text("پیام جدید")',
-    'button:has-text("پیام جدید")',
-    '[role="button"]:has-text("پیام جدید")',
-    'a:has-text("پیام جدید")',
-    '[class*="Button"]:has-text("پیام جدید")',
-    '[class*="button"]:has-text("پیام جدید")',
-    'text="پیام جدید"',
     '.MiddleColumn button:has-text("ارسال پیام")',
     '#MiddleColumn button:has-text("ارسال پیام")',
-    'button:has-text("ارسال پیام")',
-    '[role="button"]:has-text("ارسال پیام")',
+    '.MiddleColumn [role="button"]:has-text("ارسال پیام")',
+    '#MiddleColumn [role="button"]:has-text("ارسال پیام")',
     '.MiddleColumn button:has-text("New Message")',
     '#MiddleColumn button:has-text("New Message")',
     '.MiddleColumn button:has-text("New Post")',
     '#MiddleColumn button:has-text("New Post")',
+    '.MiddleColumn button[aria-label*="پیام"]',
+    '#MiddleColumn button[aria-label*="پیام"]',
+    '.MiddleColumn button[title*="پیام"]',
+    '#MiddleColumn button[title*="پیام"]',
+    '.MiddleColumn button:has(i[class*="edit"])',
+    '#MiddleColumn button:has(i[class*="edit"])',
+    '.MiddleColumn [role="button"]:has(i[class*="edit"])',
+    '#MiddleColumn [role="button"]:has(i[class*="edit"])',
+    '.MiddleColumn button:has(i[class*="compose"])',
+    '#MiddleColumn button:has(i[class*="compose"])',
 ];
 
 async function ensureComposer(page, log, timeout = 12000) {
@@ -420,9 +454,14 @@ async function readActivePreview(page) {
 
         if (!opened) {
             await C.safeScreenshot(page, 'last_media_send.jpg', log);
+            const finalHash = currentUrlHash(page);
+            const reachedTarget = isConcreteChatHash(finalHash, opts.channel);
             result = {
-                status: 'ERROR', code: 'CHANNEL_NOT_FOUND',
-                error: `کانال "${opts.channel || opts.channelName}" با هیچ‌یک از سه راهبرد باز/تأیید نشد. نام نمایشی دقیق را با --channel-name بدهید.`,
+                status: 'ERROR',
+                code: reachedTarget ? 'COMPOSER_NOT_AVAILABLE' : 'CHANNEL_NOT_FOUND',
+                error: reachedTarget
+                    ? `کانال "${opts.channel || opts.channelName}" باز شد (${page.url()}) ولی composer یا دکمهٔ ارسال پست داخل خود کانال دیده نشد. احتمالاً اکانت سروشِ این profile دسترسی ادمین/ارسال پست در کانال اصلی را ندارد.`
+                    : `کانال "${opts.channel || opts.channelName}" با هیچ‌یک از راهبردهای امن باز/تأیید نشد.`,
                 log: log.file
             };
             exitCode = 1;
@@ -521,15 +560,21 @@ async function readActivePreview(page) {
             }
 
             // ---------- ۶) ارسال مودال ----------
-            const sendBtn = await firstEnabled(page, MODAL_SEND, { timeout: 25000, label: 'modal send' });
+            const sendBtn = await firstEnabled(page, MODAL_SEND, { timeout: 12000, label: 'modal send' });
             if (sendBtn && !sendBtn.disabled) {
                 await sendBtn.locator.click({ force: true });
                 sentVia = 'modal-button:' + sendBtn.selector;
             } else {
-                if (sendBtn && sendBtn.disabled) log.step('WARNING: modal send button stayed disabled; trying keyboard fallback');
-                await page.keyboard.press('Control+Enter');
-                await C.delay(800);
-                sentVia = 'ctrl+enter';
+                if (sendBtn && sendBtn.disabled) log.step('WARNING: modal send button stayed disabled; trying modal coordinate fallback');
+                const clicked = await clickModalBottomRight(page, log, 'modal send fallback');
+                sentVia = clicked ? 'modal-bottom-right-click' : 'modal-fallback-missing';
+                await C.delay(1200);
+                const modalStill = await page.locator(MODAL).last().isVisible().catch(() => false);
+                if (!clicked || modalStill) {
+                    log.step('modal still visible after coordinate fallback; trying Ctrl+Enter');
+                    await page.keyboard.press('Control+Enter');
+                    sentVia += '+ctrl+enter';
+                }
             }
             log.step(`media submit via ${sentVia}`);
             await C.delay(5000);
