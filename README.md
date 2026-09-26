@@ -411,6 +411,11 @@ IGAP_CHANNEL_NAME="کانال آزمایش" sudo -u file --preserve-env=IGAP_CHA
 | کلید | پیش‌فرض | نقش |
 |---|---|---|
 | `USERBOT_TIMEOUT_SEC` | `240` | کرانهٔ سخت هر اجرای UserBot (`timeout` دور subprocess) |
+| `PHP_CLI_BIN` | *(خالی = تشخیص خودکار؛ fallback از `PHP_BIN`)* | باینری PHP برای worker صف پس‌زمینه — باید PHP 8 + اکستنشن‌ها + lint سالم باشد |
+| `BACKGROUND_MAX_POSTS` | `50` | سقف پست‌های جدید در هر اجرای صف پس‌زمینه |
+| `BACKGROUND_GAP_SEC` | `0` | مکث بین پست‌ها در صف پس‌زمینه (۰ = بدون مکث؛ `SYNC_GAP_SEC` فقط مسیر دستی/cron) |
+| `SYNC_PARALLEL_DISPATCH` | `true` | ارسال هم‌زمان سروش+آی‌گپ (دو Chromium موازی)؛ برای سرور کم‌رمز `0` |
+| `BACKGROUND_MAX_PASSES` | `2` | حداکثر دفعات تلاش مجدد پلتفرم‌های ناموفق در صف |
 | `MEDIA_MAX_RETRY` | `3` | سقف تلاش دانلود رسانه پیش از انتشار بدون رسانه ([`TROUBLESHOOTING.md`](TROUBLESHOOTING.md) §۳.۳) |
 | `SYNC_GAP_SEC` | `5` | فاصلهٔ بین پست‌ها در `cron_sync.sh` |
 | `CHECK_INTERVAL_SEC` | `30` | فاصلهٔ بررسی در `sync_daemon.php` (legacy) |
@@ -435,6 +440,8 @@ IGAP_CHANNEL_NAME="کانال آزمایش" sudo -u file --preserve-env=IGAP_CHA
 | `GET` | `sync_manual.php?action=list_posts&key=<KEY>&limit=10` | — | `{success, lastSeenId, limit, count, posts:[{id,text,preview,mediaType,fileName,hasMedia,sentBefore}]}` |
 | `POST` | `sync_manual.php?action=resend&key=<KEY>` | `{"ids":[…]}` یا `{"from":74136,"to":74142}` + `{"only":[…]}` + `{"no_media":bool,"advance":bool}` | `{success, only, count, lastSeenId, results:[…]}` |
 | `POST` | `sync_manual.php?action=rewind&key=<KEY>` | `{"id":74135}` | `{success, before, lastSeenId}` |
+| `GET` | `sync_manual.php?action=queue_status&key=<KEY>` | — | `{success, running, pid, progress:{state,phase,totalPosts,summary,…}, log, launcherLog}` |
+| `POST` | `sync_manual.php?action=background_sync&key=<KEY>` | `{"profile":"main","maxPosts":50}` | `{success:true, started:true, pid}` یا `{success:true, started:false, reason:"ALREADY_RUNNING", progress}` |
 | `GET` | `sync_manual.php?key=<KEY>` (بدون action) | — | HTML داشبورد |
 
 **`action=resend` — جبران شکست جزئی بدون پست تکراری**
@@ -451,6 +458,18 @@ curl -s -X POST "https://دامنه/s/sync_manual.php?action=resend&key=$KEY" \
 echo '{"ids":[74136,74137],"only":["soroush","igap"]}' > /tmp/resend.json
 ACTION=resend SYNC_BODY_FILE=/tmp/resend.json php cli_run.php | jq .
 ```
+
+**`action=background_sync` — صف پس‌زمینهٔ کامل (دکمهٔ داشبورد)**
+
+دکمهٔ «اجرای صف پس‌زمینه» روی داشبورد همین action را صدا می‌زند. جریان:
+
+1. PHP وب، باینری PHP سالم را تأیید می‌کند (`resolvePhpCliBinary`: `-v`، اکستنشن‌ها و `php -l`)، یک body JSON و یک `logs/background_launcher.sh` می‌سازد و آن را با `setsid nohup` **مستقل از Apache** اجرا می‌کند؛ PID worker در `logs/sync_worker.pid` ثبت می‌شود.
+2. worker (`ACTION=background_run`) از CLI اجرا می‌شود: پست‌های جدید (id > `last_msg_id`، قدیمی‌ترین اول، حداکثر `BACKGROUND_MAX_POSTS`) را از ایتا می‌خواند، رسانه‌ها را یک‌جا دانلود می‌کند و **هم‌زمان** به چهار پلتفرم می‌فرستد: دو runner Node (سروش‌پلاس + آی‌گپ، هرکدام کل صف را در یک مرورگر می‌فرستد) و دو worker HTTP (بله/روبیکا). هیچ مکثی بین پست‌ها نیست (`BACKGROUND_GAP_SEC=0`).
+3. پیشرفت لحظه‌ای در `logs/background_progress.json` نوشته می‌شود (نوشتن اتمیک) و داشبورد هر ۲.۵ ثانیه آن را با `queue_status` می‌خواند — بدون باز نگه‌داشتن هیچ درخواست وبی.
+4. هر پست فقط یک‌بار می‌رود: جدول `delivery` (PK: msg_id+platform+profile) موفقیت‌ها را ثبت می‌کند و تلاش دوباره همان پست، پلتفرم‌های قبلاً موفق را رد می‌کند.
+5. در پایان، گزارش مدیریتی بله با جزئیات هر پست ارسال می‌شود و `last_msg_id` فقط تا آخرین پستِ موفقِ پیوسته جلو می‌رود.
+
+اگر worker وسط کار بمیرد، داشبورد «اجرای متروک» را نشان می‌دهد؛ اجرای دوبارهٔ صف از همان‌جا ادامه می‌دهد (پست‌های قبلاً موفق رد می‌شوند).
 
 همین فیلتر در `sync_single` هم هست: `{"id":…,"text":…,"only":["igap"]}`. پلتفرم‌های ردشده در پاسخ `{"ok":null,"info":"SKIPPED"}` می‌گیرند و در داشبورد با `—` نمایش داده می‌شوند.
 
@@ -576,6 +595,9 @@ ACTION=sync_single SYNC_BODY_FILE=/tmp/body.json php cli_run.php
 | 22 | پنل کناری «بررسی و شروع همگام‌سازی» در داشبورد: انتخاب N پست آخر، ارسال **اجباری** بدون توجه به `last_msg_id`، انتخاب مقصدها، گزینهٔ بدون رسانه، `advance` اختیاری، فاصلهٔ بین پست‌ها، هشدار پست تکراری و نتیجهٔ رنگی به‌تفکیک پلتفرم + action جدید `list_posts` | ✨ قابلیت | `sync_manual.php` |
 | 23 | افزودن `DASHBOARD_ALLOWED_IP` (محدودسازی IP داشبورد از `.env`) و `IGAP_ITEM_ID` (انتقال `--item-id` به Node) | ✨ قابلیت | `config.php`, `sync_manual.php` |
 
+| 24 | **صف پس‌زمینهٔ کامل**: actionهای `background_sync` (launcher مستقل با `setsid nohup` + ثبت PID) و `background_run` (موتور CLI: دانلود گروهی رسانه، چهار worker موازی، دفتر تحویل `delivery` برای idempotency، تلاش مجدد، گزارش مدیریتی) و `queue_status` (پیشرفت زنده) + رندر کارت‌به‌کارت پیشرفت در داشبورد | ✨ قابلیت | `sync_manual.php`, `config.php`, `cli_run.php` |
+| 25 | **حالت `--batch` برای هر دو UserBot**: کل صف در یک مرورگر با progress-file اتمیک (به‌جای راه‌اندازی Chromium برای هر پست)؛ حفظ ترتیب، توقف روی اولین خطا و علامت‌گذاری بقیه `NOT_ATTEMPTED` | ✨ قابلیت/سرعت | `send_soroush.js`, `send_igap.js`, `lib/pw_common.js` |
+| 26 | **ارسال هم‌زمان سروش+آی‌گپ** در `dispatchToPlatforms` (قابل خاموش‌کردن با `SYNC_PARALLEL_DISPATCH=0`)؛ زمان هر پست از مجموعِ چهار پلتفرم به max(سروش, آی‌گپ) می‌رسد | ⚡ سرعت | `sync_manual.php` |
 ---
 
 ## ۱۳. سلب مسئولیت عملیاتی
