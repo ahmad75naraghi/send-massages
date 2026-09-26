@@ -67,6 +67,34 @@ const MODAL_SEND = [
 ];
 
 const escapeRegex = (s) => String(s || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const COMPOSER = '.MiddleColumn .input-message-input, .MiddleColumn div[contenteditable="true"], #MiddleColumn .input-message-input, #MiddleColumn div[contenteditable="true"]';
+const NEW_POST_BUTTONS = [
+    '.MiddleColumn button:has-text("پیام جدید")',
+    '.MiddleColumn [role="button"]:has-text("پیام جدید")',
+    '.MiddleColumn a:has-text("پیام جدید")',
+    '#MiddleColumn button:has-text("پیام جدید")',
+    '#MiddleColumn [role="button"]:has-text("پیام جدید")',
+    '#MiddleColumn a:has-text("پیام جدید")',
+    '.MiddleColumn button:has-text("ارسال پیام")',
+    '#MiddleColumn button:has-text("ارسال پیام")',
+    '.MiddleColumn button:has-text("New Message")',
+    '#MiddleColumn button:has-text("New Message")',
+    '.MiddleColumn button:has-text("New Post")',
+    '#MiddleColumn button:has-text("New Post")',
+];
+
+async function ensureComposer(page, log, timeout = 12000) {
+    if (await C.seen(page.locator(COMPOSER).first(), 1200)) return true;
+    const newPost = await C.firstVisible(page, NEW_POST_BUTTONS, { timeout: 3500, label: 'new post button' });
+    if (newPost) {
+        await newPost.locator.click({ force: true });
+        log.step(`new-post button clicked via ${newPost.selector}`);
+        await C.delay(1200);
+        if (await C.seen(page.locator(COMPOSER).first(), timeout)) return true;
+        log.step('new-post clicked but composer still not visible');
+    }
+    return await C.seen(page.locator(COMPOSER).first(), 1000);
+}
 
 async function openChatByName(page, name, log) {
     if (!name) return false;
@@ -74,7 +102,7 @@ async function openChatByName(page, name, log) {
     if (!(await C.seen(item, 4000))) return false;
     await item.click({ force: true });
     log.step(`openChatByName: clicked list item "${name}"`);
-    return await C.seen(page.locator('.MiddleColumn .input-message-input, .MiddleColumn div[contenteditable="true"]').first(), 8000);
+    return await ensureComposer(page, log, 8000);
 }
 
 async function openChatBySearch(page, channel, log, strict = false) {
@@ -103,7 +131,7 @@ async function openChatBySearch(page, channel, log, strict = false) {
         if (await C.seen(exact, 2500)) {
             await exact.click({ force: true });
             log.step(`openChatBySearch(strict): clicked exact username result for "${query}"`);
-            if (await C.seen(page.locator('.MiddleColumn .input-message-input, .MiddleColumn div[contenteditable="true"]').first(), 15000)) return true;
+            if (await ensureComposer(page, log, 15000)) return true;
             log.step('openChatBySearch(strict): exact result opened but composer not visible');
         } else {
             log.step('openChatBySearch(strict): exact username text not visible; iterating visible results for exact @query');
@@ -117,7 +145,7 @@ async function openChatBySearch(page, channel, log, strict = false) {
             const brief = await item.innerText({ timeout: 1000 }).catch(() => '');
             await item.click({ force: true });
             log.step(`openChatBySearch(strict): clicked result #${i + 1} for "${query}" text="${C.RunLog.brief(brief, 80)}"`);
-            if (await C.seen(page.locator('.MiddleColumn .input-message-input, .MiddleColumn div[contenteditable="true"]').first(), 15000)) return true;
+            if (await ensureComposer(page, log, 15000)) return true;
             log.step(`openChatBySearch(strict): result #${i + 1} opened but composer not visible`);
         }
         return false;
@@ -127,7 +155,7 @@ async function openChatBySearch(page, channel, log, strict = false) {
     if (!(await C.seen(result, 6000))) { log.step('openChatBySearch: no result for ' + channel); return false; }
     await result.click({ force: true });
     log.step(`openChatBySearch: clicked result for "${query}"`);
-    return await C.seen(page.locator('.MiddleColumn .input-message-input, .MiddleColumn div[contenteditable="true"]').first(), 8000);
+    return await ensureComposer(page, log, 8000);
 }
 
 async function openChatByHash(page, browser, channel, log) {
@@ -135,7 +163,7 @@ async function openChatByHash(page, browser, channel, log) {
     const route = /^-?\d+$/.test(String(channel)) ? `#${channel}` : `#@${channel}`;
     await page.goto(`https://web.splus.ir/${route}`, { waitUntil: 'domcontentloaded', timeout: 60000 });
     await C.delay(6000);
-    const ok = await C.seen(page.locator('.MiddleColumn .input-message-input, .MiddleColumn div[contenteditable="true"]').first(), 15000);
+    const ok = await ensureComposer(page, log, 15000);
     log.step(`openChatByHash: ${route} → url=${page.url()} composer ${ok ? 'visible' : 'NOT visible'}`);
     return ok;
 }
@@ -271,7 +299,7 @@ async function readActivePreview(page) {
         }
         log.step(`chat opened via ${openedVia}. header="${header}"`);
 
-        const composer = page.locator('.MiddleColumn .input-message-input, .MiddleColumn div[contenteditable="true"]').last();
+        const composer = page.locator(COMPOSER).last();
 
         // ---------- ۳) سنجه‌های «پیش از ارسال» برای تأیید ----------
         const beforeCount = await countMessages(page);
@@ -397,7 +425,7 @@ async function readActivePreview(page) {
                     snippetSeen = await page.locator('.MiddleColumn').getByText(snippet, { exact: false }).first().isVisible().catch(() => false);
                 }
                 const composerCleared = await page.evaluate(() => {
-                    const el = document.querySelector('.MiddleColumn .input-message-input') || document.querySelector('.MiddleColumn div[contenteditable="true"]');
+                    const el = document.querySelector('.MiddleColumn .input-message-input') || document.querySelector('.MiddleColumn div[contenteditable="true"]') || document.querySelector('#MiddleColumn .input-message-input') || document.querySelector('#MiddleColumn div[contenteditable="true"]');
                     return !!el && (el.innerText || '').trim() === '';
                 }).catch(() => false);
                 const previewChanged = !!beforePreview && afterPreview !== beforePreview;
