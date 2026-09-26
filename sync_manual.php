@@ -579,7 +579,7 @@ function dispatchToPlatforms(array $only, string $text, ?string $localFile, ?str
 }
 
 function sendToSoroush(string $channel, string $text = '', ?string $filePath = null, ?string $mediaType = null, ?string $channelName = null): array {
-    return runUserbot(SOROUSH_SCRIPT, SOROUSH_PROFILE_DIR, $channel, $channelName ?? SOROUSH_CHANNEL_NAME, $text, $filePath, $mediaType);
+    return runUserbot(SOROUSH_SCRIPT, SOROUSH_PROFILE_DIR, $channel, $channelName ?? SOROUSH_CHANNEL_NAME, $text, $filePath, $mediaType, ['strict-channel' => '1']);
 }
 
 function sendToIgap(string $channel, string $text = '', ?string $filePath = null, ?string $mediaType = null, ?string $channelName = null, ?string $itemId = null): array {
@@ -717,6 +717,7 @@ if ($action === 'list_posts') {
             'id'         => (int)$m['id'],
             'text'       => $text,
             'preview'    => mb_substr((string)preg_replace('/\s+/u', ' ', $text), 0, 90),
+            'mediaUrl'   => $m['mediaUrl'] ?? null,
             'mediaType'  => $m['mediaType'] ?? null,
             'fileName'   => $m['fileName'] ?? null,
             'hasMedia'   => !empty($m['mediaUrl']),
@@ -978,6 +979,7 @@ if ($action === 'sync_single') {
     $only = is_array($payload['only'] ?? null) ? (array)$payload['only'] : [];
     $onlyNorm = normalizePlatformList($only);
     $profile = normalizeDestinationProfile((string)($payload['profile'] ?? 'main'));
+    $advanceState = array_key_exists('advance', $payload) ? !empty($payload['advance']) : true;
     $hasDeliverable = (trim($text) !== '') || ($localFile && file_exists($localFile));
 
     if ($hasDeliverable) {
@@ -1021,7 +1023,9 @@ if ($action === 'sync_single') {
         exit;
     }
 
-    advanceLastSeenId($db, EITAA_CHANNEL_ID, $msgId);
+    if ($advanceState) {
+        advanceLastSeenId($db, EITAA_CHANNEL_ID, $msgId);
+    }
 
     // پستی که منتشر شد (یا بعد از سقف تلاش، بدون محتوای قابل ارسال رد شد) دیگر در صف تعویق نمی‌ماند
     clearMediaFail($db, $msgId);
@@ -1510,7 +1514,6 @@ if ($action === 'rewind') {
     async function processRecentManual(profile = 'main') {
         const isTest = profile === 'test';
         const btn = document.getElementById(isTest ? 'testBtn' : 'startBtn');
-        btn.disabled = true;
         document.getElementById('startBtn').disabled = true;
         document.getElementById('testBtn').disabled = true;
         document.getElementById('queueBtn').disabled = true;
@@ -1518,62 +1521,112 @@ if ($action === 'rewind') {
         document.getElementById('progressFill').style.width = '0%';
         document.getElementById('percentText').innerText = '0%';
         document.getElementById('statusText').innerText = `در حال دریافت ۵ پست آخر برای کانال‌های ${isTest ? 'تست' : 'اصلی'}...`;
-        log(`خواندن ۵ پست آخر ایتا برای ارسال به کانال‌های ${isTest ? 'تست/قبلی' : 'اصلی'}...`, '#7dd3fc');
+        log(`خواندن ۵ پست آخر ایتا برای ارسال مرحله‌ای به کانال‌های ${isTest ? 'تست/قبلی' : 'اصلی'}...`, '#7dd3fc');
 
         try {
             const listRes = await fetch(apiUrl('list_posts', { limit: 5 }));
             const listData = await listRes.json();
             if (!listData.success) {
                 log('خطا در خواندن پست‌ها: ' + (listData.message || listData.error || 'نامشخص'), '#f87171');
-                document.getElementById('startBtn').disabled = false;
-                document.getElementById('testBtn').disabled = false;
-                document.getElementById('queueBtn').disabled = false;
                 return;
             }
+
             pendingMessages = (listData.posts || []).slice().sort((a, b) => a.id - b.id).map(p => ({
                 id: p.id,
-                text: p.text || p.preview || '',
+                text: p.text || '',
+                mediaUrl: p.mediaUrl || null,
                 mediaType: p.mediaType || null,
-                fileName: p.fileName || null,
+                fileName: p.fileName || 'file.bin',
+                profile,
+                advance: !isTest,
             }));
             if (!pendingMessages.length) {
                 log('پستی برای ارسال پیدا نشد.', '#fbbf24');
-                document.getElementById('startBtn').disabled = false;
-                document.getElementById('testBtn').disabled = false;
-                document.getElementById('queueBtn').disabled = false;
                 return;
             }
+
             renderCards(pendingMessages);
-            pendingMessages.forEach(m => ['bale', 'rubika', 'soroush', 'igap'].forEach(p => {
-                const b = document.getElementById(`${p}-${m.id}`);
-                if (b) { b.className = 'badge loading'; b.innerText = 'در صف'; }
-            }));
+            reportList = [];
+            let stoppedEarly = false;
+            const total = pendingMessages.length;
 
-            log(`شروع ارسال ${faNum(pendingMessages.length)} پست آخر به کانال‌های ${isTest ? 'تست' : 'اصلی'}...`, '#e2e8f0');
-            document.getElementById('statusText').innerText = `ارسال ${faNum(pendingMessages.length)} پست آخر به کانال‌های ${isTest ? 'تست' : 'اصلی'}...`;
-            const res = await fetch(apiUrl('sync_recent'), {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ profile, limit: 5, advance: !isTest, gap: 0 })
-            });
-            const data = await res.json();
-            if (!data.results) data.results = [];
+            for (let i = 0; i < total; i++) {
+                const m = pendingMessages[i];
+                const card = document.getElementById(`card-${m.id}`);
+                if (card) card.classList.add('active');
+                ['bale', 'rubika', 'soroush', 'igap'].forEach(p => {
+                    const b = document.getElementById(`${p}-${m.id}`);
+                    if (b) { b.className = 'badge loading'; b.innerText = 'ارسال...'; b.style.background = ''; }
+                });
 
-            data.results.forEach(r => {
-                updateBadge(`bale-${r.id}`, r.bale?.ok, 'بله', r.bale?.info);
-                updateBadge(`rubika-${r.id}`, r.rubika?.ok, 'روبیکا', r.rubika?.info);
-                updateBadge(`soroush-${r.id}`, r.soroush?.ok, 'سروش', r.soroush?.info);
-                updateBadge(`igap-${r.id}`, r.igap?.ok, 'آیگپ', r.igap?.info);
-                const mark = x => x?.ok === true ? '✓' : (x?.ok === null ? '—' : '✕');
-                log(`#${r.id}: بله${mark(r.bale)} روبیکا${mark(r.rubika)} سروش${mark(r.soroush)} آی‌گپ${mark(r.igap)}${r.media?.info && r.media.info !== 'none' ? ' | رسانه: ' + r.media.info : ''}`, data.success ? '#4ade80' : '#fbbf24');
-            });
+                const percent = Math.round((i / total) * 100);
+                document.getElementById('progressFill').style.width = `${percent}%`;
+                document.getElementById('percentText').innerText = `${percent}%`;
+                document.getElementById('statusText').innerText = `ارسال پست ${faNum(m.id)} به کانال‌های ${isTest ? 'تست' : 'اصلی'} (${faNum(i + 1)} از ${faNum(total)})...`;
+                log(`شروع ارسال پست ${faNum(m.id)} (${isTest ? 'تست' : 'اصلی'})...`, '#e2e8f0');
+
+                try {
+                    const res = await fetch(apiUrl('sync_single'), {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(m)
+                    });
+                    const result = await res.json();
+
+                    if (result.deferred) {
+                        ['bale', 'rubika', 'soroush', 'igap'].forEach(p => {
+                            const b = document.getElementById(`${p}-${m.id}`);
+                            if (b) { b.className = 'badge fail'; b.style.background = '#78350f'; b.innerText = 'تعویق'; b.title = result.message || ''; }
+                        });
+                        log(`⏸ پست ${m.id} منتشر نشد: ${result.message || result.reason || 'رسانه دانلود نشد'}`, '#fbbf24');
+                        stoppedEarly = true;
+                        if (card) card.classList.remove('active');
+                        break;
+                    }
+
+                    if (result.success === false) {
+                        ['bale', 'rubika', 'soroush', 'igap'].forEach(p => {
+                            const b = document.getElementById(`${p}-${m.id}`);
+                            if (b) { b.className = 'badge fail'; b.innerText = 'خطا'; b.title = result.message || result.error || ''; }
+                        });
+                        log(`❌ پست ${m.id}: ${result.message || result.error || 'خطای نامشخص'}`, '#f87171');
+                        stoppedEarly = true;
+                        if (card) card.classList.remove('active');
+                        break;
+                    }
+
+                    updateBadge(`bale-${m.id}`, result.bale?.ok, 'بله', result.bale?.info);
+                    updateBadge(`rubika-${m.id}`, result.rubika?.ok, 'روبیکا', result.rubika?.info);
+                    updateBadge(`soroush-${m.id}`, result.soroush?.ok, 'سروش', result.soroush?.info);
+                    updateBadge(`igap-${m.id}`, result.igap?.ok, 'آیگپ', result.igap?.info);
+
+                    const mark = r => (r?.ok === true ? '✅' : (r?.ok === null || /\b(SKIPPED|SKIP|NO_CONTENT)\b/.test(r?.info || '') ? '—' : '❌'));
+                    reportList.push(`🔹 پست ${m.id} (${isTest ? 'تست' : 'اصلی'}): بله ${mark(result.bale)} | روبیکا ${mark(result.rubika)} | سروش ${mark(result.soroush)} | آی‌گپ ${mark(result.igap)}`);
+                    log(`#${m.id}: بله${mark(result.bale)} روبیکا${mark(result.rubika)} سروش${mark(result.soroush)} آی‌گپ${mark(result.igap)}`, '#4ade80');
+                    if (result.soroush?.ok === false) log('   سروش: ' + (result.soroush.info || ''), '#fca5a5');
+                    if (result.igap?.ok === false) log('   آی‌گپ: ' + (result.igap.info || ''), '#fca5a5');
+                } catch (err) {
+                    log(`خطا در درخواست پست ${m.id}: ${err.message}`, '#f87171');
+                    stoppedEarly = true;
+                    if (card) card.classList.remove('active');
+                    break;
+                }
+                if (card) card.classList.remove('active');
+            }
 
             document.getElementById('progressFill').style.width = '100%';
             document.getElementById('percentText').innerText = '100%';
-            document.getElementById('statusText').innerText = data.success
-                ? `پایان ارسال ۵ پست آخر به کانال‌های ${isTest ? 'تست' : 'اصلی'}`
-                : (`توقف/خطا: ${data.message || data.error || 'نامشخص'}`);
-            log(data.message || (data.success ? 'عملیات تمام شد.' : 'عملیات با خطا متوقف شد.'), data.success ? '#4ade80' : '#f87171');
+            document.getElementById('statusText').innerText = stoppedEarly
+                ? 'عملیات متوقف شد؛ مورد خطا را بررسی کنید.'
+                : `پایان ارسال ۵ پست آخر به کانال‌های ${isTest ? 'تست' : 'اصلی'}`;
+
+            if (reportList.length) {
+                fetch(apiUrl('send_report'), {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ report: reportList })
+                }).catch(() => {});
+            }
         } catch (e) {
             log('خطای ارتباط با سرور: ' + e.message, '#f87171');
         } finally {

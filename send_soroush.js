@@ -66,6 +66,8 @@ const MODAL_SEND = [
     `${MODAL} button:has-text("Send")`,
 ];
 
+const escapeRegex = (s) => String(s || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
 async function openChatByName(page, name, log) {
     if (!name) return false;
     const item = page.locator(`.LeftColumn .ListItem:has-text("${name}"), .LeftColumn .chat-list .ListItem:has-text("${name}")`).first();
@@ -75,17 +77,30 @@ async function openChatByName(page, name, log) {
     return await C.seen(page.locator('.MiddleColumn .input-message-input, .MiddleColumn div[contenteditable="true"]').first(), 8000);
 }
 
-async function openChatBySearch(page, channel, log) {
+async function openChatBySearch(page, channel, log, strict = false) {
     if (!channel) return false;
     const box = page.locator('#search-input, .SearchInput input, input[type="search"], #telegram-search-input').first();
     if (!(await C.seen(box, 5000))) { log.step('openChatBySearch: search box not found'); return false; }
+    const query = strict ? `@${channel}` : channel;
     await box.click({ force: true });
-    await box.fill(channel);
+    await box.fill(query);
     await C.delay(2500);
-    const result = page.locator('.LeftSearch .ListItem, .search-results .ListItem, .LeftColumn .ListItem:has-text("' + channel + '")').first();
-    if (!(await C.seen(result, 6000))) { log.step('openChatBySearch: no result for ' + channel); return false; }
+
+    const base = page.locator('.LeftSearch .ListItem, .search-results .ListItem, .LeftColumn .ListItem');
+    let result = null;
+    if (strict) {
+        const exactUser = new RegExp(`@${escapeRegex(channel)}(?![A-Za-z0-9_])`, 'i');
+        result = base.filter({ hasText: exactUser }).first();
+        if (!(await C.seen(result, 5000))) {
+            log.step('openChatBySearch(strict): exact username not found for @' + channel);
+            return false;
+        }
+    } else {
+        result = page.locator('.LeftSearch .ListItem, .search-results .ListItem, .LeftColumn .ListItem:has-text("' + channel + '")').first();
+        if (!(await C.seen(result, 6000))) { log.step('openChatBySearch: no result for ' + channel); return false; }
+    }
     await result.click({ force: true });
-    log.step(`openChatBySearch: clicked first result for "${channel}"`);
+    log.step(`openChatBySearch${strict ? '(strict)' : ''}: clicked result for "${query}"`);
     return await C.seen(page.locator('.MiddleColumn .input-message-input, .MiddleColumn div[contenteditable="true"]').first(), 8000);
 }
 
@@ -140,6 +155,7 @@ async function readActivePreview(page) {
     opts.channel = String(opts.channel || C.env('SOROUSH_CHANNEL_ID') || '').replace(/["\\]/g, '');
     opts.channelName = (opts.channelName || C.env('SOROUSH_CHANNEL_NAME') || null);
     opts.channelName = opts.channelName ? String(opts.channelName).replace(/["\\]/g, '') : null;
+    opts.strictChannel = String(opts.raw('strict-channel', C.env('SOROUSH_STRICT_CHANNEL', '0')) || '0') === '1';
     const log = new C.RunLog('soroush');
     log.step(`args: channel=${opts.channel || '-'} name=${opts.channelName || '-'} text=${opts.text.length}ch file=${opts.file || '-'} type=${opts.type || '-'} env=${C.ENV_FILE || 'none'}`);
 
@@ -192,10 +208,15 @@ async function readActivePreview(page) {
         // ---------- ۲) باز کردن چت مقصد (سه راهبرد + تأیید) ----------
         // هر راهبرد باید دو شرط را بگذراند: composer مرئی + تطابق هدر با نام کانال
         const strategies = [];
-        // برای تفکیک کانال اصلی/تست، اولویت با username/hash است؛ نام نمایشی ممکن است در دو کانال مشابه باشد.
-        strategies.push(['by-hash', () => openChatByHash(page, browser, opts.channel, log)]);
-        strategies.push(['by-search', () => openChatBySearch(page, opts.channel, log)]);
-        if (opts.channelName) strategies.push(['by-name', () => openChatByName(page, opts.channelName, log)]);
+        // اگر strict-channel روشن باشد، فقط نتیجهٔ exact username قابل قبول است؛
+        // این جلوی ارسال اشتباهی به کانال تست با نام نمایشی مشابه را می‌گیرد.
+        if (opts.strictChannel) {
+            strategies.push(['by-search-strict', () => openChatBySearch(page, opts.channel, log, true)]);
+        } else {
+            strategies.push(['by-hash', () => openChatByHash(page, browser, opts.channel, log)]);
+            strategies.push(['by-search', () => openChatBySearch(page, opts.channel, log, false)]);
+            if (opts.channelName) strategies.push(['by-name', () => openChatByName(page, opts.channelName, log)]);
+        }
 
         let opened = false;
         let openedVia = '';
