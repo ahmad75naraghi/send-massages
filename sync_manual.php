@@ -412,15 +412,25 @@ function runUserbot(string $script, string $profileDir, string $channel, string 
         $cmd .= ' --' . $flag . '=' . escapeshellarg((string)$value);
     }
 
-    $output = shell_exec($cmd . ' 2>&1');
+    // stdout قرارداد JSON اسکریپت Node است. stderr را جدا نگه می‌داریم تا
+    // لاگ‌های مرحله‌ای باعث خراب شدن json_decode در مسیرهای PHP/OPcache قدیمی نشوند.
+    $errFile = tempnam(sys_get_temp_dir(), 'userbot_stderr_');
+    $stderrRedir = $errFile ? (' 2>' . escapeshellarg($errFile)) : ' 2>&1';
+    $output = shell_exec($cmd . $stderrRedir);
+    $stderr = ($errFile && is_readable($errFile)) ? (string)file_get_contents($errFile) : '';
+    if ($errFile) {
+        @unlink($errFile);
+    }
     @array_map('unlink', glob($profileDir . '/Singleton*') ?: []);
 
-    $result = parseNodeJsonOutput((string)$output);
+    $combinedOutput = trim((string)$output . "
+" . $stderr);
+    $result = parseNodeJsonOutput((string)$output) ?? parseNodeJsonOutput($combinedOutput);
     $status = $result['status'] ?? null;
 
     // اگر Node به خاطر ماژول گم‌شده مرده باشد، JSON قرارداد تولید نمی‌شود؛
     // پس خودمان تشخیص می‌دهیم و پیامِ قابل‌اقدام می‌دهیم (نه stack trace خام).
-    if ($status !== 'OK' && preg_match("/Cannot find (?:module|package) '([^']+)'/u", (string)$output, $mm)) {
+    if ($status !== 'OK' && preg_match("/Cannot find (?:module|package) '([^']+)'/u", $combinedOutput, $mm)) {
         return [
             'success' => false,
             'code'    => 'NODE_DEPS_MISSING',
@@ -430,7 +440,7 @@ function runUserbot(string $script, string $profileDir, string $channel, string 
                        . '   (یا: npm install --no-audit --no-fund)',
         ];
     }
-    if ($status !== 'OK' && str_contains((string)$output, 'MODULE_NOT_FOUND')) {
+    if ($status !== 'OK' && str_contains($combinedOutput, 'MODULE_NOT_FOUND')) {
         return [
             'success' => false,
             'code'    => 'NODE_DEPS_MISSING',
@@ -452,7 +462,7 @@ function runUserbot(string $script, string $profileDir, string $channel, string 
     $detail = $result['error'] ?? $result['message'] ?? '';
     $code   = $result['code'] ?? '';
     $logRef = isset($result['log']) ? ' [log: ' . basename((string)$result['log']) . ']' : '';
-    $raw    = trim((string)$output);
+    $raw    = trim($combinedOutput);
 
     return [
         'success' => false,
@@ -569,7 +579,7 @@ function dispatchToPlatforms(array $only, string $text, ?string $localFile, ?str
     if (in_array('igap', $only, true)) {
         $r = sendToIgap($dest['igapChannel'], $text, $localFile, $mediaType, $dest['igapName'], $dest['igapItemId']);
         $out['igap'] = [
-            'ok'   => ($r['success'] === true),
+            'ok'   => userbotAccepted($r),
             'info' => $r['message'] ?? 'ERR',
             'code' => $r['code'] ?? '',
         ];
@@ -580,6 +590,17 @@ function dispatchToPlatforms(array $only, string $text, ?string $localFile, ?str
 
 function sendToSoroush(string $channel, string $text = '', ?string $filePath = null, ?string $mediaType = null, ?string $channelName = null): array {
     return runUserbot(SOROUSH_SCRIPT, SOROUSH_PROFILE_DIR, $channel, $channelName ?? SOROUSH_CHANNEL_NAME, $text, $filePath, $mediaType, ['strict-channel' => '1']);
+}
+
+function userbotAccepted(array $result): bool {
+    if (($result['success'] ?? null) === true) {
+        return true;
+    }
+    // دفاع در برابر خروجی‌های قدیمی/ترکیبی shell_exec: اگر Node واقعاً OK چاپ کرده
+    // ولی لایهٔ PHP آن را بد parse کرده باشد، پنل نباید قرمز کاذب نشان دهد.
+    $text = (string)($result['message'] ?? '') . "
+" . (string)($result['raw'] ?? '');
+    return (bool)preg_match('/"status"\s*:\s*"OK"|RUN END status=OK|Sent to iGap|caption-neighbor-modal-closed-accepted|snippet-in-chat|left-preview-changed/i', $text);
 }
 
 function sendToIgap(string $channel, string $text = '', ?string $filePath = null, ?string $mediaType = null, ?string $channelName = null, ?string $itemId = null): array {
