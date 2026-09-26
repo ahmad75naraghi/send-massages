@@ -183,6 +183,22 @@ define('IGAP_ITEM_ID', env('IGAP_ITEM_ID', '16200343869985976'));
 define('IGAP_SCRIPT', env('IGAP_SCRIPT', SYNC_APP_DIR . '/send_igap.js'));
 define('IGAP_PROFILE_DIR', env('IGAP_PROFILE_DIR', SYNC_APP_DIR . '/igap_profile'));
 
+// --- پروفایل‌های مقصد: main = کانال‌های اصلی، test = کانال‌های قبلی/آزمایشی ---
+define('MAIN_BALE_CHANNEL_ID', env('MAIN_BALE_CHANNEL_ID', '@shamimeashena'));
+define('TEST_BALE_CHANNEL_ID', env('TEST_BALE_CHANNEL_ID', BALE_CHANNEL_ID));
+define('MAIN_RUBIKA_CHANNEL_ID', env('MAIN_RUBIKA_CHANNEL_ID', '@shamimeashena'));
+define('TEST_RUBIKA_CHANNEL_ID', env('TEST_RUBIKA_CHANNEL_ID', RUBIKA_CHANNEL_ID));
+define('MAIN_SOROUSH_CHANNEL_ID', env('MAIN_SOROUSH_CHANNEL_ID', 'shamimeashena'));
+define('MAIN_SOROUSH_CHANNEL_NAME', env('MAIN_SOROUSH_CHANNEL_NAME', SOROUSH_CHANNEL_NAME));
+define('TEST_SOROUSH_CHANNEL_ID', env('TEST_SOROUSH_CHANNEL_ID', SOROUSH_CHANNEL_ID));
+define('TEST_SOROUSH_CHANNEL_NAME', env('TEST_SOROUSH_CHANNEL_NAME', SOROUSH_CHANNEL_NAME));
+define('MAIN_IGAP_CHANNEL_ID', env('MAIN_IGAP_CHANNEL_ID', 'shamimeashena'));
+define('MAIN_IGAP_CHANNEL_NAME', env('MAIN_IGAP_CHANNEL_NAME', IGAP_CHANNEL_NAME));
+define('MAIN_IGAP_ITEM_ID', env('MAIN_IGAP_ITEM_ID', IGAP_ITEM_ID));
+define('TEST_IGAP_CHANNEL_ID', env('TEST_IGAP_CHANNEL_ID', IGAP_CHANNEL_ID));
+define('TEST_IGAP_CHANNEL_NAME', env('TEST_IGAP_CHANNEL_NAME', IGAP_CHANNEL_NAME));
+define('TEST_IGAP_ITEM_ID', env('TEST_IGAP_ITEM_ID', IGAP_ITEM_ID));
+
 // --- زمان اجرا و زمان‌بندی ---
 define('NODE_BIN', env('NODE_BIN', '/usr/bin/node'));
 define('USERBOT_TIMEOUT_SEC', envInt('USERBOT_TIMEOUT_SEC', 240));

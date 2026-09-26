@@ -9,8 +9,8 @@ date_default_timezone_set('Asia/Tehran');
 require_once __DIR__ . '/config.php';
 
 // همهٔ مقدارها از .env می‌آیند:
-//   EITAA_CHANNEL_ID، CHECK_INTERVAL_SEC، BALE_BOT_TOKEN، BALE_CHANNEL_ID،
-//   RUBIKA_BOT_TOKEN، RUBIKA_CHANNEL_ID، ENABLE_SOROUSH_BOT، SOROUSH_BOT_TOKEN، SOROUSH_CHAT_ID
+//   EITAA_CHANNEL_ID، CHECK_INTERVAL_SEC، BALE_BOT_TOKEN، MAIN_BALE_CHANNEL_ID،
+//   RUBIKA_BOT_TOKEN، MAIN_RUBIKA_CHANNEL_ID، ENABLE_SOROUSH_BOT، SOROUSH_BOT_TOKEN، SOROUSH_CHAT_ID
 
 
 // ==========================================
@@ -183,7 +183,7 @@ class Broadcaster
         if ($localFile && file_exists($localFile)) {
             $url = "https://tapi.bale.ai/bot{$cleanToken}/sendPhoto";
             $postData = [
-                'chat_id' => BALE_CHANNEL_ID,
+                'chat_id' => MAIN_BALE_CHANNEL_ID,
                 'caption' => mb_substr($msg->text, 0, 1000),
                 'photo'   => new CURLFile($localFile, 'image/jpeg', 'photo.jpg')
             ];
@@ -191,7 +191,7 @@ class Broadcaster
         } elseif (!empty($msg->text)) {
             $url = "https://tapi.bale.ai/bot{$cleanToken}/sendMessage";
             $payload = [
-                'chat_id' => BALE_CHANNEL_ID,
+                'chat_id' => MAIN_BALE_CHANNEL_ID,
                 'text'    => $msg->text
             ];
             $this->execCurl($url, json_encode($payload), false, ['Content-Type: application/json']);
@@ -204,7 +204,7 @@ class Broadcaster
         if ($localFile && file_exists($localFile)) {
             $url = "https://botapi.rubika.ir/v3/" . RUBIKA_BOT_TOKEN . "/sendPhoto";
             $postData = [
-                'chat_id' => RUBIKA_CHANNEL_ID,
+                'chat_id' => MAIN_RUBIKA_CHANNEL_ID,
                 'caption' => mb_substr($msg->text, 0, 1000),
                 'photo'   => new CURLFile($localFile, 'image/jpeg', 'photo.jpg')
             ];
@@ -212,7 +212,7 @@ class Broadcaster
         } elseif (!empty($msg->text)) {
             $url = "https://botapi.rubika.ir/v3/" . RUBIKA_BOT_TOKEN . "/sendMessage";
             $payload = [
-                'chat_id' => RUBIKA_CHANNEL_ID,
+                'chat_id' => MAIN_RUBIKA_CHANNEL_ID,
                 'text'    => $msg->text
             ];
             $this->execCurl($url, json_encode($payload), false, ['Content-Type: application/json']);

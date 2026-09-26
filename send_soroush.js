@@ -192,9 +192,10 @@ async function readActivePreview(page) {
         // ---------- ۲) باز کردن چت مقصد (سه راهبرد + تأیید) ----------
         // هر راهبرد باید دو شرط را بگذراند: composer مرئی + تطابق هدر با نام کانال
         const strategies = [];
-        if (opts.channelName) strategies.push(['by-name', () => openChatByName(page, opts.channelName, log)]);
-        strategies.push(['by-search', () => openChatBySearch(page, opts.channel, log)]);
+        // برای تفکیک کانال اصلی/تست، اولویت با username/hash است؛ نام نمایشی ممکن است در دو کانال مشابه باشد.
         strategies.push(['by-hash', () => openChatByHash(page, browser, opts.channel, log)]);
+        strategies.push(['by-search', () => openChatBySearch(page, opts.channel, log)]);
+        if (opts.channelName) strategies.push(['by-name', () => openChatByName(page, opts.channelName, log)]);
 
         let opened = false;
         let openedVia = '';

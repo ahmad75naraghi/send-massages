@@ -283,7 +283,7 @@ function callApi(string $url, mixed$data, bool $isMultipart, array$headers = [])
     ];
 }
 
-function sendToBale(string $text, ?string $file, ?string $type, string $fileName): array {
+function sendToBale(string $text, ?string $file, ?string $type, string $fileName, string $chatId): array {
     if (BALE_BOT_TOKEN === '') {
         return ['code' => 0, 'res' => ['ok' => false, 'description' => envMissingMessage(envMissing(['BALE_BOT_TOKEN']))]];
     }
@@ -293,12 +293,12 @@ function sendToBale(string $text, ?string $file, ?string $type, string $fileName
         $caption = mb_substr($text, 0, 1000);
         $method = match($type) { 'video' => 'sendVideo', 'audio' => 'sendAudio', 'document' => 'sendDocument', default => 'sendPhoto' };
         $param  = match($type) { 'video' => 'video', 'audio' => 'audio', 'document' => 'document', default => 'photo' };
-        return callApi($base . $method, ['chat_id' => BALE_CHANNEL_ID, 'caption' =>$caption, $param =>$cFile], true);
+        return callApi($base . $method, ['chat_id' => $chatId, 'caption' =>$caption, $param =>$cFile], true);
     }
-    return callApi($base . 'sendMessage', json_encode(['chat_id' => BALE_CHANNEL_ID, 'text' =>$text]), false, ['Content-Type: application/json']);
+    return callApi($base . 'sendMessage', json_encode(['chat_id' => $chatId, 'text' =>$text]), false, ['Content-Type: application/json']);
 }
 
-function sendToRubika(string $text, ?string $file, ?string $type, string $fileName): array {
+function sendToRubika(string $text, ?string $file, ?string $type, string $fileName, string $chatId): array {
     if (RUBIKA_BOT_TOKEN === '') {
         return ['code' => 0, 'res' => ['status' => 'NOT_CONFIGURED', 'error_message' => envMissingMessage(envMissing(['RUBIKA_BOT_TOKEN']))]];
     }
@@ -310,13 +310,13 @@ function sendToRubika(string $text, ?string $file, ?string $type, string $fileNa
             $cFile = new CURLFile($file, mime_content_type($file) ?: 'application/octet-stream',$fileName);
             $upRes = callApi($uploadUrl, ['file' => $cFile], true);$fileId = is_array($upRes['res']['data'] ?? null) ? ($upRes['res']['data']['file_id'] ?? null) : ($upRes['res']['data'] ?? $upRes['res']['file_id'] ?? null);
             if ($fileId) {
-                $sendPayload = ['chat_id' => RUBIKA_CHANNEL_ID, 'file_id' => (string)$fileId, 'type' => $rType, 'text' =>$caption, 'file_name' => $fileName];$final = callApi($base . 'sendFile', json_encode($sendPayload), false, ['Content-Type: application/json']);
+                $sendPayload = ['chat_id' => $chatId, 'file_id' => (string)$fileId, 'type' => $rType, 'text' =>$caption, 'file_name' => $fileName];$final = callApi($base . 'sendFile', json_encode($sendPayload), false, ['Content-Type: application/json']);
                 if (($final['res']['status'] ?? '') === 'OK') return$final;
             }
         }
-        return callApi($base . 'sendMessage', json_encode(['chat_id' => RUBIKA_CHANNEL_ID, 'text' =>$caption . "\n(عدم آپلود فایل روبیکا)"]), false, ['Content-Type: application/json']);
+        return callApi($base . 'sendMessage', json_encode(['chat_id' => $chatId, 'text' =>$caption . "\n(عدم آپلود فایل روبیکا)"]), false, ['Content-Type: application/json']);
     }
-    return callApi($base . 'sendMessage', json_encode(['chat_id' => RUBIKA_CHANNEL_ID, 'text' =>$text]), false, ['Content-Type: application/json']);
+    return callApi($base . 'sendMessage', json_encode(['chat_id' => $chatId, 'text' =>$text]), false, ['Content-Type: application/json']);
 }
 
 /**
@@ -478,6 +478,39 @@ function runUserbot(string $script, string $profileDir, string $channel, string 
  *   ['bale' => ['ok' => bool|null, 'info' => mixed], ...]
  * پلتفرم‌های ردشده: ['ok' => null, 'info' => 'SKIPPED']
  */
+function normalizeDestinationProfile(string $profile): string {
+    $profile = strtolower(trim($profile));
+    return in_array($profile, ['main', 'test'], true) ? $profile : 'main';
+}
+
+function destinationProfile(string $profile): array {
+    $profile = normalizeDestinationProfile($profile);
+    if ($profile === 'test') {
+        return [
+            'profile'       => 'test',
+            'label'         => 'تست',
+            'baleChannel'   => TEST_BALE_CHANNEL_ID,
+            'rubikaChannel' => TEST_RUBIKA_CHANNEL_ID,
+            'soroushChannel'=> TEST_SOROUSH_CHANNEL_ID,
+            'soroushName'   => TEST_SOROUSH_CHANNEL_NAME,
+            'igapChannel'   => TEST_IGAP_CHANNEL_ID,
+            'igapName'      => TEST_IGAP_CHANNEL_NAME,
+            'igapItemId'    => TEST_IGAP_ITEM_ID,
+        ];
+    }
+    return [
+        'profile'       => 'main',
+        'label'         => 'اصلی',
+        'baleChannel'   => MAIN_BALE_CHANNEL_ID,
+        'rubikaChannel' => MAIN_RUBIKA_CHANNEL_ID,
+        'soroushChannel'=> MAIN_SOROUSH_CHANNEL_ID,
+        'soroushName'   => MAIN_SOROUSH_CHANNEL_NAME,
+        'igapChannel'   => MAIN_IGAP_CHANNEL_ID,
+        'igapName'      => MAIN_IGAP_CHANNEL_NAME,
+        'igapItemId'    => MAIN_IGAP_ITEM_ID,
+    ];
+}
+
 function normalizePlatformList(array $only): array {
     $all = ['bale', 'rubika', 'soroush', 'igap'];
     $only = array_values(array_unique(array_filter(
@@ -498,9 +531,10 @@ function deliveredPlatformCount(array $sent, array $only): int {
     return $count;
 }
 
-function dispatchToPlatforms(array $only, string $text, ?string $localFile, ?string $mediaType, string $fileName): array {
+function dispatchToPlatforms(array $only, string $text, ?string $localFile, ?string $mediaType, string $fileName, string $profile = 'main'): array {
     $all = ['bale', 'rubika', 'soroush', 'igap'];
     $only = normalizePlatformList($only);
+    $dest = destinationProfile($profile);
     $fileName = safeFileName($fileName, 'file.bin');
 
     $out = [];
@@ -511,21 +545,21 @@ function dispatchToPlatforms(array $only, string $text, ?string $localFile, ?str
     }
 
     if (in_array('bale', $only, true)) {
-        $r = sendToBale($text, $localFile, $mediaType, $fileName);
+        $r = sendToBale($text, $localFile, $mediaType, $fileName, $dest['baleChannel']);
         $out['bale'] = [
             'ok'   => ($r['code'] === 200 and (bool)($r['res']['ok'] ?? false)),
             'info' => $r['code'] ?? 'ERR',
         ];
     }
     if (in_array('rubika', $only, true)) {
-        $r = sendToRubika($text, $localFile, $mediaType, $fileName);
+        $r = sendToRubika($text, $localFile, $mediaType, $fileName, $dest['rubikaChannel']);
         $out['rubika'] = [
             'ok'   => ($r['code'] === 200 and (($r['res']['status'] ?? '') === 'OK')),
             'info' => $r['code'] ?? 'ERR',
         ];
     }
     if (in_array('soroush', $only, true)) {
-        $r = sendToSoroush(SOROUSH_CHANNEL_ID, $text, $localFile, $mediaType);
+        $r = sendToSoroush($dest['soroushChannel'], $text, $localFile, $mediaType, $dest['soroushName']);
         $out['soroush'] = [
             'ok'   => ($r['success'] === true),
             'info' => $r['message'] ?? 'ERR',
@@ -533,7 +567,7 @@ function dispatchToPlatforms(array $only, string $text, ?string $localFile, ?str
         ];
     }
     if (in_array('igap', $only, true)) {
-        $r = sendToIgap(IGAP_CHANNEL_ID, $text, $localFile, $mediaType);
+        $r = sendToIgap($dest['igapChannel'], $text, $localFile, $mediaType, $dest['igapName'], $dest['igapItemId']);
         $out['igap'] = [
             'ok'   => ($r['success'] === true),
             'info' => $r['message'] ?? 'ERR',
@@ -544,12 +578,12 @@ function dispatchToPlatforms(array $only, string $text, ?string $localFile, ?str
     return $out;
 }
 
-function sendToSoroush(string $channel, string $text = '', ?string $filePath = null, ?string $mediaType = null): array {
-    return runUserbot(SOROUSH_SCRIPT, SOROUSH_PROFILE_DIR, $channel, SOROUSH_CHANNEL_NAME, $text, $filePath, $mediaType);
+function sendToSoroush(string $channel, string $text = '', ?string $filePath = null, ?string $mediaType = null, ?string $channelName = null): array {
+    return runUserbot(SOROUSH_SCRIPT, SOROUSH_PROFILE_DIR, $channel, $channelName ?? SOROUSH_CHANNEL_NAME, $text, $filePath, $mediaType);
 }
 
-function sendToIgap(string $channel, string $text = '', ?string $filePath = null, ?string $mediaType = null): array {
-    return runUserbot(IGAP_SCRIPT, IGAP_PROFILE_DIR, $channel, IGAP_CHANNEL_NAME, $text, $filePath, $mediaType, ['item-id' => IGAP_ITEM_ID]);
+function sendToIgap(string $channel, string $text = '', ?string $filePath = null, ?string $mediaType = null, ?string $channelName = null, ?string $itemId = null): array {
+    return runUserbot(IGAP_SCRIPT, IGAP_PROFILE_DIR, $channel, $channelName ?? IGAP_CHANNEL_NAME, $text, $filePath, $mediaType, ['item-id' => $itemId ?? IGAP_ITEM_ID]);
 }
 
 $action =$_GET['action'] ?? '';
@@ -700,7 +734,120 @@ if ($action === 'list_posts') {
     exit;
 }
 
-// ۱-ج) وضعیت اجرای پس‌زمینه/صف cron
+// ۱-ج) ارسال ۵ پست آخر (یا N پست آخر) به پروفایل مقصد؛ مسیر اصلی دکمه‌های داشبورد و صف پس‌زمینه
+if ($action === 'sync_recent') {
+    set_time_limit(1800);
+    header('Content-Type: application/json; charset=utf-8');
+
+    $payload = json_decode(readRequestBody(), true);
+    if (!is_array($payload)) {
+        $payload = [];
+    }
+    $limit = (int)($payload['limit'] ?? 5);
+    if ($limit < 1)  { $limit = 1; }
+    if ($limit > 50) { $limit = 50; }
+    $profile = normalizeDestinationProfile((string)($payload['profile'] ?? 'main'));
+    $only = is_array($payload['only'] ?? null) ? (array)$payload['only'] : ['bale', 'rubika', 'soroush', 'igap'];
+    $only = normalizePlatformList($only);
+    $advance = array_key_exists('advance', $payload) ? !empty($payload['advance']) : true;
+    $noMedia = !empty($payload['no_media']);
+    $gap = isset($payload['gap']) ? max(0, min(120, (int)$payload['gap'])) : max(0, (int)SYNC_GAP_SEC);
+
+    $scrape = fetchEitaaPosts();
+    if (!$scrape['ok']) {
+        echo json_encode(['success' => false, 'error' => 'SCRAPE_FAILED', 'message' => $scrape['error']], JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+
+    $selected = array_slice($scrape['messages'], -$limit);
+    if ($selected === []) {
+        echo json_encode(['success' => false, 'error' => 'NO_POSTS', 'message' => 'پستی در نمای وب ایتا پیدا نشد.'], JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+
+    $results = [];
+    $maxOkId = 0;
+    $stopped = false;
+    foreach ($selected as $index => $m) {
+        if ($index > 0 && $gap > 0) {
+            sleep($gap);
+        }
+
+        $msgId = (int)$m['id'];
+        $text = (string)($m['text'] ?? '');
+        $mediaUrl = $m['mediaUrl'] ?? null;
+        $mediaType = $m['mediaType'] ?? null;
+        $fileName = safeFileName((string)($m['fileName'] ?? 'file.bin'), 'file.bin');
+        $localFile = null;
+        $mediaReason = null;
+        $mediaInfo = 'none';
+
+        if ($mediaUrl && $noMedia) {
+            $mediaInfo = 'skipped';
+        } elseif ($mediaUrl) {
+            $localFile = downloadMedia((string)$mediaUrl, $fileName, $mediaReason);
+            if (!$localFile) {
+                sleep(1);
+                $localFile = downloadMedia((string)$mediaUrl, $fileName, $mediaReason);
+            }
+            $mediaInfo = $localFile ? 'downloaded' : ('FAILED:' . (string)$mediaReason);
+        }
+
+        $hasDeliverable = (trim($text) !== '') || ($localFile && file_exists($localFile));
+        if ($hasDeliverable) {
+            $sent = dispatchToPlatforms($only, $text, $localFile, $mediaType, $fileName, $profile);
+        } else {
+            $sent = [];
+            foreach (['bale', 'rubika', 'soroush', 'igap'] as $p) {
+                $sent[$p] = ['ok' => null, 'info' => 'NO_CONTENT'];
+            }
+        }
+
+        if ($localFile && file_exists($localFile)) {
+            @unlink($localFile);
+        }
+
+        $delivered = deliveredPlatformCount($sent, $only);
+        if ($delivered > 0) {
+            $maxOkId = max($maxOkId, $msgId);
+        } elseif ($hasDeliverable) {
+            $stopped = true;
+        }
+
+        $results[] = [
+            'id'      => $msgId,
+            'profile' => $profile,
+            'media'   => ['ok' => $mediaInfo === 'none' ? null : ($mediaInfo === 'downloaded'), 'info' => $mediaInfo],
+            'bale'    => $sent['bale'],
+            'rubika'  => $sent['rubika'],
+            'soroush' => $sent['soroush'],
+            'igap'    => $sent['igap'],
+        ];
+
+        if ($stopped) {
+            break;
+        }
+    }
+
+    if ($advance && $maxOkId > 0) {
+        advanceLastSeenId($db, EITAA_CHANNEL_ID, $maxOkId);
+    }
+
+    echo json_encode([
+        'success'    => !$stopped,
+        'stopped'    => $stopped,
+        'profile'    => $profile,
+        'only'       => $only,
+        'limit'      => $limit,
+        'count'      => count($results),
+        'lastSeenId' => getLastSeenId($db, EITAA_CHANNEL_ID),
+        'results'    => $results,
+        'message'    => $stopped ? 'به‌علت شکست کامل یک پست، صف متوقف شد تا پست‌ها جا نیفتند.' : 'پست‌های آخر پردازش شدند.',
+    ], JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
+// ۱-د) وضعیت اجرای پس‌زمینه/صف cron
 if ($action === 'queue_status') {
     header('Content-Type: application/json; charset=utf-8');
     $pid = currentSyncWorkerPid();
@@ -735,22 +882,39 @@ if ($action === 'background_sync') {
         exit;
     }
 
-    $script = SYNC_APP_DIR . '/cron_sync.sh';
-    if (!is_file($script)) {
-        echo json_encode(['success' => false, 'error' => 'SCRIPT_NOT_FOUND', 'message' => 'cron_sync.sh پیدا نشد: ' . $script], JSON_UNESCAPED_UNICODE);
-        exit;
+    $payload = json_decode(readRequestBody(), true);
+    if (!is_array($payload)) {
+        $payload = [];
     }
+    $profile = normalizeDestinationProfile((string)($payload['profile'] ?? ($_GET['profile'] ?? 'main')));
+    $limit = (int)($payload['limit'] ?? ($_GET['limit'] ?? 5));
+    if ($limit < 1)  { $limit = 1; }
+    if ($limit > 50) { $limit = 50; }
+
+    $bodyFile = rtrim(LOG_DIR, '/') . '/background_sync_body_' . date('Ymd_His') . '_' . bin2hex(random_bytes(3)) . '.json';
+    @file_put_contents($bodyFile, json_encode([
+        'profile' => $profile,
+        'limit'   => $limit,
+        'advance' => true,
+        'only'    => ['bale', 'rubika', 'soroush', 'igap'],
+        'gap'     => max(0, (int)SYNC_GAP_SEC),
+    ], JSON_UNESCAPED_UNICODE));
+    @chmod($bodyFile, 0600);
 
     $pidFile = syncWorkerPidFile();
     $logFile = rtrim(LOG_DIR, '/') . '/background_sync.log';
+    $inner = 'PHP_BIN=$(command -v ea-php83 || command -v ea-php82 || command -v ea-php81 || command -v php); '
+           . 'echo "[' . date('Y-m-d H:i:s') . '] START sync_recent profile=' . $profile . ' limit=' . $limit . '"; '
+           . 'ACTION=sync_recent SYNC_BODY_FILE=' . escapeshellarg($bodyFile) . ' "$PHP_BIN" -f ' . escapeshellarg(SYNC_APP_DIR . '/cli_run.php') . '; '
+           . 'RC=$?; rm -f ' . escapeshellarg($bodyFile) . '; echo "[' . date('Y-m-d H:i:s') . '] END sync_recent rc=$RC"; exit $RC';
     $cmd = 'cd ' . escapeshellarg(SYNC_APP_DIR)
-         . ' && nohup /usr/bin/env bash ' . escapeshellarg($script)
+         . ' && nohup /usr/bin/env bash -lc ' . escapeshellarg($inner)
          . ' >> ' . escapeshellarg($logFile) . ' 2>&1 & echo $!';
     $out = trim((string)shell_exec($cmd));
     $newPid = preg_match('/\b(\d+)\b/', $out, $m) ? (int)$m[1] : 0;
     if ($newPid > 0) {
         @file_put_contents($pidFile, (string)$newPid);
-        echo json_encode(['success' => true, 'pid' => $newPid, 'message' => 'صف در پس‌زمینه شروع شد؛ می‌توانید صفحه را ببندید.'], JSON_UNESCAPED_UNICODE);
+        echo json_encode(['success' => true, 'pid' => $newPid, 'profile' => $profile, 'limit' => $limit, 'message' => 'صف ۵ پست آخر در پس‌زمینه شروع شد؛ می‌توانید صفحه را ببندید.'], JSON_UNESCAPED_UNICODE);
         exit;
     }
 
@@ -813,10 +977,11 @@ if ($action === 'sync_single') {
     // جبران شکست جزئی، بدون پست تکراری در بقیهٔ پلتفرم‌ها).
     $only = is_array($payload['only'] ?? null) ? (array)$payload['only'] : [];
     $onlyNorm = normalizePlatformList($only);
+    $profile = normalizeDestinationProfile((string)($payload['profile'] ?? 'main'));
     $hasDeliverable = (trim($text) !== '') || ($localFile && file_exists($localFile));
 
     if ($hasDeliverable) {
-        $sent = dispatchToPlatforms($onlyNorm, $text, $localFile, $mediaType, $fileName);
+        $sent = dispatchToPlatforms($onlyNorm, $text, $localFile, $mediaType, $fileName, $profile);
     } else {
         $sent = [];
         foreach (['bale', 'rubika', 'soroush', 'igap'] as $p) {
@@ -846,6 +1011,7 @@ if ($action === 'sync_single') {
             'error'     => 'ALL_DESTINATIONS_FAILED',
             'message'   => 'هیچ مقصدی ارسال را تأیید نکرد؛ last_msg_id جلو نرفت و صف باید متوقف شود تا پس از رفع خطا دوباره تلاش شود.',
             'only'      => $onlyNorm,
+            'profile'   => $profile,
             'media'     => ['ok' => $mediaOk, 'info' => $mediaInfo],
             'bale'      => ['ok' => $sent['bale']['ok'], 'info' => $sent['bale']['info']],
             'rubika'    => ['ok' => $sent['rubika']['ok'], 'info' => $sent['rubika']['info']],
@@ -864,6 +1030,7 @@ if ($action === 'sync_single') {
         'success' => true,
         'id'      => $msgId,
         'only'    => $onlyNorm,
+        'profile' => $profile,
         'media'   => ['ok' => $mediaOk, 'info' => $mediaInfo],
         'bale'    => ['ok' => $sent['bale']['ok'], 'info' => $sent['bale']['info']],
         'rubika'  => ['ok' => $sent['rubika']['ok'], 'info' => $sent['rubika']['info']],
@@ -935,6 +1102,7 @@ if ($action === 'resend') {
     }
 
     $only = is_array($payload['only'] ?? null) ? (array)$payload['only'] : ['soroush', 'igap'];
+    $profile = normalizeDestinationProfile((string)($payload['profile'] ?? 'main'));
     $advance = !empty($payload['advance']);
     $noMedia = !empty($payload['no_media']);
 
@@ -993,7 +1161,7 @@ if ($action === 'resend') {
             $mediaInfo = $localFile ? 'downloaded' : ('FAILED:' . (string)$mediaReason);
         }
 
-        $sent = dispatchToPlatforms($only, $text, $localFile, $mediaType, $fileName !== '' ? $fileName : 'file.bin');
+        $sent = dispatchToPlatforms($only, $text, $localFile, $mediaType, $fileName !== '' ? $fileName : 'file.bin', $profile);
 
         if ($localFile and file_exists($localFile)) {
             @unlink($localFile);
@@ -1016,6 +1184,7 @@ if ($action === 'resend') {
     echo json_encode([
         'success'    => true,
         'only'       => $only,
+        'profile'    => $profile,
         'count'      => count($results),
         'lastSeenId' => getLastSeenId($db, EITAA_CHANNEL_ID),
         'results'    => $results,
@@ -1163,8 +1332,9 @@ if ($action === 'rewind') {
             <small style="color: #94a3b8;">پلتفرم‌ها: بله، روبیکا، سروش‌پلاس، آیگپ</small>
         </div>
         <div class="header-actions">
-            <button id="queueBtn" class="btn" style="background:#0d9488" onclick="startBackgroundSync()">افزودن به صف پس‌زمینه</button>
-            <button id="startBtn" class="btn" onclick="startSync()">اجرای دستی (مرحله‌ای)</button>
+            <button id="queueBtn" class="btn" style="background:#0d9488" onclick="startBackgroundSync('main')">افزودن به صف پس‌زمینه (۵ پست اصلی)</button>
+            <button id="startBtn" class="btn" onclick="startSync()">اجرای دستی (۵ پست اصلی)</button>
+            <button id="testBtn" class="btn" style="background:#7c3aed" onclick="startTestSync()">تست کانال‌های قبلی</button>
         </div>
     </div>
 
@@ -1271,13 +1441,17 @@ if ($action === 'rewind') {
     }
 
     let queuePollTimer = null;
-    async function startBackgroundSync() {
+    async function startBackgroundSync(profile = 'main') {
         const btn = document.getElementById('queueBtn');
         btn.disabled = true;
-        document.getElementById('statusText').innerText = 'در حال افزودن کارها به صف پس‌زمینه...';
-        log('شروع صف پس‌زمینه: cron_sync.sh در سرور اجرا می‌شود و لازم نیست مرورگر منتظر بماند.', '#7dd3fc');
+        document.getElementById('statusText').innerText = 'در حال افزودن ۵ پست آخر به صف پس‌زمینه...';
+        log(`شروع صف پس‌زمینه (${profile === 'test' ? 'تست' : 'اصلی'}): ۵ پست آخر روی سرور پردازش می‌شود و لازم نیست مرورگر منتظر بماند.`, '#7dd3fc');
         try {
-            const res = await fetch(apiUrl('background_sync'), { method: 'POST' });
+            const res = await fetch(apiUrl('background_sync'), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ profile, limit: 5 })
+            });
             const data = await res.json();
             if (!data.success) {
                 log('❌ صف پس‌زمینه شروع نشد: ' + (data.message || data.error || 'خطای نامشخص'), '#f87171');
@@ -1300,7 +1474,7 @@ if ($action === 'rewind') {
                 const res = await fetch(apiUrl('queue_status'));
                 const data = await res.json();
                 if (!data.success) return false;
-                const lines = String(data.log || data.launcherLog || '').trim().split(/\n/).filter(Boolean).slice(-5);
+                const lines = String(data.launcherLog || data.log || '').trim().split(/\n/).filter(Boolean).slice(-5);
                 if (lines.length) {
                     document.getElementById('statusText').innerText = data.running ? 'صف پس‌زمینه در حال پردازش است...' : 'صف پس‌زمینه متوقف/تمام شد.';
                     document.getElementById('percentText').innerText = data.running ? 'در صف' : 'پایان';
@@ -1326,41 +1500,86 @@ if ($action === 'rewind') {
     }
 
     async function startSync() {
-        const btn = document.getElementById('startBtn');
+        return processRecentManual('main');
+    }
+
+    async function startTestSync() {
+        return processRecentManual('test');
+    }
+
+    async function processRecentManual(profile = 'main') {
+        const isTest = profile === 'test';
+        const btn = document.getElementById(isTest ? 'testBtn' : 'startBtn');
         btn.disabled = true;
+        document.getElementById('startBtn').disabled = true;
+        document.getElementById('testBtn').disabled = true;
+        document.getElementById('queueBtn').disabled = true;
         document.getElementById('cardsList').innerHTML = '';
-        document.getElementById('statusText').innerText = 'در حال دریافت پست‌ها از ایتا...';
-        log('در حال دریافت لیست پیام‌های جدید از کانال ایتا...');
+        document.getElementById('progressFill').style.width = '0%';
+        document.getElementById('percentText').innerText = '0%';
+        document.getElementById('statusText').innerText = `در حال دریافت ۵ پست آخر برای کانال‌های ${isTest ? 'تست' : 'اصلی'}...`;
+        log(`خواندن ۵ پست آخر ایتا برای ارسال به کانال‌های ${isTest ? 'تست/قبلی' : 'اصلی'}...`, '#7dd3fc');
 
         try {
-            const res = await fetch(apiUrl('get_pending'));
-            const data = await res.json();
-
-            if (!data.success) {
-                log('خطا: ' + (data.error || 'عدم دسترسی به ایتا'), '#f87171');
-                btn.disabled = false;
+            const listRes = await fetch(apiUrl('list_posts', { limit: 5 }));
+            const listData = await listRes.json();
+            if (!listData.success) {
+                log('خطا در خواندن پست‌ها: ' + (listData.message || listData.error || 'نامشخص'), '#f87171');
+                document.getElementById('startBtn').disabled = false;
+                document.getElementById('testBtn').disabled = false;
+                document.getElementById('queueBtn').disabled = false;
                 return;
             }
-
-            log(`آخرین پیام پردازش‌شده در دیتابیس: ID ${data.lastSeenId}`);
-            pendingMessages = data.messages || [];
-
-            if (pendingMessages.length === 0) {
-                log('هیچ پیام جدیدی یافت نشد. وضعیت کانال‌ها به‌روز است.', '#38bdf8');
-                document.getElementById('statusText').innerText = 'پایان: پیام جدیدی نیست';
-                document.getElementById('progressFill').style.width = '100%';
-                document.getElementById('percentText').innerText = '100%';
-                btn.disabled = false;
+            pendingMessages = (listData.posts || []).slice().sort((a, b) => a.id - b.id).map(p => ({
+                id: p.id,
+                text: p.text || p.preview || '',
+                mediaType: p.mediaType || null,
+                fileName: p.fileName || null,
+            }));
+            if (!pendingMessages.length) {
+                log('پستی برای ارسال پیدا نشد.', '#fbbf24');
+                document.getElementById('startBtn').disabled = false;
+                document.getElementById('testBtn').disabled = false;
+                document.getElementById('queueBtn').disabled = false;
                 return;
             }
-
-            log(`تعداد ${pendingMessages.length} پیام جدید برای پردازش مشخص شد.`);
             renderCards(pendingMessages);
-            processQueue();
+            pendingMessages.forEach(m => ['bale', 'rubika', 'soroush', 'igap'].forEach(p => {
+                const b = document.getElementById(`${p}-${m.id}`);
+                if (b) { b.className = 'badge loading'; b.innerText = 'در صف'; }
+            }));
 
+            log(`شروع ارسال ${faNum(pendingMessages.length)} پست آخر به کانال‌های ${isTest ? 'تست' : 'اصلی'}...`, '#e2e8f0');
+            document.getElementById('statusText').innerText = `ارسال ${faNum(pendingMessages.length)} پست آخر به کانال‌های ${isTest ? 'تست' : 'اصلی'}...`;
+            const res = await fetch(apiUrl('sync_recent'), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ profile, limit: 5, advance: !isTest, gap: 0 })
+            });
+            const data = await res.json();
+            if (!data.results) data.results = [];
+
+            data.results.forEach(r => {
+                updateBadge(`bale-${r.id}`, r.bale?.ok, 'بله', r.bale?.info);
+                updateBadge(`rubika-${r.id}`, r.rubika?.ok, 'روبیکا', r.rubika?.info);
+                updateBadge(`soroush-${r.id}`, r.soroush?.ok, 'سروش', r.soroush?.info);
+                updateBadge(`igap-${r.id}`, r.igap?.ok, 'آیگپ', r.igap?.info);
+                const mark = x => x?.ok === true ? '✓' : (x?.ok === null ? '—' : '✕');
+                log(`#${r.id}: بله${mark(r.bale)} روبیکا${mark(r.rubika)} سروش${mark(r.soroush)} آی‌گپ${mark(r.igap)}${r.media?.info && r.media.info !== 'none' ? ' | رسانه: ' + r.media.info : ''}`, data.success ? '#4ade80' : '#fbbf24');
+            });
+
+            document.getElementById('progressFill').style.width = '100%';
+            document.getElementById('percentText').innerText = '100%';
+            document.getElementById('statusText').innerText = data.success
+                ? `پایان ارسال ۵ پست آخر به کانال‌های ${isTest ? 'تست' : 'اصلی'}`
+                : (`توقف/خطا: ${data.message || data.error || 'نامشخص'}`);
+            log(data.message || (data.success ? 'عملیات تمام شد.' : 'عملیات با خطا متوقف شد.'), data.success ? '#4ade80' : '#f87171');
         } catch (e) {
-            log('خطای غیرمنتظره ارتباط با سرور: ' + e.message, '#f87171');
-            btn.disabled = false;
+            log('خطای ارتباط با سرور: ' + e.message, '#f87171');
+        } finally {
+            document.getElementById('startBtn').disabled = false;
+            document.getElementById('testBtn').disabled = false;
+            document.getElementById('queueBtn').disabled = false;
         }
     }
 
@@ -1717,7 +1936,7 @@ if ($action === 'rewind') {
                 const res = await fetch(apiUrl('resend'), {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ ids: [id], only, advance: advance && isLast, no_media: !withMedia }),
+                    body: JSON.stringify({ ids: [id], only, profile: 'main', advance: advance && isLast, no_media: !withMedia }),
                 });
                 const data = await res.json();
                 if (!data.success) {
