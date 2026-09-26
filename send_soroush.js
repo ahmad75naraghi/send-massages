@@ -201,8 +201,10 @@ async function openChatByHash(page, browser, channel, log) {
     await page.goto(`https://web.splus.ir/${route}`, { waitUntil: 'domcontentloaded', timeout: 60000 });
     await C.delay(6000);
     const url = page.url();
-    if (route.startsWith('#@') && !url.includes('#')) {
-        log.step(`openChatByHash: ${route} → url=${url} did not resolve to a chat hash`);
+    let hash = '';
+    try { hash = new URL(url).hash; } catch (e) {}
+    if (route.startsWith('#@') && (!hash || hash.toLowerCase() === route.toLowerCase())) {
+        log.step(`openChatByHash: ${route} → url=${url} did not resolve to a concrete chat hash`);
         return false;
     }
     const ok = await ensureComposer(page, log, 15000);
