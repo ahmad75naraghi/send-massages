@@ -38,8 +38,12 @@ envval() {  # envval KEY → مقدار از محیط یا .env
   local k="$1" v=""
   v="${!k:-}"
   if [[ -z "$v" && -r "$APP_DIR/.env" ]]; then
-    v="$(sed -nE "s/^${k}=([^\r]*)$/\1/p" "$APP_DIR/.env" | tail -1)"
-    v="${v%\#*}"; v="$(printf '%s' "$v" | sed -E 's/[[:space:]]+$//; s/^"(.*)"$/\1/; s/^'\''(.*)'\''$/\1/')"
+    if declare -F dotenv_read >/dev/null 2>&1; then
+      v="$(dotenv_read "$APP_DIR/.env" "$k")"
+    else
+      v="$(sed -nE "s/^(export[[:space:]]+)?${k}=([^\r]*)$/\2/p" "$APP_DIR/.env" | tail -1)"
+      v="${v%\#*}"; v="$(printf '%s' "$v" | sed -E 's/[[:space:]]+$//; s/^"(.*)"$/\1/; s/^'\''(.*)'\''$/\1/')"
+    fi
   fi
   printf '%s' "$v"
 }
@@ -161,6 +165,7 @@ if [[ "$LIVE" == "--live" ]]; then
   STAMP="$(date '+%H:%M:%S')"
 
   BTOKEN="$(envval BALE_BOT_TOKEN)"
+  BTOKEN="$(printf '%s' "$BTOKEN" | sed -E 's/^[Bb][Oo][Tt]//')"
   BCHAT="$(envval BALE_CHANNEL_ID)"
   [[ -z "$BCHAT" ]] && BCHAT="@testforme"
   printf '  %-46s ' "بله: sendMessage زنده"

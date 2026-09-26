@@ -20,24 +20,36 @@ if [[ -z "$APP" ]]; then
   if declare -F dotenv_app_dir >/dev/null 2>&1; then APP="$(dotenv_app_dir)"
   else APP="$SELF_DIR"; fi
 fi
+if [[ -r "${SYNC_ENV_FILE:-$APP/.env}" ]] && declare -F load_dotenv >/dev/null 2>&1; then
+  load_dotenv "${SYNC_ENV_FILE:-$APP/.env}"
+fi
 TARGET="${1:-soroush}"
 MODE="${2:-headless}"
 
 case "$TARGET" in
-  soroush) URL="https://web.splus.ir";  PROFILE="$APP/soroush_profile" ;;
-  igap)    URL="https://web.igap.net"; PROFILE="$APP/igap_profile" ;;
+  soroush) URL="https://web.splus.ir";  PROFILE="${SOROUSH_PROFILE_DIR:-$APP/soroush_profile}" ;;
+  igap)    URL="https://web.igap.net"; PROFILE="${IGAP_PROFILE_DIR:-$APP/igap_profile}" ;;
   *) echo "هدف نامعتبر: $TARGET (soroush|igap)" >&2; exit 2 ;;
 esac
 
 HEADLESS="--headless=new"
 [[ "$MODE" == "--headed" ]] && HEADLESS=""
 
+CHROME="${SYNC_CHROMIUM_BIN:-/usr/bin/chromium-browser}"
+if [[ ! -x "$CHROME" ]]; then
+  for c in /usr/bin/chromium /usr/bin/google-chrome-stable /usr/bin/google-chrome chromium-browser chromium; do
+    if command -v "$c" >/dev/null 2>&1; then CHROME="$(command -v "$c")"; break; fi
+  done
+fi
+[[ -x "$CHROME" ]] || { echo "باینری کرومیوم پیدا نشد: $CHROME" >&2; exit 1; }
+mkdir -p "$PROFILE"
+
 # فقط کرومیوم‌های یتیمِ همین پروفایل بسته می‌شوند (نه همهٔ فرایندها)
 pkill -f "user-data-dir=$PROFILE" 2>/dev/null || true
 sleep 1
 rm -f "$PROFILE"/Singleton* 2>/dev/null || true
 
-exec /usr/bin/chromium-browser \
+exec "$CHROME" \
   --remote-debugging-port=9222 \
   --remote-debugging-address=127.0.0.1 \
   --user-data-dir="$PROFILE" \

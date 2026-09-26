@@ -25,7 +25,7 @@ const path = require('path');
 const { chromium } = require('playwright');
 const C = require(path.join(__dirname, 'lib', 'pw_common.js'));
 
-const PROFILE_DIR = path.join(C.APP_DIR, 'soroush_profile');
+const PROFILE_DIR = C.env('SOROUSH_PROFILE_DIR', path.join(C.APP_DIR, 'soroush_profile'));
 const VIEWPORT = { width: 1280, height: 720 };
 
 const LOGIN_MARKERS = ['#sign-in-phone-number', '#sign-in-phone-code', 'button:has-text("دریافت کد")'];
@@ -57,14 +57,226 @@ const MENU_DOC = [
     '.MenuItem:has-text("فایل")',
 ];
 
-const MODAL = '.modal-dialog, .Modal, [role="dialog"]';
+const MODAL = ':is(.modal-dialog, .Modal, [role="dialog"])';
 const MODAL_SEND = [
+    `${MODAL} button:has-text("ارسال")`,
+    `${MODAL} [role="button"]:has-text("ارسال")`,
+    `${MODAL} button:has-text("Send")`,
+    `${MODAL} [role="button"]:has-text("Send")`,
     `${MODAL} button.confirm-dialog-button`,
     `${MODAL} button.primary`,
     `${MODAL} button.btn-primary`,
-    `${MODAL} button:has-text("ارسال")`,
-    `${MODAL} button:has-text("Send")`,
+    `${MODAL} button:has(i[class*="send"])`,
+    `${MODAL} [role="button"]:has(i[class*="send"])`,
 ];
+
+const escapeRegex = (s) => String(s || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const normalizeBrief = (s) => String(s || '').replace(/[‌‏‪-‮]/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+
+function hasExactChannelToken(text, channel) {
+    const c = String(channel || '').replace(/^@/, '').toLowerCase();
+    if (!c) return false;
+    return new RegExp(`(^|[^A-Za-z0-9_])@?${escapeRegex(c)}($|[^A-Za-z0-9_])`, 'i').test(normalizeBrief(text));
+}
+
+function hasWrongChannelVariant(text, channel) {
+    const c = String(channel || '').replace(/^@/, '').toLowerCase();
+    if (!c) return false;
+    const n = normalizeBrief(text);
+    // نمونهٔ خطرناک واقعی: جست‌وجوی @shamimeashena نتیجهٔ shamimeashena1 را هم می‌آورد.
+    return new RegExp(`(^|[^A-Za-z0-9_@])@?${escapeRegex(c)}[A-Za-z0-9_]+`, 'i').test(n)
+        && !hasExactChannelToken(n, c);
+}
+
+function strictCandidateStatus(brief, channel, expectedName) {
+    const name = normalizeBrief(expectedName || '');
+    const text = normalizeBrief(brief);
+    if (hasWrongChannelVariant(text, channel)) {
+        return { ok: false, reason: 'near-match username is not exact target' };
+    }
+    if (name && text.includes(name)) {
+        return { ok: true, reason: 'display-name match' };
+    }
+    if (hasExactChannelToken(text, channel)) {
+        return { ok: true, reason: 'exact username match' };
+    }
+    return { ok: false, reason: 'no exact username/display-name evidence' };
+}
+
+const COMPOSER = '.MiddleColumn .input-message-input, .MiddleColumn div[contenteditable="true"], #MiddleColumn .input-message-input, #MiddleColumn div[contenteditable="true"]';
+async function firstEnabled(page, selectors, { timeout = 20000, label = 'button' } = {}) {
+    const deadline = Date.now() + timeout;
+    let sawDisabled = false;
+    do {
+        for (const sel of selectors) {
+            const loc = page.locator(sel).last();
+            try {
+                if (!(await loc.isVisible())) continue;
+                if (await loc.isEnabled().catch(() => true)) return { locator: loc, selector: sel };
+                sawDisabled = true;
+            } catch (e) { /* try next selector */ }
+        }
+        await C.delay(350);
+    } while (Date.now() < deadline);
+    return sawDisabled ? { disabled: true, selector: label } : null;
+}
+
+
+async function clickModalSendBottomLeft(page, log, label = 'modal send bottom-left') {
+    const box = await page.evaluate(() => {
+        const selectors = ['[role="dialog"]', '.modal-dialog', '.Modal'];
+        const nodes = [];
+        for (const sel of selectors) nodes.push(...document.querySelectorAll(sel));
+        const visible = nodes
+            .map(el => ({ el, r: el.getBoundingClientRect(), text: (el.innerText || '').slice(0, 180) }))
+            .filter(x => {
+                const cs = getComputedStyle(x.el);
+                return x.r.width > 220 && x.r.height > 180 && x.r.bottom > 0 && x.r.right > 0
+                    && x.r.width < window.innerWidth * 0.9 && x.r.height < window.innerHeight * 0.95
+                    && cs.visibility !== 'hidden' && cs.display !== 'none';
+            });
+        visible.sort((a, b) => {
+            const as = /ارسال|Send|عکس|ویدیو|رسانه/i.test(a.text) ? 1 : 0;
+            const bs = /ارسال|Send|عکس|ویدیو|رسانه/i.test(b.text) ? 1 : 0;
+            return (bs - as) || ((b.r.width * b.r.height) - (a.r.width * a.r.height));
+        });
+        const x = visible[0];
+        if (!x) return null;
+        return { left: x.r.left, top: x.r.top, right: x.r.right, bottom: x.r.bottom, width: x.r.width, height: x.r.height, text: x.text };
+    }).catch(() => null);
+    if (!box) { log.step(`${label}: modal box not found`); return false; }
+    // در مودال RTL سروش، دکمهٔ آبی «ارسال» پایینِ چپ است.
+    const x = Math.min(box.right - 20, box.left + 45);
+    const y = Math.max(box.top + 20, box.bottom - 28);
+    await page.mouse.click(x, y);
+    log.step(`${label}: clicked at ${Math.round(x)},${Math.round(y)} box=${Math.round(box.width)}x${Math.round(box.height)} text="${C.RunLog.brief(box.text, 50)}"`);
+    return true;
+}
+
+function currentUrlHash(page) {
+    try { return new URL(page.url()).hash || ''; } catch (e) { return ''; }
+}
+
+function isSoroushSideViewHash(hash) {
+    return /_(?:pinned|comments|scheduled|discussion|replies)\b/i.test(String(hash || ''));
+}
+
+function isConcreteChatHash(hash, channel) {
+    const h = String(hash || '').toLowerCase();
+    const c = String(channel || '').replace(/^@/, '').toLowerCase();
+    if (!h || h === '#') return false;
+    if (isSoroushSideViewHash(h)) return false;
+    // #@username is only the unresolved public route. After a real search-result click,
+    // Soroush Web resolves channels to an internal numeric hash like #-1001243691.
+    if (c && h === `#@${c}`) return false;
+    return /^#-?\d+/.test(h);
+}
+
+async function waitForConcreteChatAfterClick(page, channel, beforeHash, log, label, timeout = 10000) {
+    try {
+        await C.waitUntil(() => {
+            const h = currentUrlHash(page);
+            if (!isConcreteChatHash(h, channel)) return false;
+            // If we were already on some concrete chat, do not accept the stale chat
+            // immediately after clicking a search result; wait until navigation changes it.
+            if (beforeHash && h === beforeHash) return false;
+            return true;
+        }, { timeout, interval: 250, label });
+        log.step(`${label}: resolved to ${page.url()}`);
+        return true;
+    } catch (e) {
+        log.step(`${label}: concrete chat hash not observed after click; current url=${page.url()}`);
+        return false;
+    }
+}
+
+const NEW_POST_BUTTONS = [
+    // اول فقط داخل ستون چت مقصد؛ برای جلوگیری از ارسال به چت اشتباه.
+    '.MiddleColumn button:has-text("پیام جدید")',
+    '.MiddleColumn [role="button"]:has-text("پیام جدید")',
+    '.MiddleColumn a:has-text("پیام جدید")',
+    '#MiddleColumn button:has-text("پیام جدید")',
+    '#MiddleColumn [role="button"]:has-text("پیام جدید")',
+    '#MiddleColumn a:has-text("پیام جدید")',
+    '.MiddleColumn [class*="Button"]:has-text("پیام جدید")',
+    '#MiddleColumn [class*="Button"]:has-text("پیام جدید")',
+    '.MiddleColumn [class*="button"]:has-text("پیام جدید")',
+    '#MiddleColumn [class*="button"]:has-text("پیام جدید")',
+    '.MiddleColumn button:has-text("ارسال پیام")',
+    '#MiddleColumn button:has-text("ارسال پیام")',
+    '.MiddleColumn [role="button"]:has-text("ارسال پیام")',
+    '#MiddleColumn [role="button"]:has-text("ارسال پیام")',
+    '.MiddleColumn button:has-text("New Message")',
+    '#MiddleColumn button:has-text("New Message")',
+    '.MiddleColumn button:has-text("New Post")',
+    '#MiddleColumn button:has-text("New Post")',
+];
+
+// fallback امن: بعضی نسخه‌های سروش دکمهٔ «پیام جدید» کانال را خارج از
+// MiddleColumn رندر می‌کنند. فقط وقتی URL همین کانال به hash عددی واقعی resolve
+// شده باشد، این دکمه‌های global را امتحان می‌کنیم و بعد از کلیک هم hash باید
+// تغییر نکند؛ پس به shamimeashena1 یا چت دیگر نمی‌فرستیم.
+const GLOBAL_NEW_POST_BUTTONS = [
+    'button:has-text("پیام جدید")',
+    '[role="button"]:has-text("پیام جدید")',
+    'a:has-text("پیام جدید")',
+    '[class*="Button"]:has-text("پیام جدید")',
+    '[class*="button"]:has-text("پیام جدید")',
+    'button:has-text("ارسال پیام")',
+    '[role="button"]:has-text("ارسال پیام")',
+];
+
+async function ensureComposer(page, log, timeout = 12000) {
+    const deadline = Date.now() + timeout;
+    let clickedNewPost = false;
+    let triedGlobalNewPost = false;
+    let loggedMissing = false;
+
+    while (Date.now() < deadline) {
+        if (await C.seen(page.locator(COMPOSER).first(), 700)) return true;
+
+        if (!clickedNewPost) {
+            let newPost = await C.firstVisible(page, NEW_POST_BUTTONS, { timeout: 700, label: 'scoped new post button' });
+            let globalFallback = false;
+            const beforeHash = currentUrlHash(page);
+
+            if (!newPost && !triedGlobalNewPost && /^#-?\d+/.test(beforeHash) && !isSoroushSideViewHash(beforeHash)) {
+                // بعضی نسخه‌ها دکمهٔ ارسال پست کانال را خارج از MiddleColumn می‌گذارند.
+                // فقط بعد از resolve شدن کانال به hash عددی واقعی اجازهٔ fallback global داریم.
+                newPost = await C.firstVisible(page, GLOBAL_NEW_POST_BUTTONS, { timeout: 700, label: 'global new post button' });
+                globalFallback = Boolean(newPost);
+                triedGlobalNewPost = true;
+            }
+
+            if (newPost) {
+                await newPost.locator.click({ force: true });
+                clickedNewPost = true;
+                log.step(`${globalFallback ? 'global ' : ''}new-post button clicked via ${newPost.selector}`);
+                await C.delay(1500);
+                const afterHash = currentUrlHash(page);
+                if (afterHash && beforeHash && afterHash !== beforeHash) {
+                    log.step(`new-post changed chat hash ${beforeHash} → ${afterHash}; refusing composer`);
+                    return false;
+                }
+                if (isSoroushSideViewHash(afterHash)) {
+                    log.step(`new-post opened side view ${afterHash}; refusing composer`);
+                    return false;
+                }
+                continue;
+            }
+            if (!loggedMissing && Date.now() + 3500 < deadline) {
+                log.step('new-post button not visible yet; waiting');
+                loggedMissing = true;
+            }
+        }
+
+        await C.delay(350);
+    }
+
+    if (clickedNewPost) log.step('new-post clicked but composer still not visible');
+    else log.step('composer/new-post button not visible within timeout');
+    return false;
+}
 
 async function openChatByName(page, name, log) {
     if (!name) return false;
@@ -72,29 +284,89 @@ async function openChatByName(page, name, log) {
     if (!(await C.seen(item, 4000))) return false;
     await item.click({ force: true });
     log.step(`openChatByName: clicked list item "${name}"`);
-    return await C.seen(page.locator('.MiddleColumn .input-message-input, .MiddleColumn div[contenteditable="true"]').first(), 8000);
+    return await ensureComposer(page, log, 8000);
 }
 
-async function openChatBySearch(page, channel, log) {
+async function openChatBySearch(page, channel, log, strict = false, expectedName = null) {
     if (!channel) return false;
-    const box = page.locator('#search-input, .SearchInput input, input[type="search"], #telegram-search-input').first();
-    if (!(await C.seen(box, 5000))) { log.step('openChatBySearch: search box not found'); return false; }
-    await box.click({ force: true });
-    await box.fill(channel);
-    await C.delay(2500);
+    const query = strict ? `@${channel}` : channel;
+    const boxSel = '#search-input, .SearchInput input, input[type="search"], #telegram-search-input';
+    const resultSel = '.LeftSearch .ListItem, .search-results .ListItem, .LeftColumn .ListItem';
+
+    const runSearch = async () => {
+        const box = page.locator(boxSel).first();
+        if (!(await C.seen(box, 5000))) { log.step('openChatBySearch: search box not found'); return false; }
+        await box.click({ force: true });
+        await box.fill('');
+        await box.fill(query);
+        await C.delay(2500);
+        return true;
+    };
+
+    if (!(await runSearch())) return false;
+
+    if (strict) {
+        // اول exact username در متن نتیجه؛ اگر سروش username را در innerText پنهان کرده بود،
+        // همهٔ نتایج همین query دقیق @username را یکی‌یکی امتحان می‌کنیم تا نتیجه‌ای که composer دارد پیدا شود.
+        const exactUser = new RegExp(`@${escapeRegex(channel)}(?![A-Za-z0-9_])`, 'i');
+        const exact = page.locator(resultSel).filter({ hasText: exactUser }).first();
+        if (await C.seen(exact, 2500)) {
+            const beforeHash = currentUrlHash(page);
+            await exact.click({ force: true });
+            log.step(`openChatBySearch(strict): clicked exact username result for "${query}"`);
+            if (!(await waitForConcreteChatAfterClick(page, channel, beforeHash, log, 'openChatBySearch(strict): exact result navigation', 10000))) {
+                log.step('openChatBySearch(strict): exact result click did not resolve; refusing stale composer');
+            } else if (await ensureComposer(page, log, 15000)) return true;
+            log.step('openChatBySearch(strict): exact result opened but composer not visible');
+        } else {
+            log.step('openChatBySearch(strict): exact username text not visible; iterating visible results for exact @query');
+        }
+
+        const maxTry = Math.min(6, await page.locator(resultSel).count().catch(() => 0));
+        for (let i = 0; i < maxTry; i++) {
+            if (i > 0 && !(await runSearch())) return false;
+            const item = page.locator(resultSel).nth(i);
+            if (!(await C.seen(item, 3000))) continue;
+            const brief = await item.innerText({ timeout: 1000 }).catch(() => '');
+            const status = strictCandidateStatus(brief, channel, expectedName);
+            if (!status.ok) {
+                log.step(`openChatBySearch(strict): skipped result #${i + 1} for "${query}" (${status.reason}) text="${C.RunLog.brief(brief, 80)}"`);
+                continue;
+            }
+            const beforeHash = currentUrlHash(page);
+            await item.click({ force: true });
+            log.step(`openChatBySearch(strict): clicked result #${i + 1} for "${query}" (${status.reason}) text="${C.RunLog.brief(brief, 80)}"`);
+            if (!(await waitForConcreteChatAfterClick(page, channel, beforeHash, log, `openChatBySearch(strict): result #${i + 1} navigation`, 10000))) {
+                log.step(`openChatBySearch(strict): result #${i + 1} click did not resolve; refusing stale composer`);
+                continue;
+            }
+            if (await ensureComposer(page, log, 15000)) return true;
+            log.step(`openChatBySearch(strict): result #${i + 1} opened but composer not visible`);
+        }
+        return false;
+    }
+
     const result = page.locator('.LeftSearch .ListItem, .search-results .ListItem, .LeftColumn .ListItem:has-text("' + channel + '")').first();
     if (!(await C.seen(result, 6000))) { log.step('openChatBySearch: no result for ' + channel); return false; }
     await result.click({ force: true });
-    log.step(`openChatBySearch: clicked first result for "${channel}"`);
-    return await C.seen(page.locator('.MiddleColumn .input-message-input, .MiddleColumn div[contenteditable="true"]').first(), 8000);
+    log.step(`openChatBySearch: clicked result for "${query}"`);
+    return await ensureComposer(page, log, 8000);
 }
 
 async function openChatByHash(page, browser, channel, log) {
     if (!channel) return false;
-    await page.goto(`https://web.splus.ir/#@${channel}`, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    await C.delay(4000);
-    const ok = await C.seen(page.locator('.MiddleColumn .input-message-input, .MiddleColumn div[contenteditable="true"]').first(), 8000);
-    log.step(`openChatByHash: #@${channel} → composer ${ok ? 'visible' : 'NOT visible'}`);
+    const route = /^-?\d+$/.test(String(channel)) ? `#${channel}` : `#@${channel}`;
+    await page.goto(`https://web.splus.ir/${route}`, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await C.delay(6000);
+    const url = page.url();
+    let hash = '';
+    try { hash = new URL(url).hash; } catch (e) {}
+    if (route.startsWith('#@') && (!hash || hash.toLowerCase() === route.toLowerCase())) {
+        log.step(`openChatByHash: ${route} → url=${url} did not resolve to a concrete chat hash`);
+        return false;
+    }
+    const ok = await ensureComposer(page, log, 15000);
+    log.step(`openChatByHash: ${route} → url=${page.url()} composer ${ok ? 'visible' : 'NOT visible'}`);
     return ok;
 }
 
@@ -140,6 +412,7 @@ async function readActivePreview(page) {
     opts.channel = String(opts.channel || C.env('SOROUSH_CHANNEL_ID') || '').replace(/["\\]/g, '');
     opts.channelName = (opts.channelName || C.env('SOROUSH_CHANNEL_NAME') || null);
     opts.channelName = opts.channelName ? String(opts.channelName).replace(/["\\]/g, '') : null;
+    opts.strictChannel = String(opts.raw('strict-channel', C.env('SOROUSH_STRICT_CHANNEL', '0')) || '0') === '1';
     const log = new C.RunLog('soroush');
     log.step(`args: channel=${opts.channel || '-'} name=${opts.channelName || '-'} text=${opts.text.length}ch file=${opts.file || '-'} type=${opts.type || '-'} env=${C.ENV_FILE || 'none'}`);
 
@@ -192,9 +465,17 @@ async function readActivePreview(page) {
         // ---------- ۲) باز کردن چت مقصد (سه راهبرد + تأیید) ----------
         // هر راهبرد باید دو شرط را بگذراند: composer مرئی + تطابق هدر با نام کانال
         const strategies = [];
-        if (opts.channelName) strategies.push(['by-name', () => openChatByName(page, opts.channelName, log)]);
-        strategies.push(['by-search', () => openChatBySearch(page, opts.channel, log)]);
-        strategies.push(['by-hash', () => openChatByHash(page, browser, opts.channel, log)]);
+        // اگر strict-channel روشن باشد، فقط نتیجهٔ exact username قابل قبول است؛
+        // این جلوی ارسال اشتباهی به کانال تست با نام نمایشی مشابه را می‌گیرد.
+        if (opts.strictChannel) {
+            // hash route uses the exact username and avoids the duplicate display-name problem.
+            strategies.push(['by-hash-strict', () => openChatByHash(page, browser, opts.channel, log)]);
+            strategies.push(['by-search-strict', () => openChatBySearch(page, opts.channel, log, true, opts.channelName)]);
+        } else {
+            strategies.push(['by-hash', () => openChatByHash(page, browser, opts.channel, log)]);
+            strategies.push(['by-search', () => openChatBySearch(page, opts.channel, log, false)]);
+            if (opts.channelName) strategies.push(['by-name', () => openChatByName(page, opts.channelName, log)]);
+        }
 
         let opened = false;
         let openedVia = '';
@@ -210,9 +491,14 @@ async function readActivePreview(page) {
 
         if (!opened) {
             await C.safeScreenshot(page, 'last_media_send.jpg', log);
+            const finalHash = currentUrlHash(page);
+            const reachedTarget = isConcreteChatHash(finalHash, opts.channel);
             result = {
-                status: 'ERROR', code: 'CHANNEL_NOT_FOUND',
-                error: `کانال "${opts.channel || opts.channelName}" با هیچ‌یک از سه راهبرد باز/تأیید نشد. نام نمایشی دقیق را با --channel-name بدهید.`,
+                status: 'ERROR',
+                code: reachedTarget ? 'COMPOSER_NOT_AVAILABLE' : 'CHANNEL_NOT_FOUND',
+                error: reachedTarget
+                    ? `کانال "${opts.channel || opts.channelName}" باز شد (${page.url()}) ولی composer یا دکمهٔ ارسال پست داخل خود کانال دیده نشد. احتمالاً اکانت سروشِ این profile دسترسی ادمین/ارسال پست در کانال اصلی را ندارد.`
+                    : `کانال "${opts.channel || opts.channelName}" با هیچ‌یک از راهبردهای امن باز/تأیید نشد.`,
                 log: log.file
             };
             exitCode = 1;
@@ -220,7 +506,7 @@ async function readActivePreview(page) {
         }
         log.step(`chat opened via ${openedVia}. header="${header}"`);
 
-        const composer = page.locator('.MiddleColumn .input-message-input, .MiddleColumn div[contenteditable="true"]').last();
+        const composer = page.locator(COMPOSER).last();
 
         // ---------- ۳) سنجه‌های «پیش از ارسال» برای تأیید ----------
         const beforeCount = await countMessages(page);
@@ -311,17 +597,31 @@ async function readActivePreview(page) {
             }
 
             // ---------- ۶) ارسال مودال ----------
-            const sendBtn = await C.firstVisible(page, MODAL_SEND, { timeout: 6000, label: 'modal send' });
-            if (sendBtn) {
+            const sendBtn = await firstEnabled(page, MODAL_SEND, { timeout: 12000, label: 'modal send' });
+            if (sendBtn && !sendBtn.disabled) {
                 await sendBtn.locator.click({ force: true });
                 sentVia = 'modal-button:' + sendBtn.selector;
+                await C.delay(3000);
+                if (await page.locator(MODAL).last().isVisible().catch(() => false)) {
+                    log.step('modal still visible after selector send; trying bottom-left send button');
+                    const clicked = await clickModalSendBottomLeft(page, log, 'modal send fallback');
+                    if (clicked) sentVia += '+bottom-left-click';
+                }
             } else {
+                if (sendBtn && sendBtn.disabled) log.step('WARNING: modal send button stayed disabled; trying modal coordinate fallback');
+                const clicked = await clickModalSendBottomLeft(page, log, 'modal send fallback');
+                sentVia = clicked ? 'modal-bottom-left-click' : 'modal-fallback-missing';
+            }
+            await C.delay(1800);
+            const modalStill = await page.locator(MODAL).last().isVisible().catch(() => false);
+            if (modalStill) {
+                log.step('modal still visible after send clicks; trying Ctrl+Enter');
                 await page.keyboard.press('Control+Enter');
-                await C.delay(800);
-                sentVia = 'ctrl+enter';
+                sentVia += '+ctrl+enter';
+                await C.delay(1800);
             }
             log.step(`media submit via ${sentVia}`);
-            await C.delay(3000);
+            await C.delay(5000);
         }
         // ---------- ۷) مسیر متن ساده ----------
         else if (opts.text) {
@@ -337,8 +637,10 @@ async function readActivePreview(page) {
         // ---------- ۸) تأیید ارسال ----------
         let verified = false;
         let how = '';
+        let acceptedButNotVisual = false;
         try {
             await C.waitUntil(async () => {
+                const modalGone = !(await page.locator(MODAL).last().isVisible().catch(() => false));
                 const afterCount = await countMessages(page);
                 const afterPreview = await readActivePreview(page);
                 let snippetSeen = false;
@@ -346,7 +648,7 @@ async function readActivePreview(page) {
                     snippetSeen = await page.locator('.MiddleColumn').getByText(snippet, { exact: false }).first().isVisible().catch(() => false);
                 }
                 const composerCleared = await page.evaluate(() => {
-                    const el = document.querySelector('.MiddleColumn .input-message-input') || document.querySelector('.MiddleColumn div[contenteditable="true"]');
+                    const el = document.querySelector('.MiddleColumn .input-message-input') || document.querySelector('.MiddleColumn div[contenteditable="true"]') || document.querySelector('#MiddleColumn .input-message-input') || document.querySelector('#MiddleColumn div[contenteditable="true"]');
                     return !!el && (el.innerText || '').trim() === '';
                 }).catch(() => false);
                 const previewChanged = !!beforePreview && afterPreview !== beforePreview;
@@ -356,17 +658,18 @@ async function readActivePreview(page) {
                 if (countGrew) { verified = true; how = 'message-count+' + (afterCount - beforeCount); return true; }
                 if (previewChanged) { verified = true; how = 'left-preview-changed'; return true; }
                 if (sentVia === 'composer-enter' && composerCleared) { verified = true; how = 'composer-cleared'; return true; }
+                if (opts.file && modalGone && sentVia !== 'none') { acceptedButNotVisual = true; how = 'modal-closed-accepted'; return true; }
                 return false;
-            }, { timeout: 20000, interval: 700, label: 'send verification' });
+            }, { timeout: opts.file ? 45000 : 20000, interval: 700, label: 'send verification' });
         } catch (e) {
             log.step('verification window elapsed without positive signal: ' + e.message);
         }
-        log.step(`verified=${verified} how=${how || 'n/a'}`);
+        log.step(`verified=${verified} accepted=${acceptedButNotVisual} how=${how || 'n/a'}`);
 
         await C.safeScreenshot(page, 'last_media_send.jpg', log);
 
-        if (verified) {
-            result = { status: 'OK', message: `Sent to Soroush (${sentVia})`, verified: true, proof: how, header, via: openedVia, log: log.file };
+        if (verified || acceptedButNotVisual) {
+            result = { status: 'OK', message: `Sent to Soroush (${sentVia})`, verified, proof: how || (verified ? 'verified' : 'accepted'), header, via: openedVia, log: log.file };
         } else {
             result = { status: 'UNVERIFIED', code: 'SEND_NOT_VERIFIED', message: 'فرایند ارسال انجام شد ولی صحت آن تأیید نشد؛ اسکرین‌شات last_media_send.jpg و لاگ را ببینید', verified: false, header, via: openedVia, log: log.file };
             exitCode = 1;

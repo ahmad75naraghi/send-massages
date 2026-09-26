@@ -56,12 +56,15 @@ const VIEWPORT = { width: 1440, height: 900 };
 
     const opts = C.parseArgs(process.argv);
     const openChat = process.argv.includes('--chat');
-    const htmlPath = path.join(__dirname, target + '_dump.html');
-    const shotPath = path.join(__dirname, target + '_dump.jpg');
+    const htmlPath = path.join(C.APP_DIR, target + '_dump.html');
+    const shotPath = path.join(C.APP_DIR, target + '_dump.jpg');
     let browser = null;
 
     try {
-        const launched = await C.launchBrowser({ chromium }, path.join(__dirname, cfg.profile), VIEWPORT, log);
+        const profileDir = target === 'igap'
+            ? C.env('IGAP_PROFILE_DIR', path.join(C.APP_DIR, cfg.profile))
+            : C.env('SOROUSH_PROFILE_DIR', path.join(C.APP_DIR, cfg.profile));
+        const launched = await C.launchBrowser({ chromium }, profileDir, VIEWPORT, log);
         browser = launched.browser;
         const page = launched.page;
 

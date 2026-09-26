@@ -157,6 +157,8 @@ both "QUEUE: $COUNT پست جدید (lastSeenId=$(jq -r '.lastSeenId' <<<"$PENDI
 # ---------- ۲) پردازش ترتیبی ----------
 FAIL=0
 DEFER=0
+STOP=0
+PROCESSED=0
 REPORT=""
 for ((i = 0; i < COUNT; i++)); do
   PAYLOAD="$(jq -c ".messages[$i]" <<<"$PENDING")"
@@ -172,17 +174,21 @@ for ((i = 0; i < COUNT; i++)); do
   # حالت تعویق: رسانه دانلود نشد → چیزی منتشر نشده و last_msg_id جلو نرفته است
   if [[ "$SUCCESS" != "true" && "$DEFERRED" == "true" ]]; then
     both "DEFER: پست $MID منتشر نشد — $(jq -r '.message // .reason // "?"' <<<"$RESULT" | head -c 200)"
-    REPORT+="⏸ پست ${MID} [${MTYPE}]: رسانه دانلود نشد → منتشر نشد (تلاش بعدی با لینک تازه)"$'\n'
+    REPORT+="⏸ پست ${MID} [${MTYPE}]: رسانه دانلود نشد → منتشر نشد (صف متوقف شد تا last_msg_id از روی آن نپرد)"$'\n'
     DEFER=$((DEFER + 1))
-    sleep 3
-    continue
+    STOP=1
+    break
   fi
 
   if [[ "$SUCCESS" != "true" ]]; then
-    both "ERROR: پاسخ نامعتبر/ناموفق برای پست $MID: $(printf '%s' "$RESULT" | head -c 200)"
+    both "ERROR: پاسخ نامعتبر/ناموفق برای پست $MID: $(jq -r '.message // .error // "نامشخص"' <<<"$RESULT" 2>/dev/null | head -c 240)"
+    REPORT+="❌ پست ${MID} [${MTYPE}]: ارسال ناموفق؛ صف متوقف شد"$'\n'
     FAIL=$((FAIL + 1))
-    continue
+    STOP=1
+    break
   fi
+
+  PROCESSED=$((PROCESSED + 1))
 
   B="$(jq -r '.bale.ok'    <<<"$RESULT")"
   R="$(jq -r '.rubika.ok'  <<<"$RESULT")"
@@ -212,8 +218,11 @@ if [[ -n "$REPORT" ]]; then
   else                            call_http send_report "$BODY" >>"$LOG_FILE" 2>&1; fi
 fi
 
-both "DONE: $COUNT پست پردازش شد، $FAIL مورد با شکست کامل، $DEFER مورد تعویق‌شده"
-# کد خروج: 0 = همه سبز (شامل تعویق‌های انتظار‌رفته)، 3 = شکست ارسال، 4 = فقط تعویق
+if [[ "$STOP" -eq 1 ]]; then
+  both "STOP: صف پس از $PROCESSED/$COUNT پست متوقف شد تا ترتیب state حفظ شود"
+fi
+both "DONE: $PROCESSED از $COUNT پست پردازش شد، $FAIL مورد با شکست کامل، $DEFER مورد تعویق‌شده"
+# کد خروج: 0 = همه سبز، 3 = شکست ارسال، 4 = تعویق/توقف برای تلاش بعدی
 if [[ "$FAIL" -gt 0 ]]; then exit 3; fi
-[[ "$DEFER" -gt 0 ]] && exit 4
+[[ "$DEFER" -gt 0 || "$STOP" -gt 0 ]] && exit 4
 exit 0
