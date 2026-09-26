@@ -100,6 +100,38 @@ function strictCandidateStatus(brief, channel, expectedName) {
 }
 
 const COMPOSER = '.MiddleColumn .input-message-input, .MiddleColumn div[contenteditable="true"], #MiddleColumn .input-message-input, #MiddleColumn div[contenteditable="true"]';
+function currentUrlHash(page) {
+    try { return new URL(page.url()).hash || ''; } catch (e) { return ''; }
+}
+
+function isConcreteChatHash(hash, channel) {
+    const h = String(hash || '').toLowerCase();
+    const c = String(channel || '').replace(/^@/, '').toLowerCase();
+    if (!h || h === '#') return false;
+    // #@username is only the unresolved public route. After a real search-result click,
+    // Soroush Web resolves channels to an internal numeric hash like #-1001243691.
+    if (c && h === `#@${c}`) return false;
+    return /^#-?\d+/.test(h) || (c ? h.includes(c) : true);
+}
+
+async function waitForConcreteChatAfterClick(page, channel, beforeHash, log, label, timeout = 10000) {
+    try {
+        await C.waitUntil(() => {
+            const h = currentUrlHash(page);
+            if (!isConcreteChatHash(h, channel)) return false;
+            // If we were already on some concrete chat, do not accept the stale chat
+            // immediately after clicking a search result; wait until navigation changes it.
+            if (beforeHash && h === beforeHash) return false;
+            return true;
+        }, { timeout, interval: 250, label });
+        log.step(`${label}: resolved to ${page.url()}`);
+        return true;
+    } catch (e) {
+        log.step(`${label}: concrete chat hash not observed after click; current url=${page.url()}`);
+        return false;
+    }
+}
+
 const NEW_POST_BUTTONS = [
     '.MiddleColumn button:has-text("پیام جدید")',
     '.MiddleColumn [role="button"]:has-text("پیام جدید")',
@@ -191,9 +223,12 @@ async function openChatBySearch(page, channel, log, strict = false, expectedName
         const exactUser = new RegExp(`@${escapeRegex(channel)}(?![A-Za-z0-9_])`, 'i');
         const exact = page.locator(resultSel).filter({ hasText: exactUser }).first();
         if (await C.seen(exact, 2500)) {
+            const beforeHash = currentUrlHash(page);
             await exact.click({ force: true });
             log.step(`openChatBySearch(strict): clicked exact username result for "${query}"`);
-            if (await ensureComposer(page, log, 15000)) return true;
+            if (!(await waitForConcreteChatAfterClick(page, channel, beforeHash, log, 'openChatBySearch(strict): exact result navigation', 10000))) {
+                log.step('openChatBySearch(strict): exact result click did not resolve; refusing stale composer');
+            } else if (await ensureComposer(page, log, 15000)) return true;
             log.step('openChatBySearch(strict): exact result opened but composer not visible');
         } else {
             log.step('openChatBySearch(strict): exact username text not visible; iterating visible results for exact @query');
@@ -210,8 +245,13 @@ async function openChatBySearch(page, channel, log, strict = false, expectedName
                 log.step(`openChatBySearch(strict): skipped result #${i + 1} for "${query}" (${status.reason}) text="${C.RunLog.brief(brief, 80)}"`);
                 continue;
             }
+            const beforeHash = currentUrlHash(page);
             await item.click({ force: true });
             log.step(`openChatBySearch(strict): clicked result #${i + 1} for "${query}" (${status.reason}) text="${C.RunLog.brief(brief, 80)}"`);
+            if (!(await waitForConcreteChatAfterClick(page, channel, beforeHash, log, `openChatBySearch(strict): result #${i + 1} navigation`, 10000))) {
+                log.step(`openChatBySearch(strict): result #${i + 1} click did not resolve; refusing stale composer`);
+                continue;
+            }
             if (await ensureComposer(page, log, 15000)) return true;
             log.step(`openChatBySearch(strict): result #${i + 1} opened but composer not visible`);
         }
