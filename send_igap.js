@@ -155,6 +155,24 @@ async function clickModalBottomRight(page, log, label = 'modal bottom-right') {
     return true;
 }
 
+async function clickSendBesideCaption(page, caption, log) {
+    const box = await caption.boundingBox().catch(() => null);
+    const vp = page.viewportSize() || VIEWPORT;
+    if (!box) {
+        log.step('modal send near-caption: caption bounding box not available');
+        return false;
+    }
+    if (box.y > vp.height - 160) {
+        log.step(`modal send near-caption: refusing because caption looks like main composer y=${Math.round(box.y)} h=${Math.round(box.height)}`);
+        return false;
+    }
+    const x = Math.min(vp.width - 20, Math.max(20, box.x + box.width + 32));
+    const y = Math.min(vp.height - 20, Math.max(20, box.y + (box.height / 2)));
+    await page.mouse.click(x, y);
+    log.step(`modal send near-caption: clicked at ${Math.round(x)},${Math.round(y)} caption=${Math.round(box.x)},${Math.round(box.y)},${Math.round(box.width)}x${Math.round(box.height)}`);
+    return true;
+}
+
 async function clickChannel(page, locator, name, log, label) {
     try {
         await locator.first().waitFor({ state: 'visible', timeout: 8000 });
@@ -338,29 +356,27 @@ async function countCards(page) {
                 log.step('WARNING: caption editor not ready; media will be sent without caption');
             }
 
-            // ---------- ۵) ارسال: روی دکمهٔ سبز پایین راست مودال کلیک می‌کنیم.
-            // Selectorهای متنی آی‌گپ گاهی عنصر اشتباه/پنهان را match می‌کنند؛
-            // مختصات پایین راست، دقیقاً همان دکمهٔ ارسال دیده‌شده در اسکرین‌شات است.
+            // ---------- ۵) ارسال رسانه ----------
+            // دکمهٔ سبز ارسال آی‌گپ کنار input کپشن است. کلیک پایین راستِ کل مودال
+            // می‌تواند overlay را ببندد و OK کاذب بسازد؛ پس از مختصات کپشن استفاده می‌کنیم.
             await C.delay(1200);
-            const clicked = await clickModalBottomRight(page, log, 'modal send primary');
-            sentVia = clicked ? 'modal-bottom-right-click' : 'modal-coordinate-missing';
-            await C.delay(1800);
+            let clicked = await clickSendBesideCaption(page, caption, log);
+            sentVia = clicked ? 'caption-neighbor-button' : 'caption-neighbor-missing';
+            await C.delay(2200);
+
             if (await igapUploadModalVisible(page)) {
-                log.step('upload modal still visible after coordinate click; trying selector send');
+                log.step('upload modal still visible after caption-neighbor click; trying explicit send selector');
                 const sendBtn = await firstEnabled(page, MODAL_SEND, { timeout: 7000, label: 'modal send' });
                 if (sendBtn && !sendBtn.disabled) {
                     await sendBtn.locator.click({ force: true });
                     sentVia += '+modal-button:' + sendBtn.selector;
-                    await C.delay(1800);
+                    await C.delay(2200);
                 } else if (sendBtn && sendBtn.disabled) {
-                    log.step('WARNING: modal send button stayed disabled after coordinate click');
+                    log.step('WARNING: modal send button stayed disabled after caption-neighbor click');
                 }
             }
             if (await igapUploadModalVisible(page)) {
-                log.step('upload modal still visible after selector click; trying Enter');
-                await page.keyboard.press('Enter');
-                sentVia += '+enter';
-                await C.delay(1800);
+                log.step('upload modal still visible after selector click; send not confirmed');
             }
             log.step(`media submit via ${sentVia}`);
             await C.delay(4000);
@@ -391,21 +407,17 @@ async function countCards(page) {
                 if (snippet) {
                     snippetSeen = await page.locator('#MiddleColumn').getByText(snippet, { exact: false }).first().isVisible().catch(() => false);
                 }
-                const afterCards = await countCards(page);
-                const cardsGrew = beforeCards >= 0 && afterCards > beforeCards;
                 const composerCleared = await page.evaluate(() => {
                     const el = document.querySelector('#MiddleColumn div[contenteditable="true"], #text-editor');
                     return !!el && (el.innerText || '').trim() === '';
                 }).catch(() => false);
 
                 if (snippetSeen && modalGone) { verified = true; how = 'snippet-in-chat'; return true; }
-                if (previewChanged) { verified = true; how = 'left-preview-changed'; return true; }
-                if (opts.file && modalGone && cardsGrew) { verified = true; how = 'modal-closed+cards+' + (afterCards - beforeCards); return true; }
+                if (previewChanged && modalGone) { verified = true; how = 'left-preview-changed'; return true; }
                 if (sentVia === 'composer-enter' && composerCleared) { verified = true; how = 'composer-cleared'; return true; }
 
-                // آی‌گپ گاهی بعد از ارسال واقعی، DOM/preview را به‌موقع به‌روزرسانی نمی‌کند.
-                // اما برای رسانه فقط وقتی OK محافظه‌کارانه می‌دهیم که مودال واقعی Send File بسته شده باشد.
-                if (opts.file && modalGone && sentVia !== 'none') { acceptedButNotVisual = true; how = 'upload-modal-closed-accepted'; return true; }
+                // برای رسانه، بسته شدن مودال یا تغییر تعداد کارت‌ها به‌تنهایی کافی نیست؛
+                // همین حالت قبلاً OK کاذب ساخت. باید کپشن در چت دیده شود یا preview کانال عوض شود.
                 if (!opts.file && composerCleared && sentVia === 'composer-enter') { acceptedButNotVisual = true; how = 'composer-cleared-accepted'; return true; }
                 return false;
             }, { timeout: opts.file ? Math.max(VERIFY_TIMEOUT_MS, 20000) : VERIFY_TIMEOUT_MS, interval: 500, label: 'send verification' });
