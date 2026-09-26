@@ -58,7 +58,7 @@ const MENU_DOC = [
     '.MenuItem:has-text("فایل (سند)")',
 ];
 
-const MODAL = '.modal-dialog, [role="dialog"], .MuiDialog-root, .MuiModal-root';
+const MODAL = ':is(.modal-dialog, [role="dialog"], .MuiDialog-root, .MuiModal-root)';
 const MODAL_SEND = [
     `${MODAL} button:has-text("ارسال")`,
     `${MODAL} button:has-text("Send")`,
@@ -345,7 +345,7 @@ async function countCards(page) {
                 `${MODAL} div[contenteditable="true"]`,
                 `${MODAL} textarea`,
                 `${MODAL} input[type="text"]`,
-                '#text-editor',
+                `${MODAL} #text-editor`,
             ].join(', ')).last();
             const captionReady = await C.seen(caption, 12000);
             log.step(`modal caption editor ready: ${captionReady}`);
