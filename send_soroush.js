@@ -149,10 +149,15 @@ function currentUrlHash(page) {
     try { return new URL(page.url()).hash || ''; } catch (e) { return ''; }
 }
 
+function isSoroushSideViewHash(hash) {
+    return /_(?:pinned|comments|scheduled|discussion|replies)\b/i.test(String(hash || ''));
+}
+
 function isConcreteChatHash(hash, channel) {
     const h = String(hash || '').toLowerCase();
     const c = String(channel || '').replace(/^@/, '').toLowerCase();
     if (!h || h === '#') return false;
+    if (isSoroushSideViewHash(h)) return false;
     // #@username is only the unresolved public route. After a real search-result click,
     // Soroush Web resolves channels to an internal numeric hash like #-1001243691.
     if (c && h === `#@${c}`) return false;
@@ -197,16 +202,6 @@ const NEW_POST_BUTTONS = [
     '#MiddleColumn button:has-text("New Message")',
     '.MiddleColumn button:has-text("New Post")',
     '#MiddleColumn button:has-text("New Post")',
-    '.MiddleColumn button[aria-label*="پیام"]',
-    '#MiddleColumn button[aria-label*="پیام"]',
-    '.MiddleColumn button[title*="پیام"]',
-    '#MiddleColumn button[title*="پیام"]',
-    '.MiddleColumn button:has(i[class*="edit"])',
-    '#MiddleColumn button:has(i[class*="edit"])',
-    '.MiddleColumn [role="button"]:has(i[class*="edit"])',
-    '#MiddleColumn [role="button"]:has(i[class*="edit"])',
-    '.MiddleColumn button:has(i[class*="compose"])',
-    '#MiddleColumn button:has(i[class*="compose"])',
 ];
 
 // fallback امن: بعضی نسخه‌های سروش دکمهٔ «پیام جدید» کانال را خارج از
@@ -221,10 +216,6 @@ const GLOBAL_NEW_POST_BUTTONS = [
     '[class*="button"]:has-text("پیام جدید")',
     'button:has-text("ارسال پیام")',
     '[role="button"]:has-text("ارسال پیام")',
-    'button[aria-label*="پیام"]',
-    '[role="button"][aria-label*="پیام"]',
-    'button[title*="پیام"]',
-    '[role="button"][title*="پیام"]',
 ];
 
 async function ensureComposer(page, log, timeout = 12000) {
@@ -241,7 +232,7 @@ async function ensureComposer(page, log, timeout = 12000) {
             let globalFallback = false;
             const beforeHash = currentUrlHash(page);
 
-            if (!newPost && !triedGlobalNewPost && /^#-?\d+/.test(beforeHash)) {
+            if (!newPost && !triedGlobalNewPost && /^#-?\d+/.test(beforeHash) && !isSoroushSideViewHash(beforeHash)) {
                 // بعضی نسخه‌ها دکمهٔ ارسال پست کانال را خارج از MiddleColumn می‌گذارند.
                 // فقط بعد از resolve شدن کانال به hash عددی واقعی اجازهٔ fallback global داریم.
                 newPost = await C.firstVisible(page, GLOBAL_NEW_POST_BUTTONS, { timeout: 700, label: 'global new post button' });
@@ -254,12 +245,14 @@ async function ensureComposer(page, log, timeout = 12000) {
                 clickedNewPost = true;
                 log.step(`${globalFallback ? 'global ' : ''}new-post button clicked via ${newPost.selector}`);
                 await C.delay(1500);
-                if (globalFallback) {
-                    const afterHash = currentUrlHash(page);
-                    if (afterHash !== beforeHash) {
-                        log.step(`global new-post changed chat hash ${beforeHash} → ${afterHash}; refusing composer`);
-                        return false;
-                    }
+                const afterHash = currentUrlHash(page);
+                if (afterHash && beforeHash && afterHash !== beforeHash) {
+                    log.step(`new-post changed chat hash ${beforeHash} → ${afterHash}; refusing composer`);
+                    return false;
+                }
+                if (isSoroushSideViewHash(afterHash)) {
+                    log.step(`new-post opened side view ${afterHash}; refusing composer`);
+                    return false;
                 }
                 continue;
             }
