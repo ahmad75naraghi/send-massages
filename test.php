@@ -78,7 +78,7 @@ foreach ($messageNodes as $node) {
 
     if ($photoNode) {
         $style = $photoNode->getAttribute('style');
-        if (preg_match('/url\(\'?(.*?)\'?\)/', $style, $matches)) {
+        if (preg_match("~url\(\s*['\"]?([^'\")]+)['\"]?\s*\)~i", $style, $matches)) {
             $mediaUrl = $matches[1];
             $mediaType = 'photo';
         }

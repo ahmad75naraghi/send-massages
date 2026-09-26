@@ -126,14 +126,14 @@ class EitaaScraper
 
             if ($photoNode) {
                 $style = $photoNode->getAttribute('style');
-                if (preg_match('/url\(\'?(.*?)\'?\)/', $style, $matches)) {
-                    $mediaUrl = 'https://eitaa.com' . $matches[1];
+                if (preg_match("~url\(\s*['\"]?([^'\")]+)['\"]?\s*\)~i", $style, $matches)) {
+                    $mediaUrl = str_starts_with($matches[1], 'http') ? $matches[1] : 'https://eitaa.com' . $matches[1];
                     $mediaType = 'image';
                 }
             } elseif ($videoNode) {
                 $src = $videoNode->getAttribute('src');
                 if ($src) {
-                    $mediaUrl = 'https://eitaa.com' . $src;
+                    $mediaUrl = str_starts_with($src, 'http') ? $src : 'https://eitaa.com' . $src;
                     $mediaType = 'video';
                 }
             }
@@ -301,7 +301,7 @@ class Broadcaster
 // ==========================================
 // حلقه اجرای نامحدود (Daemon Loop)
 // ==========================================
-$store = new StateStore();
+$store = new StateStore(STATE_DB_PATH);
 $scraper = new EitaaScraper(EITAA_CHANNEL_ID);
 $broadcaster = new Broadcaster();
 

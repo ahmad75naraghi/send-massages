@@ -2,7 +2,6 @@
 declare(strict_types=1);
 
 date_default_timezone_set('Asia/Tehran');
-ini_set('display_errors', '1');
 error_reporting(E_ALL);
 
 // ============================================================
@@ -11,6 +10,10 @@ error_reporting(E_ALL);
 //  هیچ secret ای در این فایل باقی نمانده است.
 // ============================================================
 require_once __DIR__ . '/config.php';
+
+// در تولید، خطاهای PHP نباید وسط JSON/HTML چاپ شوند؛ با SYNC_DEBUG=1 می‌توان موقتاً روشن کرد.
+ini_set('display_errors', envBool('SYNC_DEBUG', false) ? '1' : '0');
+ini_set('log_errors', '1');
 
 // اعتبارسنجی توکن دسترسی
 if (php_sapi_name() !== 'cli') {
@@ -34,8 +37,17 @@ if (php_sapi_name() !== 'cli') {
 }
 
 // پایگاه داده وضعیت
-$dbPath = STATE_DB_PATH;$db = new PDO("sqlite:{$dbPath}");
-$db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);$db->exec("CREATE TABLE IF NOT EXISTS sync_state (channel TEXT PRIMARY KEY, last_msg_id INTEGER NOT NULL)");
+$dbPath = STATE_DB_PATH;
+$dbDir = dirname($dbPath);
+if ($dbDir !== '' && $dbDir !== '.' && !is_dir($dbDir)) {
+    @mkdir($dbDir, 0770, true);
+}
+$db = new PDO("sqlite:{$dbPath}");
+$db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+$db->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
+$db->exec('PRAGMA busy_timeout = 10000');
+$db->exec('PRAGMA journal_mode = WAL');
+$db->exec("CREATE TABLE IF NOT EXISTS sync_state (channel TEXT PRIMARY KEY, last_msg_id INTEGER NOT NULL)");
 $db->exec("CREATE TABLE IF NOT EXISTS media_fail (msg_id INTEGER PRIMARY KEY, fails INTEGER NOT NULL DEFAULT 0, last_reason TEXT, updated_at TEXT)");
 
 function getLastSeenId(PDO $db, string$channel): int {
@@ -50,6 +62,51 @@ function setLastSeenId(PDO $db, string $channel, int$msgId): void {
     $stmt->execute([':channel' => $channel, ':msg_id' =>$msgId]);
 }
 
+/** فقط جلو بردن state؛ هرگز مقدار را عقب نمی‌برد (برای sync/resend). */
+function advanceLastSeenId(PDO $db, string $channel, int $msgId): void {
+    $stmt = $db->prepare("INSERT INTO sync_state (channel, last_msg_id) VALUES (:channel, :msg_id)
+                          ON CONFLICT(channel) DO UPDATE SET last_msg_id = MAX(sync_state.last_msg_id, excluded.last_msg_id)");
+    $stmt->execute([':channel' => $channel, ':msg_id' => $msgId]);
+}
+
+/** نام فایل امن برای مسیر موقت و CURLFile (بدون /، کنترل‌کاراکتر، و طول غیرعادی). */
+function safeFileName(?string $name, string $fallback = 'file.bin'): string {
+    $name = trim((string)$name);
+    if ($name === '') {
+        $name = $fallback;
+    }
+    $name = basename(str_replace('\\', '/', $name));
+    $name = preg_replace('/[\x00-\x1F\x7F<>:"\\\\|?*]+/u', '_', $name) ?: $fallback;
+    $name = trim($name, " .\t\n\r\0\x0B");
+    if ($name === '' || $name === '.' || $name === '..') {
+        $name = $fallback;
+    }
+    return mb_substr($name, 0, 160);
+}
+
+/** تبدیل URL نسبی ایتا/CDN به URL کامل. */
+function eitaaAbsoluteUrl(string $url): string {
+    $url = html_entity_decode(trim($url), ENT_QUOTES | ENT_HTML5, 'UTF-8');
+    if ($url === '') {
+        return '';
+    }
+    if (preg_match('#^https?://#i', $url)) {
+        return $url;
+    }
+    if (str_starts_with($url, '//')) {
+        return 'https:' . $url;
+    }
+    return 'https://eitaa.com' . ($url[0] === '/' ? '' : '/') . $url;
+}
+
+/** استخراج URL از background-image: url(...) با پشتیبانی از کوتیشن تکی/دوتایی. */
+function cssUrlFromStyle(string $style): ?string {
+    if (preg_match("~url\(\s*['\"]?([^'\")]+)['\"]?\s*\)~i", $style, $m)) {
+        return trim($m[1]);
+    }
+    return null;
+}
+
 /**
  * دانلود رسانهٔ ایتا به فایل موقت.
  *
@@ -60,6 +117,8 @@ function setLastSeenId(PDO $db, string $channel, int$msgId): void {
  */
 function downloadMedia(string $url, string$targetFilename, ?string &$reason = null): ?string {
     $reason = null;
+    $url = eitaaAbsoluteUrl($url);
+    $targetFilename = safeFileName($targetFilename, 'media.bin');
     if ($url === '' or !preg_match('#^https?://#i', $url)) {
         $reason = 'BAD_URL';
         return null;
@@ -77,8 +136,12 @@ function downloadMedia(string $url, string$targetFilename, ?string &$reason = nu
         CURLOPT_TIMEOUT        => 180,
         CURLOPT_FOLLOWLOCATION => true, 
         CURLOPT_SSL_VERIFYPEER => false,
+        CURLOPT_SSL_VERIFYHOST => false,
         CURLOPT_USERAGENT      => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-        CURLOPT_HTTPHEADER     => ['Referer: https://eitaa.com/' . EITAA_CHANNEL_ID]
+        CURLOPT_HTTPHEADER     => [
+            'Referer: https://eitaa.com/' . EITAA_CHANNEL_ID,
+            'Accept-Encoding: identity',
+        ]
     ]);
     $res = curl_exec($ch);
     $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
@@ -163,6 +226,39 @@ function readRequestBody(): string {
     return (string)file_get_contents('php://input');
 }
 
+function tailText(string $file, int $lines = 80): string {
+    if (!is_readable($file)) {
+        return '';
+    }
+    $rows = @file($file, FILE_IGNORE_NEW_LINES);
+    if (!is_array($rows)) {
+        return '';
+    }
+    return implode("\n", array_slice($rows, -max(1, $lines)));
+}
+
+function isPidRunning(int $pid): bool {
+    if ($pid <= 0) {
+        return false;
+    }
+    if (function_exists('posix_kill')) {
+        return @posix_kill($pid, 0);
+    }
+    return is_dir('/proc/' . $pid);
+}
+
+function syncWorkerPidFile(): string {
+    return rtrim(LOG_DIR, '/') . '/sync_worker.pid';
+}
+
+function currentSyncWorkerPid(): int {
+    $pidFile = syncWorkerPidFile();
+    if (!is_readable($pidFile)) {
+        return 0;
+    }
+    return max(0, (int)trim((string)file_get_contents($pidFile)));
+}
+
 function callApi(string $url, mixed$data, bool $isMultipart, array$headers = []): array {
     $ch = curl_init($url);
     curl_setopt_array($ch, [
@@ -174,9 +270,17 @@ function callApi(string $url, mixed$data, bool $isMultipart, array$headers = [])
     ]);
     if (!empty($headers)) curl_setopt($ch, CURLOPT_HTTPHEADER,$headers);
     $res = curl_exec($ch);
-    $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $errno = curl_errno($ch);
+    $error = curl_error($ch);
     curl_close($ch);
-    return ['code' => $code, 'res' => json_decode((string)$res, true) ?? $res];
+    $decoded = json_decode((string)$res, true);
+    return [
+        'code'  => $errno ? 0 : $code,
+        'res'   => is_array($decoded) ? $decoded : $res,
+        'errno' => $errno,
+        'error' => $error,
+    ];
 }
 
 function sendToBale(string $text, ?string $file, ?string $type, string $fileName): array {
@@ -234,7 +338,7 @@ function nodeEnvProblem(string $script): string {
              . 'رفع: پوشهٔ lib/ را همراه بقیهٔ پروژه روی سرور بگذارید.';
     }
     $nodeBin = NODE_BIN;
-    if ($nodeBin !== '' && !is_executable($nodeBin) && !file_exists($nodeBin)) {
+    if ($nodeBin !== '' && str_contains($nodeBin, '/') && !is_executable($nodeBin) && !file_exists($nodeBin)) {
         return "باینری Node در مسیر پیکربندی‌شده پیدا نشد: $nodeBin\n"
              . 'رفع: `command -v node` را ببینید و NODE_BIN را در .env اصلاح کنید.';
     }
@@ -251,7 +355,7 @@ function nodeEnvProblem(string $script): string {
          . '    git restore --source=e5e4708 --worktree -- node_modules\n'
          . '    # یا اگر git restore نبود:  git checkout e5e4708 -- node_modules && git reset -q HEAD node_modules\n'
          . 'رفع (با اینترنت):  cd ' . SYNC_APP_DIR . ' && npm install --no-audit --no-fund\n'
-         . 'تأیید:  node -e "require(\'playwright\'); console.log(\'OK\')"';
+         . "تأیید:  node -e \"require('playwright'); console.log('OK')\"";
 }
 
 /**
@@ -269,6 +373,14 @@ function nodeEnvProblem(string $script): string {
 function runUserbot(string $script, string $profileDir, string $channel, string $channelName, string $text, ?string $filePath, ?string $mediaType, array $extraArgs = []): array {
     if (trim($text) === '' and (!$filePath or !file_exists($filePath))) {
         return ['success' => true, 'message' => 'SKIP: محتوایی برای ارسال نیست', 'skipped' => true];
+    }
+
+    if (!function_exists('shell_exec') || !is_callable('shell_exec')) {
+        return [
+            'success' => false,
+            'code'    => 'SHELL_EXEC_DISABLED',
+            'message' => 'تابع shell_exec در PHP غیرفعال است؛ مسیر UserBot (سروش/آی‌گپ) اجرا نمی‌شود. در تنظیمات PHP آن را از disable_functions حذف کنید.',
+        ];
     }
 
     // پیش‌بررسی: اگر playwright/Node نباشد، به‌جای stack trace خام، پیام روشن بده
@@ -366,15 +478,30 @@ function runUserbot(string $script, string $profileDir, string $channel, string 
  *   ['bale' => ['ok' => bool|null, 'info' => mixed], ...]
  * پلتفرم‌های ردشده: ['ok' => null, 'info' => 'SKIPPED']
  */
-function dispatchToPlatforms(array $only, string $text, ?string $localFile, ?string $mediaType, string $fileName): array {
+function normalizePlatformList(array $only): array {
     $all = ['bale', 'rubika', 'soroush', 'igap'];
     $only = array_values(array_unique(array_filter(
         array_map(fn($x) => strtolower(trim((string)$x)), $only),
         fn($x) => in_array($x, $all, true)
     )));
-    if ($only === []) {
-        $only = $all;
+    return $only === [] ? $all : $only;
+}
+
+function deliveredPlatformCount(array $sent, array $only): int {
+    $count = 0;
+    foreach (normalizePlatformList($only) as $platform) {
+        $info = (string)($sent[$platform]['info'] ?? '');
+        if (($sent[$platform]['ok'] ?? null) === true && !preg_match('/\bSKIP(?:PED)?\b/i', $info)) {
+            $count++;
+        }
     }
+    return $count;
+}
+
+function dispatchToPlatforms(array $only, string $text, ?string $localFile, ?string $mediaType, string $fileName): array {
+    $all = ['bale', 'rubika', 'soroush', 'igap'];
+    $only = normalizePlatformList($only);
+    $fileName = safeFileName($fileName, 'file.bin');
 
     $out = [];
     foreach ($all as $platform) {
@@ -440,13 +567,18 @@ function fetchEitaaPosts(): array {
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_FOLLOWLOCATION => true,
         CURLOPT_SSL_VERIFYPEER => false,
-        CURLOPT_TIMEOUT        => 25
+        CURLOPT_SSL_VERIFYHOST => false,
+        CURLOPT_TIMEOUT        => 25,
+        CURLOPT_USERAGENT      => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+        CURLOPT_HTTPHEADER     => ['Accept-Language: fa,en;q=0.9'],
     ]);
     $html = curl_exec($ch);
+    $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $err  = curl_error($ch);
     curl_close($ch);
 
-    if (empty($html)) {
-        return ['ok' => false, 'error' => 'عدم دسترسی به ایتا', 'messages' => []];
+    if ($code !== 200 || empty($html)) {
+        return ['ok' => false, 'error' => 'عدم دسترسی به ایتا' . ($code ? " (HTTP $code)" : '') . ($err ? ": $err" : ''), 'messages' => []];
     }
 
     $dom = new DOMDocument();
@@ -468,23 +600,24 @@ function fetchEitaaPosts(): array {
 
         $videoNode = $xpath->query(".//video", $node)->item(0);
         if ($videoNode and ($src =$videoNode->getAttribute('src'))) {
-            $mediaUrl = str_starts_with($src, 'http') ? $src : 'https://eitaa.com' .$src;
+            $mediaUrl = eitaaAbsoluteUrl($src);
             $mediaType = 'video';$fileName = 'video.mp4';
         } elseif ($audioNode = $xpath->query(".//audio", $node)->item(0)) {
             if ($src =$audioNode->getAttribute('src')) {
-                $mediaUrl = str_starts_with($src, 'http') ? $src : 'https://eitaa.com' .$src;
+                $mediaUrl = eitaaAbsoluteUrl($src);
                 $mediaType = 'audio';$fileName = 'audio.mp3';
             }
         } elseif ($photoNode = $xpath->query(".//a[contains(@class, 'etme_widget_message_photo_wrap')]", $node)->item(0)) {
-            if (preg_match('/url\(\'?(.*?)\'?\)/', $photoNode->getAttribute('style'),$m)) {
-                $mediaUrl = str_starts_with($m[1], 'http') ? $m[1] : 'https://eitaa.com' .$m[1];
+            $cssUrl = cssUrlFromStyle($photoNode->getAttribute('style'));
+            if ($cssUrl !== null) {
+                $mediaUrl = eitaaAbsoluteUrl($cssUrl);
                 $mediaType = 'image';$fileName = 'photo.jpg';
             }
         } elseif ($docNode = $xpath->query(".//a[contains(@class, 'etme_widget_message_document_wrap')]", $node)->item(0)) {
             if ($href =$docNode->getAttribute('href')) {
-                $mediaUrl = str_starts_with($href, 'http') ? $href : 'https://eitaa.com' .$href;
+                $mediaUrl = eitaaAbsoluteUrl($href);
                 $mediaType = 'document';
-                $tNode =$xpath->query(".//div[contains(@class, 'etme_widget_message_document_title')]", $docNode)->item(0);$fileName = $tNode ? trim($tNode->textContent) : 'document.bin';
+                $tNode =$xpath->query(".//div[contains(@class, 'etme_widget_message_document_title')]", $docNode)->item(0);$fileName = safeFileName($tNode ? trim($tNode->textContent) : 'document.bin', 'document.bin');
             }
         }
 
@@ -567,6 +700,64 @@ if ($action === 'list_posts') {
     exit;
 }
 
+// ۱-ج) وضعیت اجرای پس‌زمینه/صف cron
+if ($action === 'queue_status') {
+    header('Content-Type: application/json; charset=utf-8');
+    $pid = currentSyncWorkerPid();
+    $running = isPidRunning($pid);
+    echo json_encode([
+        'success' => true,
+        'running' => $running,
+        'pid'     => $running ? $pid : 0,
+        'log'     => tailText(rtrim(LOG_DIR, '/') . '/cron_sync.log', 80),
+        'launcherLog' => tailText(rtrim(LOG_DIR, '/') . '/background_sync.log', 30),
+    ], JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
+// ۱-د) اجرای صف در پس‌زمینه: کاربر منتظر ارسال تک‌تک پست‌ها نمی‌ماند
+if ($action === 'background_sync') {
+    header('Content-Type: application/json; charset=utf-8');
+    @mkdir(LOG_DIR, 0770, true);
+
+    $pid = currentSyncWorkerPid();
+    if (isPidRunning($pid)) {
+        echo json_encode(['success' => true, 'alreadyRunning' => true, 'pid' => $pid, 'message' => 'صف هم‌اکنون در حال پردازش است.'], JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+
+    if (!function_exists('shell_exec') || !is_callable('shell_exec')) {
+        echo json_encode([
+            'success' => false,
+            'error'   => 'SHELL_EXEC_DISABLED',
+            'message' => 'برای اجرای صف در پس‌زمینه، shell_exec باید در PHP فعال باشد. تا آن زمان cron/systemd می‌تواند cron_sync.sh را اجرا کند.',
+        ], JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+
+    $script = SYNC_APP_DIR . '/cron_sync.sh';
+    if (!is_file($script)) {
+        echo json_encode(['success' => false, 'error' => 'SCRIPT_NOT_FOUND', 'message' => 'cron_sync.sh پیدا نشد: ' . $script], JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+
+    $pidFile = syncWorkerPidFile();
+    $logFile = rtrim(LOG_DIR, '/') . '/background_sync.log';
+    $cmd = 'cd ' . escapeshellarg(SYNC_APP_DIR)
+         . ' && nohup /usr/bin/env bash ' . escapeshellarg($script)
+         . ' >> ' . escapeshellarg($logFile) . ' 2>&1 & echo $!';
+    $out = trim((string)shell_exec($cmd));
+    $newPid = preg_match('/\b(\d+)\b/', $out, $m) ? (int)$m[1] : 0;
+    if ($newPid > 0) {
+        @file_put_contents($pidFile, (string)$newPid);
+        echo json_encode(['success' => true, 'pid' => $newPid, 'message' => 'صف در پس‌زمینه شروع شد؛ می‌توانید صفحه را ببندید.'], JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+
+    echo json_encode(['success' => false, 'error' => 'START_FAILED', 'message' => 'شروع اجرای پس‌زمینه ناموفق بود.', 'raw' => $out], JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
 // ۲. پردازش منفرد یک پست
 if ($action === 'sync_single') {
     set_time_limit(300);
@@ -579,10 +770,10 @@ if ($action === 'sync_single') {
     }
 
     $msgId     = (int)$payload['id'];
-    $text      =$payload['text'] ?? '';
-    $mediaUrl  =$payload['mediaUrl'] ?? null;
-    $mediaType =$payload['mediaType'] ?? null;
-    $fileName  =$payload['fileName'] ?? 'file.bin';
+    $text      = (string)($payload['text'] ?? '');
+    $mediaUrl  = isset($payload['mediaUrl']) ? (string)$payload['mediaUrl'] : null;
+    $mediaType = isset($payload['mediaType']) ? (string)$payload['mediaType'] : null;
+    $fileName  = safeFileName((string)($payload['fileName'] ?? 'file.bin'), 'file.bin');
 
     // ---------- دانلود رسانه با سیاست «تعویق هوشمند» ----------
     // اگر رسانه دانلود نشود، پست «متن‌خالی» منتشر نمی‌شود؛ بلکه تعویق می‌شود تا
@@ -603,10 +794,11 @@ if ($action === 'sync_single') {
             if ($attempts < MEDIA_MAX_RETRY) {
                 http_response_code(200);
                 echo json_encode([
-                    'success'  => false,
-                    'deferred' => true,
-                    'id'       => $msgId,
-                    'error'    => 'MEDIA_DOWNLOAD_FAILED',
+                    'success'   => false,
+                    'deferred'  => true,
+                    'stopQueue' => true,
+                    'id'        => $msgId,
+                    'error'     => 'MEDIA_DOWNLOAD_FAILED',
                     'reason'   => (string)$mediaReason,
                     'attempt'  => $attempts,
                     'message'  => "رسانهٔ پست $msgId دانلود نشد ($mediaReason). پست منتشر نشد و last_msg_id جلو نرفت؛ در چرخهٔ بعد با لینک تازه دوباره تلاش می‌شود (تلاش $attempts از " . MEDIA_MAX_RETRY . ')',
@@ -620,16 +812,21 @@ if ($action === 'sync_single') {
     // «only» اختیاری: اگر داده شود، فقط همان مقصدها ارسال می‌شوند (برای
     // جبران شکست جزئی، بدون پست تکراری در بقیهٔ پلتفرم‌ها).
     $only = is_array($payload['only'] ?? null) ? (array)$payload['only'] : [];
-    $sent = dispatchToPlatforms($only, $text, $localFile, $mediaType, (string)$fileName);
+    $onlyNorm = normalizePlatformList($only);
+    $hasDeliverable = (trim($text) !== '') || ($localFile && file_exists($localFile));
+
+    if ($hasDeliverable) {
+        $sent = dispatchToPlatforms($onlyNorm, $text, $localFile, $mediaType, $fileName);
+    } else {
+        $sent = [];
+        foreach (['bale', 'rubika', 'soroush', 'igap'] as $p) {
+            $sent[$p] = ['ok' => null, 'info' => 'NO_CONTENT'];
+        }
+    }
 
     if ($localFile and file_exists($localFile)) {
         @unlink($localFile);
     }
-
-    setLastSeenId($db, EITAA_CHANNEL_ID,$msgId);
-
-    // پستی که منتشر شد (با یا بدون رسانه) دیگر در صف تعویق نمی‌ماند
-    clearMediaFail($db, $msgId);
 
     $mediaOk = true;
     $mediaInfo = 'none';
@@ -638,10 +835,35 @@ if ($action === 'sync_single') {
         $mediaInfo = $mediaOk ? 'downloaded' : ('DROPPED_AFTER_' . MEDIA_MAX_RETRY . '_TRIES:' . (string)$mediaReason);
     }
 
+    // اگر هیچ مقصدی واقعاً پیام را نپذیرفت، state جلو نرود و صف متوقف شود؛
+    // در غیر این صورت پردازش پست‌های بعدی باعث جا افتادن دائمی این پست می‌شود.
+    $delivered = deliveredPlatformCount($sent, $onlyNorm);
+    if ($hasDeliverable && $delivered === 0) {
+        echo json_encode([
+            'success'   => false,
+            'stopQueue' => true,
+            'id'        => $msgId,
+            'error'     => 'ALL_DESTINATIONS_FAILED',
+            'message'   => 'هیچ مقصدی ارسال را تأیید نکرد؛ last_msg_id جلو نرفت و صف باید متوقف شود تا پس از رفع خطا دوباره تلاش شود.',
+            'only'      => $onlyNorm,
+            'media'     => ['ok' => $mediaOk, 'info' => $mediaInfo],
+            'bale'      => ['ok' => $sent['bale']['ok'], 'info' => $sent['bale']['info']],
+            'rubika'    => ['ok' => $sent['rubika']['ok'], 'info' => $sent['rubika']['info']],
+            'soroush'   => ['ok' => $sent['soroush']['ok'], 'info' => $sent['soroush']['info']],
+            'igap'      => ['ok' => $sent['igap']['ok'], 'info' => $sent['igap']['info']],
+        ], JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+
+    advanceLastSeenId($db, EITAA_CHANNEL_ID, $msgId);
+
+    // پستی که منتشر شد (یا بعد از سقف تلاش، بدون محتوای قابل ارسال رد شد) دیگر در صف تعویق نمی‌ماند
+    clearMediaFail($db, $msgId);
+
     echo json_encode([
         'success' => true,
         'id'      => $msgId,
-        'only'    => $only === [] ? ['bale', 'rubika', 'soroush', 'igap'] : array_values($only),
+        'only'    => $onlyNorm,
         'media'   => ['ok' => $mediaOk, 'info' => $mediaInfo],
         'bale'    => ['ok' => $sent['bale']['ok'], 'info' => $sent['bale']['info']],
         'rubika'  => ['ok' => $sent['rubika']['ok'], 'info' => $sent['rubika']['info']],
@@ -655,7 +877,7 @@ if ($action === 'sync_single') {
 if ($action === 'send_report') {
     header('Content-Type: application/json; charset=utf-8');
     $payload = json_decode(readRequestBody(), true);
-    $reportItems =$payload['report'] ?? [];
+    $reportItems = is_array($payload['report'] ?? null) ? $payload['report'] : [];
 
     $reportSent  = false;
     $reportError = '';
@@ -755,7 +977,7 @@ if ($action === 'resend') {
         $text     = (string)($m['text'] ?? '');
         $mediaUrl = $m['mediaUrl'] ?? null;
         $mediaType = $m['mediaType'] ?? null;
-        $fileName = (string)($m['fileName'] ?? 'file.bin');
+        $fileName = safeFileName((string)($m['fileName'] ?? 'file.bin'), 'file.bin');
 
         $localFile = null;
         $mediaReason = null;
@@ -788,7 +1010,7 @@ if ($action === 'resend') {
     }
 
     if ($advance && $maxId > 0) {
-        setLastSeenId($db, EITAA_CHANNEL_ID, $maxId);
+        advanceLastSeenId($db, EITAA_CHANNEL_ID, $maxId);
     }
 
     echo json_encode([
@@ -841,8 +1063,9 @@ if ($action === 'rewind') {
             .layout { grid-template-columns: minmax(0, 1fr); }
             .side-col { position: static; }
         }
-        .header { display: flex; justify-content: space-between; align-items: center; background: #1e293b; padding: 20px; border-radius: 12px; border: 1px solid #334155; margin-bottom: 20px; }
+        .header { display: flex; justify-content: space-between; align-items: center; background: #1e293b; padding: 20px; border-radius: 12px; border: 1px solid #334155; margin-bottom: 20px; gap: 14px; }
         .header h1 { font-size: 1.25rem; margin: 0; color: #38bdf8; }
+        .header-actions { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
         .btn { background: #2563eb; color: #fff; border: none; padding: 10px 20px; border-radius: 8px; font-weight: bold; cursor: pointer; transition: 0.2s; font-size: 0.95rem; }
         .btn:hover { background: #1d4ed8; }
         .btn:disabled { background: #475569; cursor: not-allowed; }
@@ -939,7 +1162,10 @@ if ($action === 'rewind') {
             <h1>همگام‌سازی خودکار کانال‌ها</h1>
             <small style="color: #94a3b8;">پلتفرم‌ها: بله، روبیکا، سروش‌پلاس، آیگپ</small>
         </div>
-        <button id="startBtn" class="btn" onclick="startSync()">بررسی و شروع همگام‌سازی</button>
+        <div class="header-actions">
+            <button id="queueBtn" class="btn" style="background:#0d9488" onclick="startBackgroundSync()">افزودن به صف پس‌زمینه</button>
+            <button id="startBtn" class="btn" onclick="startSync()">اجرای دستی (مرحله‌ای)</button>
+        </div>
     </div>
 
     <div class="layout">
@@ -1023,8 +1249,15 @@ if ($action === 'rewind') {
 </div>
 
 <script>
-    const SECURITY_KEY = '<?= SECURITY_KEY ?>';
-    const MEDIA_MAX_RETRY_TXT = '<?= MEDIA_MAX_RETRY ?>';
+    const SECURITY_KEY = <?= json_encode(SECURITY_KEY, JSON_UNESCAPED_UNICODE | JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_AMP | JSON_HEX_QUOT) ?>;
+    const MEDIA_MAX_RETRY_TXT = <?= json_encode((string)MEDIA_MAX_RETRY, JSON_UNESCAPED_UNICODE) ?>;
+    const apiUrl = (action, params = {}) => {
+        const q = new URLSearchParams({ action, key: SECURITY_KEY, ...params });
+        return `sync_manual.php?${q.toString()}`;
+    };
+    const escapeHtml = (s) => String(s ?? '').replace(/[&<>"']/g, ch => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;'
+    }[ch]));
     let pendingMessages = [];
     let reportList = [];
 
@@ -1037,6 +1270,61 @@ if ($action === 'rewind') {
         c.scrollTop = c.scrollHeight;
     }
 
+    let queuePollTimer = null;
+    async function startBackgroundSync() {
+        const btn = document.getElementById('queueBtn');
+        btn.disabled = true;
+        document.getElementById('statusText').innerText = 'در حال افزودن کارها به صف پس‌زمینه...';
+        log('شروع صف پس‌زمینه: cron_sync.sh در سرور اجرا می‌شود و لازم نیست مرورگر منتظر بماند.', '#7dd3fc');
+        try {
+            const res = await fetch(apiUrl('background_sync'), { method: 'POST' });
+            const data = await res.json();
+            if (!data.success) {
+                log('❌ صف پس‌زمینه شروع نشد: ' + (data.message || data.error || 'خطای نامشخص'), '#f87171');
+                btn.disabled = false;
+                return;
+            }
+            log((data.alreadyRunning ? 'صف از قبل در حال اجراست' : 'صف شروع شد') + ` — PID: ${data.pid || '؟'}`, '#4ade80');
+            document.getElementById('statusText').innerText = 'صف پس‌زمینه فعال است؛ وضعیت از لاگ خوانده می‌شود.';
+            pollQueueStatus(true);
+        } catch (e) {
+            log('❌ خطای شروع صف پس‌زمینه: ' + e.message, '#f87171');
+            btn.disabled = false;
+        }
+    }
+
+    async function pollQueueStatus(force = false) {
+        if (queuePollTimer && !force) return;
+        const tick = async () => {
+            try {
+                const res = await fetch(apiUrl('queue_status'));
+                const data = await res.json();
+                if (!data.success) return false;
+                const lines = String(data.log || data.launcherLog || '').trim().split(/\n/).filter(Boolean).slice(-5);
+                if (lines.length) {
+                    document.getElementById('statusText').innerText = data.running ? 'صف پس‌زمینه در حال پردازش است...' : 'صف پس‌زمینه متوقف/تمام شد.';
+                    document.getElementById('percentText').innerText = data.running ? 'در صف' : 'پایان';
+                    const last = lines[lines.length - 1];
+                    if (window.__lastQueueLine !== last) {
+                        window.__lastQueueLine = last;
+                        log('صف: ' + last, data.running ? '#7dd3fc' : '#4ade80');
+                    }
+                }
+                if (!data.running) {
+                    clearInterval(queuePollTimer);
+                    queuePollTimer = null;
+                    document.getElementById('queueBtn').disabled = false;
+                }
+                return !!data.running;
+            } catch (e) {
+                log('خواندن وضعیت صف ناموفق بود: ' + e.message, '#fbbf24');
+                return false;
+            }
+        };
+        const running = await tick();
+        if (running && !queuePollTimer) queuePollTimer = setInterval(tick, 5000);
+    }
+
     async function startSync() {
         const btn = document.getElementById('startBtn');
         btn.disabled = true;
@@ -1045,7 +1333,7 @@ if ($action === 'rewind') {
         log('در حال دریافت لیست پیام‌های جدید از کانال ایتا...');
 
         try {
-            const res = await fetch(`sync_manual.php?action=get_pending&key=${SECURITY_KEY}`);
+            const res = await fetch(apiUrl('get_pending'));
             const data = await res.json();
 
             if (!data.success) {
@@ -1086,8 +1374,8 @@ if ($action === 'rewind') {
             div.id = `card-${m.id}`;
             div.innerHTML = `
                 <div class="card-info">
-                    <span class="card-id">پست ID ${m.id} (${m.mediaType ? m.mediaType : 'متن'})</span>
-                    <span class="card-desc">${desc}</span>
+                    <span class="card-id">پست ID ${escapeHtml(m.id)} (${escapeHtml(m.mediaType ? m.mediaType : 'متن')})</span>
+                    <span class="card-desc">${escapeHtml(desc)}</span>
                 </div>
                 <div class="badges">
                     <span class="badge" id="bale-${m.id}">بله</span>
@@ -1103,6 +1391,7 @@ if ($action === 'rewind') {
     async function processQueue() {
         const total = pendingMessages.length;
         reportList = [];
+        let stoppedEarly = false;
 
         for (let i = 0; i < total; i++) {
             const m = pendingMessages[i];
@@ -1123,7 +1412,7 @@ if ($action === 'rewind') {
             log(`شروع ارسال پست ID ${m.id} به هر ۴ پلتفرم...`, '#e2e8f0');
 
             try {
-                const res = await fetch(`sync_manual.php?action=sync_single&key=${SECURITY_KEY}`, {
+                const res = await fetch(apiUrl('sync_single'), {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(m)
@@ -1138,8 +1427,10 @@ if ($action === 'rewind') {
                     });
                     log(`⏸ پست ${m.id} منتشر نشد: ${result.message || result.reason || 'رسانه دانلود نشد'}`, '#fbbf24');
                     reportList.push(`⏸ پست ${m.id}: رسانه دانلود نشد (${result.reason || '?'}) — منتشر نشد؛ تلاش ${result.attempt || 1}/${MEDIA_MAX_RETRY_TXT}`);
+                    document.getElementById('statusText').innerText = 'توقف صف: یک پست برای دریافت لینک تازهٔ رسانه به چرخهٔ بعد موکول شد.';
+                    stoppedEarly = true;
                     card.classList.remove('active');
-                    continue;
+                    break;
                 }
 
                 if (result.success === false) {
@@ -1147,8 +1438,13 @@ if ($action === 'rewind') {
                         const b = document.getElementById(`${p}-${m.id}`);
                         if (b) { b.className = 'badge fail'; b.innerText = 'خطا'; }
                     });
-                    log(`❌ پست ${m.id}: ${result.error || 'خطای نامشخص'}`, '#f87171');
+                    log(`❌ پست ${m.id}: ${result.message || result.error || 'خطای نامشخص'}`, '#f87171');
                     card.classList.remove('active');
+                    if (result.stopQueue) {
+                        document.getElementById('statusText').innerText = 'توقف صف: خطا را رفع کنید تا پست‌های بعدی باعث جاافتادن این پست نشوند.';
+                        stoppedEarly = true;
+                        break;
+                    }
                     continue;
                 }
 
@@ -1161,13 +1457,13 @@ if ($action === 'rewind') {
                 const mediaState = result.media
                     ? (result.media.ok ? '✅' : `❌ ${result.media.info}`)
                     : (m.mediaUrl ? '⚠️ نامشخص' : '—');
-                const mark = r => (r?.ok === true ? '✅' : (r?.ok === null || /\bSKIPPED\b/.test(r?.info || '') ? '—' : '❌'));
+                const mark = r => (r?.ok === true ? '✅' : (r?.ok === null || /\b(SKIPPED|SKIP|NO_CONTENT)\b/.test(r?.info || '') ? '—' : '❌'));
                 reportList.push(`🔹 پست ${m.id} [${mediaDesc}]:\n  بله: ${mark(result.bale)} | روبیکا: ${mark(result.rubika)}\n  سروش: ${mark(result.soroush)} | آیگپ: ${mark(result.igap)}\n  رسانه: ${mediaState}`);
 
                 const sInfo = result.soroush?.info || '';
                 const gInfo = result.igap?.info || '';
                 const word = (ok, info) => (ok === true ? 'OK'
-                    : (ok === null || /\bSKIPPED\b/.test(info) ? 'رد شد'
+                    : (ok === null || /\b(SKIPPED|SKIP|NO_CONTENT)\b/.test(info) ? 'رد شد'
                     : (/UNVERIFIED/i.test(info) ? 'تأیید نشد' : 'خطا')));
                 log(`پست ID ${m.id} پردازش شد. (سروش: ${word(result.soroush?.ok, sInfo)} | آیگپ: ${word(result.igap?.ok, gInfo)})`);
                 if (result.media && result.media.ok === false) {
@@ -1188,6 +1484,9 @@ if ($action === 'rewind') {
                     b.className = 'badge fail';
                     b.innerText = 'خطا';
                 });
+                stoppedEarly = true;
+                card.classList.remove('active');
+                break;
             }
 
             card.classList.remove('active');
@@ -1195,16 +1494,23 @@ if ($action === 'rewind') {
 
         document.getElementById('progressFill').style.width = '100%';
         document.getElementById('percentText').innerText = '100%';
-        document.getElementById('statusText').innerText = 'تمام پیام‌ها با موفقیت توزیع شدند.';
-        log('همه پیام‌ها پردازش شدند. ارسال گزارش مدیریتی به بله...', '#38bdf8');
+        document.getElementById('statusText').innerText = stoppedEarly
+            ? 'عملیات متوقف شد؛ پس از رفع مورد قرمز دوباره اجرا کنید.'
+            : 'تمام پیام‌های قابل پردازش توزیع شدند.';
+        log(stoppedEarly ? 'صف برای جلوگیری از جاافتادن پست‌های بعدی متوقف شد. ارسال گزارش مدیریتی...' : 'همه پیام‌ها پردازش شدند. ارسال گزارش مدیریتی به بله...', '#38bdf8');
 
-        await fetch(`sync_manual.php?action=send_report&key=${SECURITY_KEY}`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ report: reportList })
-        });
-
-        log('گزارش نهایی ارسال شد. عملیات کامل است.', '#4ade80');
+        try {
+            const reportRes = await fetch(apiUrl('send_report'), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ report: reportList })
+            });
+            const reportJson = await reportRes.json().catch(() => ({}));
+            if (reportJson.success) log('گزارش نهایی ارسال شد.', '#4ade80');
+            else log('ارسال گزارش نهایی ناموفق بود: ' + (reportJson.error || reportRes.status), '#fbbf24');
+        } catch (e) {
+            log('ارسال گزارش نهایی ناموفق بود: ' + e.message, '#fbbf24');
+        }
         document.getElementById('startBtn').disabled = false;
     }
 
@@ -1216,7 +1522,7 @@ if ($action === 'rewind') {
         const detail = typeof info === 'string' ? info : '';
         if (detail) el.title = detail;
         const unverified = /UNVERIFIED|SEND_NOT_VERIFIED/i.test(detail);
-        if (isOk === null || /\bSKIPPED\b/.test(detail)) {
+        if (isOk === null || /\b(SKIPPED|SKIP|NO_CONTENT)\b/.test(detail)) {
             el.className = 'badge';
             el.style.background = '#334155';
             el.innerText = `${name} —`;
@@ -1262,7 +1568,7 @@ if ($action === 'rewind') {
         log(`پنل اجباری: خواندن ${faNum(limit)} پست آخر کانال ایتا…`, '#7dd3fc');
 
         try {
-            const res = await fetch(`sync_manual.php?action=list_posts&key=${SECURITY_KEY}&limit=${limit}`);
+            const res = await fetch(apiUrl('list_posts', { limit }));
             const data = await res.json();
             if (!data.success) {
                 const msg = data.message || data.error || 'خطای نامشخص';
@@ -1306,12 +1612,15 @@ if ($action === 'rewind') {
             const stateTag = p.sentBefore
                 ? '<span class="tag old">قبلاً رفته</span>'
                 : '<span class="tag new">نرفته</span>';
+            const safeId = Number.parseInt(p.id, 10) || 0;
+            const safeText = escapeHtml(p.text || '');
+            const safePreview = escapeHtml(p.preview || '(بدون متن)');
             row.innerHTML =
-                `<input type="checkbox" data-id="${p.id}" ${p.sentBefore ? '' : 'checked'}>` +
+                `<input type="checkbox" data-id="${safeId}" ${p.sentBefore ? '' : 'checked'}>` +
                 `<div class="post-main">` +
-                    `<div class="post-top"><span class="post-id">#${faNum(p.id)}</span><span>${stateTag} ${mediaTag}</span></div>` +
-                    `<div class="post-txt" title="${(p.text || '').replace(/"/g, '&quot;')}">${p.preview || '(بدون متن)'}</div>` +
-                    `<div class="dots">` + PLATFORMS.map(x => `<span class="dot skip" data-dot="${x.id}" title="${x.fa}">${x.dot}</span>`).join('') + `</div>` +
+                    `<div class="post-top"><span class="post-id">#${faNum(safeId)}</span><span>${stateTag} ${mediaTag}</span></div>` +
+                    `<div class="post-txt" title="${safeText}">${safePreview}</div>` +
+                    `<div class="dots">` + PLATFORMS.map(x => `<span class="dot skip" data-dot="${x.id}" title="${escapeHtml(x.fa)}">${escapeHtml(x.dot)}</span>`).join('') + `</div>` +
                 `</div>`;
             row.querySelector('input').addEventListener('change', () => { row.classList.toggle('sel', row.querySelector('input').checked); updateSummary(); });
             row.classList.toggle('sel', row.querySelector('input').checked);
@@ -1405,7 +1714,7 @@ if ($action === 'rewind') {
             PLATFORMS.forEach(p => setDot(id, p.id, only.includes(p.id) ? 'wait' : 'skip', p.fa));
 
             try {
-                const res = await fetch(`sync_manual.php?action=resend&key=${SECURITY_KEY}`, {
+                const res = await fetch(apiUrl('resend'), {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ ids: [id], only, advance: advance && isLast, no_media: !withMedia }),
@@ -1415,7 +1724,7 @@ if ($action === 'rewind') {
                     failCount++;
                     PLATFORMS.forEach(p => setDot(id, p.id, 'bad', data.message || data.error || ''));
                     const m = data.message || data.error || 'خطای نامشخص';
-                    $('forceResult').insertAdjacentHTML('beforeend', `<div class="res-line bad">#${faNum(id)} — ${m}</div>`);
+                    $('forceResult').insertAdjacentHTML('beforeend', `<div class="res-line bad">#${faNum(id)} — ${escapeHtml(m)}</div>`);
                     log(`پست ${faNum(id)}: ❌ ${m}`, '#f87171');
                     continue;
                 }
@@ -1441,12 +1750,12 @@ if ($action === 'rewind') {
                     : (media.ok ? ' | رسانه ✓' : ` | رسانه ✕ (${media.info})`);
                 if (lineOk) okCount++; else failCount++;
                 $('forceResult').insertAdjacentHTML('beforeend',
-                    `<div class="res-line ${lineOk ? 'ok' : 'bad'}">#${faNum(id)} — ${parts.join(' ')}${mediaTxt}</div>`);
+                    `<div class="res-line ${lineOk ? 'ok' : 'bad'}">#${faNum(id)} — ${escapeHtml(parts.join(' '))}${escapeHtml(mediaTxt)}</div>`);
                 log(`پست ${faNum(id)}: ${parts.join(' ')}${mediaTxt}`, lineOk ? '#4ade80' : '#fca5a5');
             } catch (e) {
                 failCount++;
                 PLATFORMS.forEach(p => setDot(id, p.id, 'bad', e.message));
-                $('forceResult').insertAdjacentHTML('beforeend', `<div class="res-line bad">#${faNum(id)} — خطای شبکه: ${e.message}</div>`);
+                $('forceResult').insertAdjacentHTML('beforeend', `<div class="res-line bad">#${faNum(id)} — خطای شبکه: ${escapeHtml(e.message)}</div>`);
                 log(`پست ${faNum(id)}: ❌ ${e.message}`, '#f87171');
             }
 
@@ -1466,6 +1775,7 @@ if ($action === 'rewind') {
     // همگام‌سازی اولیهٔ UI پنل
     ['optMedia', 'optAdvance', 'optGap'].forEach(id => { const el = $(id); if (el) el.addEventListener('change', updateSummary); });
     syncPlatformUI();
+    pollQueueStatus(true);
 </script>
 
 </body>

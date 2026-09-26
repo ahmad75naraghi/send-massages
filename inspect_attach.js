@@ -1,38 +1,41 @@
+'use strict';
+/** inspect_attach.js — بازرسی منوی ضمیمهٔ آی‌گپ با مسیرهای پیکربندی‌شده */
+
+const path = require('path');
 const { chromium } = require('playwright');
+const C = require(path.join(__dirname, 'lib', 'pw_common.js'));
 
 (async () => {
-    const browser = await chromium.launchPersistentContext('/home/file/public_html/s/igap_profile', {
-        executablePath: '/usr/bin/chromium-browser',
-        args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
-        headless: true,
-        viewport: { width: 1440, height: 900 }
-    });
+    const profile = C.env('IGAP_PROFILE_DIR', path.join(C.APP_DIR, 'igap_profile'));
+    const name = C.env('IGAP_CHANNEL_NAME', 'شمیم آشنا').replace(/["\\]/g, '');
+    const itemId = C.env('IGAP_ITEM_ID', '16200343869985976').replace(/["\\]/g, '');
+    const log = new C.RunLog('inspect_attach');
+    let browser = null;
 
     try {
-        const page = browser.pages()[0] || await browser.newPage();
-        await page.goto('https://web.igap.net', { waitUntil: 'domcontentloaded' });
-        await page.waitForTimeout(6000);
+        const launched = await C.launchBrowser({ chromium }, profile, { width: 1440, height: 900 }, log);
+        browser = launched.browser;
+        const page = launched.page;
 
-        // ۱. کلیک روی کانال
-        const channel = page.locator('span:has-text("شمیم آشنا"), div[data-list-item-id="16200343869985976"]').first();
+        await page.goto('https://web.igap.net', { waitUntil: 'domcontentloaded', timeout: 60000 });
+        await C.delay(6000);
+
+        const channel = page.locator(`span:has-text("${name}"), div[data-list-item-id="${itemId}"]`).first();
         await channel.waitFor({ state: 'visible', timeout: 15000 });
         await channel.click({ force: true });
-        await page.waitForTimeout(3000);
+        await C.delay(3000);
 
-        // ۲. کلیک دقیق روی دکمه ضمیمه (ایندکس ۱۳)
         const attachBtn = page.locator('button:has(i.icon-ig-attachment-outline)').first();
         await attachBtn.waitFor({ state: 'visible', timeout: 10000 });
         await attachBtn.click({ force: true });
-        await page.waitForTimeout(2000);
+        await C.delay(2000);
 
-        // ذخیره اسکرین‌شات از منوی بازشده
-        await page.screenshot({ path: '/home/file/public_html/s/igap_attach_menu.jpg' });
+        await C.safeScreenshot(page, 'igap_attach_menu.jpg', log);
 
-        // بررسی اینپوت‌های فایل جدید یا گزینه‌های منو
         const result = await page.evaluate(() => {
             const inputs = Array.from(document.querySelectorAll('input[type="file"]')).map(inp => ({
                 id: inp.id,
-                class: inp.className,
+                class: typeof inp.className === 'string' ? inp.className : '',
                 accept: inp.getAttribute('accept') || '',
                 outerHtml: inp.outerHTML
             }));
@@ -40,25 +43,26 @@ const { chromium } = require('playwright');
             const menuOptions = Array.from(document.querySelectorAll('button, div, li, span'))
                 .filter(el => {
                     const t = el.innerText ? el.innerText.trim() : '';
-                    return el.children.length <= 2 && t.length > 0 && t.length < 25;
+                    return el.children.length <= 2 && t.length > 0 && t.length < 40;
                 })
-                .slice(-15)
+                .slice(-25)
                 .map(el => ({
                     tag: el.tagName,
-                    class: el.className,
+                    class: typeof el.className === 'string' ? el.className : '',
                     text: el.innerText.trim(),
-                    html: el.innerHTML.slice(0, 100)
+                    html: el.innerHTML.slice(0, 140)
                 }));
 
             return { inputs, menuOptions };
         });
 
-        console.log('=== ATTACH MENU INSPECTION ===');
-        console.log(JSON.stringify(result, null, 2));
-
+        C.emit({ status: 'OK', screenshot: path.join(C.APP_DIR, 'igap_attach_menu.jpg'), result });
     } catch (err) {
-        console.error(err);
+        log.step('FATAL: ' + (err && err.stack ? err.stack : String(err)));
+        C.emit({ status: 'ERROR', code: 'RUNTIME', error: C.RunLog.brief(err && err.message, 300), log: log.file });
+        process.exitCode = 1;
     } finally {
-        await browser.close();
+        await C.closeQuietly(browser, log);
+        C.cleanSingletons(profile, log);
     }
 })();

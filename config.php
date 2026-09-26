@@ -65,11 +65,10 @@ function loadDotEnv(?string $path = null): string {
         }
         $key = trim(substr($line, 0, $pos));
         $val = trim(substr($line, $pos + 1));
+        // پشتیبانی واقعی از قالب `export KEY=value`: ابتدا export حذف می‌شود، سپس نام کلید اعتبارسنجی می‌شود.
+        $key = preg_replace('/^export\s+/i', '', $key) ?? $key;
         if ($key === '' || preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/', $key) !== 1) {
             continue;
-        }
-        if (str_starts_with($key, 'export ')) {
-            $key = trim(substr($key, 7));
         }
 
         // کامنت انتهایی فقط وقتی که مقدار کوتیشن ندارد

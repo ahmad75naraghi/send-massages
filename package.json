@@ -1,14 +1,19 @@
 {
-  "name": "s",
+  "name": "send-massages",
   "version": "1.0.0",
-  "main": "index.js",
+  "description": "Content syndication pipeline from Eitaa to Bale, Rubika, Soroush+ and iGap",
+  "main": "send_soroush.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "check": "node --check send_soroush.js && node --check send_igap.js && node --check login_soroush.js && node --check login_igap.js && node --check restore_session.js && node --check dump_dom.js && node --check inspect_igap.js && node --check inspect_attach.js && node --check lib/pw_common.js",
+    "test": "npm run check"
   },
-  "keywords": [],
+  "keywords": [
+    "eitaa",
+    "sync",
+    "playwright"
+  ],
   "author": "",
   "license": "ISC",
-  "description": "",
   "dependencies": {
     "playwright": "^1.63.0"
   }

@@ -25,7 +25,7 @@ const path = require('path');
 const { chromium } = require('playwright');
 const C = require(path.join(__dirname, 'lib', 'pw_common.js'));
 
-const PROFILE_DIR = path.join(C.APP_DIR, 'soroush_profile');
+const PROFILE_DIR = C.env('SOROUSH_PROFILE_DIR', path.join(C.APP_DIR, 'soroush_profile'));
 const VIEWPORT = { width: 1280, height: 720 };
 
 const LOGIN_MARKERS = ['#sign-in-phone-number', '#sign-in-phone-code', 'button:has-text("دریافت کد")'];

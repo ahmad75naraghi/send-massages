@@ -15,7 +15,7 @@ const readline = require('readline').createInterface({ input: process.stdin, out
 const { chromium } = require('playwright');
 const C = require(path.join(__dirname, 'lib', 'pw_common.js'));
 
-const PROFILE_DIR = path.join(C.APP_DIR, 'igap_profile');
+const PROFILE_DIR = C.env('IGAP_PROFILE_DIR', path.join(C.APP_DIR, 'igap_profile'));
 const VIEWPORT = { width: 1440, height: 900 };
 
 const question = (q) => new Promise(r => readline.question(q, r));

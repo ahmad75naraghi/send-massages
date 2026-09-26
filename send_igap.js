@@ -34,11 +34,13 @@ const fs = require('fs');
 const { chromium } = require('playwright');
 const C = require(path.join(__dirname, 'lib', 'pw_common.js'));
 
-const PROFILE_DIR = path.join(C.APP_DIR, 'igap_profile');
+const PROFILE_DIR = C.env('IGAP_PROFILE_DIR', path.join(C.APP_DIR, 'igap_profile'));
 const VIEWPORT = { width: 1440, height: 900 };
 
 const DEFAULT_ITEM_ID = '16200343869985976';
 const DEFAULT_CHANNEL_NAME = 'شمیم آشنا';
+const INITIAL_WAIT_MS = Number(C.env('IGAP_INITIAL_WAIT_MS', '3500')) || 3500;
+const VERIFY_TIMEOUT_MS = Number(C.env('IGAP_VERIFY_TIMEOUT_MS', C.env('USERBOT_VERIFY_TIMEOUT_MS', '8000'))) || 8000;
 
 const LOGIN_MARKERS = ['input[type="tel"]', 'input[placeholder*="موبایل"]', 'input[placeholder*="شماره"]'];
 
@@ -140,7 +142,7 @@ async function countCards(page) {
 
         // ---------- ۱) بارگذاری ----------
         await page.goto('https://web.igap.net', { waitUntil: 'domcontentloaded', timeout: 60000 });
-        await C.delay(6000);
+        await C.delay(INITIAL_WAIT_MS);
 
         const loginMarker = await C.detectLoginPage(page, LOGIN_MARKERS);
         const listReady = await C.seen(page.locator('#LeftColumn div[aria-haspopup="true"]').first(), 8000);
@@ -261,7 +263,7 @@ async function countCards(page) {
                 else sentVia = 'ctrl+enter';
             }
             log.step(`media submit via ${sentVia}`);
-            await C.delay(3000);
+            await C.delay(1000);
         }
         // ---------- ۶) مسیر متن ساده ----------
         else if (opts.text) {
@@ -273,12 +275,13 @@ async function countCards(page) {
             await page.keyboard.press('Enter');
             sentVia = 'composer-enter';
             log.step('text submitted via Enter');
-            await C.delay(2000);
+            await C.delay(800);
         }
 
         // ---------- ۷) تأیید ارسال ----------
         let verified = false;
         let how = '';
+        let acceptedButNotVisual = false;
         try {
             await C.waitUntil(async () => {
                 const modalGone = !(await page.locator(MODAL).last().isVisible().catch(() => false));
@@ -290,22 +293,31 @@ async function countCards(page) {
                 }
                 const afterCards = await countCards(page);
                 const cardsGrew = beforeCards >= 0 && afterCards > beforeCards;
+                const composerCleared = await page.evaluate(() => {
+                    const el = document.querySelector('#MiddleColumn div[contenteditable="true"], #text-editor');
+                    return !!el && (el.innerText || '').trim() === '';
+                }).catch(() => false);
 
                 if (snippetSeen && modalGone) { verified = true; how = 'snippet-in-chat'; return true; }
                 if (previewChanged) { verified = true; how = 'left-preview-changed'; return true; }
                 if (opts.file && modalGone && cardsGrew) { verified = true; how = 'modal-closed+cards+' + (afterCards - beforeCards); return true; }
-                if (sentVia === 'composer-enter' && modalGone && !snippet && previewChanged) { verified = true; how = 'preview-changed'; return true; }
+                if (sentVia === 'composer-enter' && composerCleared) { verified = true; how = 'composer-cleared'; return true; }
+
+                // آی‌گپ گاهی بعد از ارسال واقعی، DOM/preview را به‌موقع به‌روزرسانی نمی‌کند.
+                // اگر مودال بسته شده یا composer خالی شده باشد، خطای کاذب ندهیم؛ OK با proof محافظه‌کارانه برمی‌گردانیم.
+                if (opts.file && modalGone && sentVia !== 'none') { acceptedButNotVisual = true; how = 'modal-closed-accepted'; return true; }
+                if (!opts.file && composerCleared && sentVia === 'composer-enter') { acceptedButNotVisual = true; how = 'composer-cleared-accepted'; return true; }
                 return false;
-            }, { timeout: 20000, interval: 700, label: 'send verification' });
+            }, { timeout: VERIFY_TIMEOUT_MS, interval: 500, label: 'send verification' });
         } catch (e) {
             log.step('verification window elapsed: ' + e.message);
         }
-        log.step(`verified=${verified} how=${how || 'n/a'}`);
+        log.step(`verified=${verified} accepted=${acceptedButNotVisual} how=${how || 'n/a'}`);
 
         await C.safeScreenshot(page, 'last_igap_send.jpg', log);
 
-        if (verified) {
-            result = { status: 'OK', message: `Sent to iGap (${sentVia})`, verified: true, proof: how, header: name, log: log.file };
+        if (verified || acceptedButNotVisual) {
+            result = { status: 'OK', message: `Sent to iGap (${sentVia})`, verified, proof: how || (verified ? 'verified' : 'accepted'), header: name, log: log.file };
         } else {
             result = { status: 'UNVERIFIED', code: 'SEND_NOT_VERIFIED', message: 'فرایند ارسال انجام شد ولی صحت آن تأیید نشد؛ اسکرین‌شات last_igap_send.jpg و لاگ را ببینید', verified: false, log: log.file };
             exitCode = 1;

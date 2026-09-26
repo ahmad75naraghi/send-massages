@@ -9,6 +9,7 @@
  *    ACTION=get_pending php cli_run.php
  *    ACTION=sync_single SYNC_BODY_FILE=/tmp/body.json php cli_run.php
  *    ACTION=send_report SYNC_BODY_FILE=/tmp/report.json php cli_run.php
+ *    ACTION=queue_status php cli_run.php
  */
 declare(strict_types=1);
 

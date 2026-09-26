@@ -51,11 +51,11 @@ for ($i = $messageNodes->length - 1; $i >= 0; $i--) {
     
     if ($photoNode) {
         $style = $photoNode->getAttribute('style');
-        if (preg_match('/url\(\'?(.*?)\'?\)/', $style, $matches)) {
+        if (preg_match("~url\(\s*['\"]?([^'\")]+)['\"]?\s*\)~i", $style, $matches)) {
             $textNode = $xpath->query(".//div[contains(@class, 'etme_widget_message_text')]", $node)->item(0);
             $targetPost = [
                 'text'      => $textNode ? trim($textNode->textContent) : '',
-                'media_url' => 'https://eitaa.com' . $matches[1]
+                'media_url' => str_starts_with($matches[1], 'http') ? $matches[1] : 'https://eitaa.com' . $matches[1]
             ];
             break;
         }
@@ -105,7 +105,8 @@ if (!$downloadSuccess || !in_array($httpCode, [200, 206], true) || $fileSize < 1
 }
 
 // 3. ارسال مستقیم به بله (Multipart / SendPhoto)
-$baleApiUrl = "https://tapi.bale.ai/bot" . BALE_BOT_TOKEN . "/sendPhoto";
+$cleanBaleToken = preg_replace('/^bot/i', '', trim(BALE_BOT_TOKEN));
+$baleApiUrl = "https://tapi.bale.ai/bot" . $cleanBaleToken . "/sendPhoto";
 
 // محدودیت کپشن در پلتفرم بله (حداکثر 1024 کاراکتر)
 $caption = mb_substr($targetPost['text'], 0, 1000);

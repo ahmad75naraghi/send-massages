@@ -32,7 +32,10 @@ dotenv_read() {
     # حذف فاصله‌های ابتدایی
     line="${line#"${line%%[![:space:]]*}"}"
     [[ -z "$line" || "$line" == '#'* || "$line" == ';'* ]] && continue
-    line="${line#export }"
+    if [[ "$line" =~ ^export[[:space:]]+ ]]; then
+      line="${line#export}"
+      line="${line#"${line%%[![:space:]]*}"}"
+    fi
     [[ "$line" != *=* ]] && continue
     k="${line%%=*}"
     v="${line#*=}"
@@ -59,7 +62,10 @@ load_dotenv() {
     line="${line%$'\r'}"
     line="${line#"${line%%[![:space:]]*}"}"
     [[ -z "$line" || "$line" == '#'* || "$line" == ';'* ]] && continue
-    line="${line#export }"
+    if [[ "$line" =~ ^export[[:space:]]+ ]]; then
+      line="${line#export}"
+      line="${line#"${line%%[![:space:]]*}"}"
+    fi
     [[ "$line" != *=* ]] && continue
     k="${line%%=*}"
     k="${k%"${k##*[![:space:]]}"}"
