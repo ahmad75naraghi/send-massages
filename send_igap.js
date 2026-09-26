@@ -67,6 +67,23 @@ const MODAL_SEND = [
     `${MODAL} button.btn-primary`,
 ];
 
+async function firstEnabled(page, selectors, { timeout = 20000, label = 'button' } = {}) {
+    const deadline = Date.now() + timeout;
+    let sawDisabled = false;
+    do {
+        for (const sel of selectors) {
+            const loc = page.locator(sel).last();
+            try {
+                if (!(await loc.isVisible())) continue;
+                if (await loc.isEnabled().catch(() => true)) return { locator: loc, selector: sel };
+                sawDisabled = true;
+            } catch (e) { /* try next selector */ }
+        }
+        await C.delay(350);
+    } while (Date.now() < deadline);
+    return sawDisabled ? { disabled: true, selector: label } : null;
+}
+
 async function clickChannel(page, locator, name, log, label) {
     try {
         await locator.first().waitFor({ state: 'visible', timeout: 8000 });
@@ -251,11 +268,12 @@ async function countCards(page) {
             }
 
             // ---------- ۵) ارسال: فقط از داخل مودال ----------
-            const sendBtn = await C.firstVisible(page, MODAL_SEND, { timeout: 8000, label: 'modal send' });
-            if (sendBtn) {
+            const sendBtn = await firstEnabled(page, MODAL_SEND, { timeout: 25000, label: 'modal send' });
+            if (sendBtn && !sendBtn.disabled) {
                 await sendBtn.locator.click({ force: true });
-                sentVia = 'modal-button';
+                sentVia = 'modal-button:' + sendBtn.selector;
             } else {
+                if (sendBtn && sendBtn.disabled) log.step('WARNING: modal send button stayed disabled; trying keyboard fallback');
                 await page.keyboard.press('Control+Enter');
                 await C.delay(800);
                 const modalStill = await page.locator(MODAL).last().isVisible().catch(() => false);
@@ -263,7 +281,7 @@ async function countCards(page) {
                 else sentVia = 'ctrl+enter';
             }
             log.step(`media submit via ${sentVia}`);
-            await C.delay(1000);
+            await C.delay(3000);
         }
         // ---------- ۶) مسیر متن ساده ----------
         else if (opts.text) {
@@ -308,7 +326,7 @@ async function countCards(page) {
                 if (opts.file && modalGone && sentVia !== 'none') { acceptedButNotVisual = true; how = 'modal-closed-accepted'; return true; }
                 if (!opts.file && composerCleared && sentVia === 'composer-enter') { acceptedButNotVisual = true; how = 'composer-cleared-accepted'; return true; }
                 return false;
-            }, { timeout: VERIFY_TIMEOUT_MS, interval: 500, label: 'send verification' });
+            }, { timeout: opts.file ? Math.max(VERIFY_TIMEOUT_MS, 20000) : VERIFY_TIMEOUT_MS, interval: 500, label: 'send verification' });
         } catch (e) {
             log.step('verification window elapsed: ' + e.message);
         }

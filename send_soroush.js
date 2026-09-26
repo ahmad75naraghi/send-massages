@@ -100,6 +100,23 @@ function strictCandidateStatus(brief, channel, expectedName) {
 }
 
 const COMPOSER = '.MiddleColumn .input-message-input, .MiddleColumn div[contenteditable="true"], #MiddleColumn .input-message-input, #MiddleColumn div[contenteditable="true"]';
+async function firstEnabled(page, selectors, { timeout = 20000, label = 'button' } = {}) {
+    const deadline = Date.now() + timeout;
+    let sawDisabled = false;
+    do {
+        for (const sel of selectors) {
+            const loc = page.locator(sel).last();
+            try {
+                if (!(await loc.isVisible())) continue;
+                if (await loc.isEnabled().catch(() => true)) return { locator: loc, selector: sel };
+                sawDisabled = true;
+            } catch (e) { /* try next selector */ }
+        }
+        await C.delay(350);
+    } while (Date.now() < deadline);
+    return sawDisabled ? { disabled: true, selector: label } : null;
+}
+
 function currentUrlHash(page) {
     try { return new URL(page.url()).hash || ''; } catch (e) { return ''; }
 }
@@ -504,17 +521,18 @@ async function readActivePreview(page) {
             }
 
             // ---------- ۶) ارسال مودال ----------
-            const sendBtn = await C.firstVisible(page, MODAL_SEND, { timeout: 6000, label: 'modal send' });
-            if (sendBtn) {
+            const sendBtn = await firstEnabled(page, MODAL_SEND, { timeout: 25000, label: 'modal send' });
+            if (sendBtn && !sendBtn.disabled) {
                 await sendBtn.locator.click({ force: true });
                 sentVia = 'modal-button:' + sendBtn.selector;
             } else {
+                if (sendBtn && sendBtn.disabled) log.step('WARNING: modal send button stayed disabled; trying keyboard fallback');
                 await page.keyboard.press('Control+Enter');
                 await C.delay(800);
                 sentVia = 'ctrl+enter';
             }
             log.step(`media submit via ${sentVia}`);
-            await C.delay(3000);
+            await C.delay(5000);
         }
         // ---------- ۷) مسیر متن ساده ----------
         else if (opts.text) {
@@ -530,8 +548,10 @@ async function readActivePreview(page) {
         // ---------- ۸) تأیید ارسال ----------
         let verified = false;
         let how = '';
+        let acceptedButNotVisual = false;
         try {
             await C.waitUntil(async () => {
+                const modalGone = !(await page.locator(MODAL).last().isVisible().catch(() => false));
                 const afterCount = await countMessages(page);
                 const afterPreview = await readActivePreview(page);
                 let snippetSeen = false;
@@ -549,17 +569,18 @@ async function readActivePreview(page) {
                 if (countGrew) { verified = true; how = 'message-count+' + (afterCount - beforeCount); return true; }
                 if (previewChanged) { verified = true; how = 'left-preview-changed'; return true; }
                 if (sentVia === 'composer-enter' && composerCleared) { verified = true; how = 'composer-cleared'; return true; }
+                if (opts.file && modalGone && sentVia !== 'none') { acceptedButNotVisual = true; how = 'modal-closed-accepted'; return true; }
                 return false;
-            }, { timeout: 20000, interval: 700, label: 'send verification' });
+            }, { timeout: opts.file ? 30000 : 20000, interval: 700, label: 'send verification' });
         } catch (e) {
             log.step('verification window elapsed without positive signal: ' + e.message);
         }
-        log.step(`verified=${verified} how=${how || 'n/a'}`);
+        log.step(`verified=${verified} accepted=${acceptedButNotVisual} how=${how || 'n/a'}`);
 
         await C.safeScreenshot(page, 'last_media_send.jpg', log);
 
-        if (verified) {
-            result = { status: 'OK', message: `Sent to Soroush (${sentVia})`, verified: true, proof: how, header, via: openedVia, log: log.file };
+        if (verified || acceptedButNotVisual) {
+            result = { status: 'OK', message: `Sent to Soroush (${sentVia})`, verified, proof: how || (verified ? 'verified' : 'accepted'), header, via: openedVia, log: log.file };
         } else {
             result = { status: 'UNVERIFIED', code: 'SEND_NOT_VERIFIED', message: 'فرایند ارسال انجام شد ولی صحت آن تأیید نشد؛ اسکرین‌شات last_media_send.jpg و لاگ را ببینید', verified: false, header, via: openedVia, log: log.file };
             exitCode = 1;
