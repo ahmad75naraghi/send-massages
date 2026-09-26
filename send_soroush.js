@@ -108,14 +108,14 @@ async function openChatBySearch(page, channel, log, strict = false) {
     }
     await result.click({ force: true });
     log.step(`openChatBySearch${strict ? '(strict)' : ''}: clicked result for "${query}"`);
-    return await C.seen(page.locator('.MiddleColumn .input-message-input, .MiddleColumn div[contenteditable="true"]').first(), 8000);
+    return await C.seen(page.locator('.MiddleColumn .input-message-input, .MiddleColumn div[contenteditable="true"]').first(), strict ? 15000 : 8000);
 }
 
 async function openChatByHash(page, browser, channel, log) {
     if (!channel) return false;
     await page.goto(`https://web.splus.ir/#@${channel}`, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    await C.delay(4000);
-    const ok = await C.seen(page.locator('.MiddleColumn .input-message-input, .MiddleColumn div[contenteditable="true"]').first(), 8000);
+    await C.delay(6000);
+    const ok = await C.seen(page.locator('.MiddleColumn .input-message-input, .MiddleColumn div[contenteditable="true"]').first(), 15000);
     log.step(`openChatByHash: #@${channel} → composer ${ok ? 'visible' : 'NOT visible'}`);
     return ok;
 }
@@ -218,6 +218,8 @@ async function readActivePreview(page) {
         // اگر strict-channel روشن باشد، فقط نتیجهٔ exact username قابل قبول است؛
         // این جلوی ارسال اشتباهی به کانال تست با نام نمایشی مشابه را می‌گیرد.
         if (opts.strictChannel) {
+            // hash route uses the exact username and avoids the duplicate display-name problem.
+            strategies.push(['by-hash-strict', () => openChatByHash(page, browser, opts.channel, log)]);
             strategies.push(['by-search-strict', () => openChatBySearch(page, opts.channel, log, true)]);
         } else {
             strategies.push(['by-hash', () => openChatByHash(page, browser, opts.channel, log)]);
