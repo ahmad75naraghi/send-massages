@@ -91,22 +91,65 @@ async function firstEnabled(page, selectors, { timeout = 20000, label = 'button'
 }
 
 
+async function igapUploadModalVisible(page) {
+    return page.evaluate(() => {
+        const visible = (el) => {
+            if (!el) return false;
+            const r = el.getBoundingClientRect();
+            const cs = getComputedStyle(el);
+            return r.width > 0 && r.height > 0 && r.bottom > 0 && r.right > 0 && cs.visibility !== 'hidden' && cs.display !== 'none';
+        };
+        const hasTitle = Array.from(document.querySelectorAll('body *')).some(el => {
+            const t = (el.textContent || '').trim();
+            return visible(el) && (t === 'Send File' || t === 'ارسال فایل');
+        });
+        if (hasTitle) return true;
+        const nodes = Array.from(document.querySelectorAll('[role="dialog"], .modal-dialog, .MuiDialog-root, .MuiModal-root, .MuiPaper-root'));
+        return nodes.some(el => visible(el) && /Send File|ارسال فایل|Media \(image\/video\)|File \(document\)/i.test(el.innerText || ''));
+    }).catch(() => false);
+}
+
 async function clickModalBottomRight(page, log, label = 'modal bottom-right') {
     const box = await page.evaluate(() => {
+        const visible = (el) => {
+            if (!el) return false;
+            const r = el.getBoundingClientRect();
+            const cs = getComputedStyle(el);
+            return r.width > 160 && r.height > 120 && r.bottom > 0 && r.right > 0 && cs.visibility !== 'hidden' && cs.display !== 'none';
+        };
+        const describe = (el) => {
+            const r = el.getBoundingClientRect();
+            return { left: r.left, top: r.top, right: r.right, bottom: r.bottom, width: r.width, height: r.height, text: (el.innerText || '').slice(0, 160) };
+        };
+
         const selectors = ['[role="dialog"]', '.modal-dialog', '.MuiDialog-root [role="dialog"]', '.MuiPaper-root', '.MuiModal-root'];
         const nodes = [];
         for (const sel of selectors) nodes.push(...document.querySelectorAll(sel));
-        const visible = nodes
-            .map(el => ({ el, r: el.getBoundingClientRect(), text: (el.innerText || '').slice(0, 120) }))
-            .filter(x => x.r.width > 160 && x.r.height > 120 && x.r.bottom > 0 && x.r.right > 0 && getComputedStyle(x.el).visibility !== 'hidden');
-        visible.sort((a, b) => (b.r.width * b.r.height) - (a.r.width * a.r.height));
-        const x = visible.find(v => /Send File|ارسال|فایل|رسانه/i.test(v.text)) || visible[0];
-        if (!x) return null;
-        return { left: x.r.left, top: x.r.top, right: x.r.right, bottom: x.r.bottom, width: x.r.width, height: x.r.height, text: x.text };
+        const visibleBoxes = nodes.filter(visible).map(describe);
+        visibleBoxes.sort((a, b) => (b.width * b.height) - (a.width * a.height));
+        const bySelector = visibleBoxes.find(v => /Send File|ارسال|فایل|رسانه/i.test(v.text));
+        if (bySelector) return bySelector;
+
+        // iGap's upload dialog may not expose a stable role/class in headless mode.
+        // Find the visible "Send File" title and walk up to the centered card.
+        const title = Array.from(document.querySelectorAll('body *')).find(el => {
+            const t = (el.textContent || '').trim();
+            const r = el.getBoundingClientRect();
+            return (t === 'Send File' || t === 'ارسال فایل') && r.width > 20 && r.height > 10;
+        });
+        let cur = title;
+        while (cur && cur !== document.body) {
+            if (visible(cur)) {
+                const d = describe(cur);
+                if (d.width >= 280 && d.width <= 700 && d.height >= 220 && d.height <= 700) return d;
+            }
+            cur = cur.parentElement;
+        }
+        return visibleBoxes[0] || null;
     }).catch(() => null);
     if (!box) { log.step(`${label}: modal box not found`); return false; }
-    const x = Math.max(box.left + 20, box.right - 55);
-    const y = Math.max(box.top + 20, box.bottom - 55);
+    const x = Math.max(box.left + 20, box.right - 40);
+    const y = Math.max(box.top + 20, box.bottom - 40);
     await page.mouse.click(x, y);
     log.step(`${label}: clicked at ${Math.round(x)},${Math.round(y)} box=${Math.round(box.width)}x${Math.round(box.height)} text="${C.RunLog.brief(box.text, 50)}"`);
     return true;
@@ -295,22 +338,29 @@ async function countCards(page) {
                 log.step('WARNING: caption editor not ready; media will be sent without caption');
             }
 
-            // ---------- ۵) ارسال: فقط از داخل مودال ----------
-            const sendBtn = await firstEnabled(page, MODAL_SEND, { timeout: 12000, label: 'modal send' });
-            if (sendBtn && !sendBtn.disabled) {
-                await sendBtn.locator.click({ force: true });
-                sentVia = 'modal-button:' + sendBtn.selector;
-            } else {
-                if (sendBtn && sendBtn.disabled) log.step('WARNING: modal send button stayed disabled; trying modal coordinate fallback');
-                const clicked = await clickModalBottomRight(page, log, 'modal send fallback');
-                sentVia = clicked ? 'modal-bottom-right-click' : 'modal-fallback-missing';
-                await C.delay(1200);
-                const modalStill = await page.locator(MODAL).last().isVisible().catch(() => false);
-                if (!clicked || modalStill) {
-                    log.step('modal still visible after coordinate fallback; trying Enter');
-                    await page.keyboard.press('Enter');
-                    sentVia += '+enter';
+            // ---------- ۵) ارسال: روی دکمهٔ سبز پایین راست مودال کلیک می‌کنیم.
+            // Selectorهای متنی آی‌گپ گاهی عنصر اشتباه/پنهان را match می‌کنند؛
+            // مختصات پایین راست، دقیقاً همان دکمهٔ ارسال دیده‌شده در اسکرین‌شات است.
+            await C.delay(1200);
+            const clicked = await clickModalBottomRight(page, log, 'modal send primary');
+            sentVia = clicked ? 'modal-bottom-right-click' : 'modal-coordinate-missing';
+            await C.delay(1800);
+            if (await igapUploadModalVisible(page)) {
+                log.step('upload modal still visible after coordinate click; trying selector send');
+                const sendBtn = await firstEnabled(page, MODAL_SEND, { timeout: 7000, label: 'modal send' });
+                if (sendBtn && !sendBtn.disabled) {
+                    await sendBtn.locator.click({ force: true });
+                    sentVia += '+modal-button:' + sendBtn.selector;
+                    await C.delay(1800);
+                } else if (sendBtn && sendBtn.disabled) {
+                    log.step('WARNING: modal send button stayed disabled after coordinate click');
                 }
+            }
+            if (await igapUploadModalVisible(page)) {
+                log.step('upload modal still visible after selector click; trying Enter');
+                await page.keyboard.press('Enter');
+                sentVia += '+enter';
+                await C.delay(1800);
             }
             log.step(`media submit via ${sentVia}`);
             await C.delay(4000);
@@ -334,7 +384,7 @@ async function countCards(page) {
         let acceptedButNotVisual = false;
         try {
             await C.waitUntil(async () => {
-                const modalGone = !(await page.locator(MODAL).last().isVisible().catch(() => false));
+                const modalGone = !(await igapUploadModalVisible(page));
                 const afterPreview = await readPreview(page, name);
                 const previewChanged = !!beforePreview && afterPreview !== beforePreview;
                 let snippetSeen = false;
@@ -354,8 +404,8 @@ async function countCards(page) {
                 if (sentVia === 'composer-enter' && composerCleared) { verified = true; how = 'composer-cleared'; return true; }
 
                 // آی‌گپ گاهی بعد از ارسال واقعی، DOM/preview را به‌موقع به‌روزرسانی نمی‌کند.
-                // اگر مودال بسته شده یا composer خالی شده باشد، خطای کاذب ندهیم؛ OK با proof محافظه‌کارانه برمی‌گردانیم.
-                if (opts.file && modalGone && sentVia !== 'none') { acceptedButNotVisual = true; how = 'modal-closed-accepted'; return true; }
+                // اما برای رسانه فقط وقتی OK محافظه‌کارانه می‌دهیم که مودال واقعی Send File بسته شده باشد.
+                if (opts.file && modalGone && sentVia !== 'none') { acceptedButNotVisual = true; how = 'upload-modal-closed-accepted'; return true; }
                 if (!opts.file && composerCleared && sentVia === 'composer-enter') { acceptedButNotVisual = true; how = 'composer-cleared-accepted'; return true; }
                 return false;
             }, { timeout: opts.file ? Math.max(VERIFY_TIMEOUT_MS, 20000) : VERIFY_TIMEOUT_MS, interval: 500, label: 'send verification' });
