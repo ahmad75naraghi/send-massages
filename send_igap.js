@@ -281,6 +281,7 @@ async function countCards(page) {
         log.step(`before: preview="${C.RunLog.brief(beforePreview, 60)}" cards=${beforeCards}`);
 
         let sentVia = 'none';
+        let trustedMediaSubmit = false;
 
         // ---------- ۳) مسیر رسانه ----------
         if (opts.file) {
@@ -361,6 +362,7 @@ async function countCards(page) {
             // می‌تواند overlay را ببندد و OK کاذب بسازد؛ پس از مختصات کپشن استفاده می‌کنیم.
             await C.delay(1200);
             let clicked = await clickSendBesideCaption(page, caption, log);
+            trustedMediaSubmit = Boolean(clicked);
             sentVia = clicked ? 'caption-neighbor-button' : 'caption-neighbor-missing';
             await C.delay(2200);
 
@@ -416,11 +418,13 @@ async function countCards(page) {
                 if (previewChanged && modalGone) { verified = true; how = 'left-preview-changed'; return true; }
                 if (sentVia === 'composer-enter' && composerCleared) { verified = true; how = 'composer-cleared'; return true; }
 
-                // برای رسانه، بسته شدن مودال یا تغییر تعداد کارت‌ها به‌تنهایی کافی نیست؛
-                // همین حالت قبلاً OK کاذب ساخت. باید کپشن در چت دیده شود یا preview کانال عوض شود.
+                // برای رسانه ابتدا شواهد قوی بالا را ترجیح می‌دهیم. اگر کپشن‌های بلند در DOM قابل‌دیدن
+                // نبودند، ولی دکمهٔ واقعی کنار caption کلیک شده و مودال ارسال بسته شده، آن را ارسالِ پذیرفته‌شده
+                // حساب می‌کنیم؛ این برای پست‌های رسانه‌دار بلند آی‌گپ جلوی قرمزِ کاذب داشبورد را می‌گیرد.
+                if (opts.file && modalGone && trustedMediaSubmit) { acceptedButNotVisual = true; how = 'caption-neighbor-modal-closed-accepted'; return true; }
                 if (!opts.file && composerCleared && sentVia === 'composer-enter') { acceptedButNotVisual = true; how = 'composer-cleared-accepted'; return true; }
                 return false;
-            }, { timeout: opts.file ? Math.max(VERIFY_TIMEOUT_MS, 20000) : VERIFY_TIMEOUT_MS, interval: 500, label: 'send verification' });
+            }, { timeout: opts.file ? Math.max(VERIFY_TIMEOUT_MS, 45000) : VERIFY_TIMEOUT_MS, interval: 500, label: 'send verification' });
         } catch (e) {
             log.step('verification window elapsed: ' + e.message);
         }
