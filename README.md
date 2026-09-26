@@ -416,6 +416,7 @@ IGAP_CHANNEL_NAME="کانال آزمایش" sudo -u file --preserve-env=IGAP_CHA
 | `BACKGROUND_GAP_SEC` | `0` | مکث بین پست‌ها در صف پس‌زمینه (۰ = بدون مکث؛ `SYNC_GAP_SEC` فقط مسیر دستی/cron) |
 | `SYNC_PARALLEL_DISPATCH` | `true` | ارسال هم‌زمان سروش+آی‌گپ (دو Chromium موازی)؛ برای سرور کم‌رمز `0` |
 | `BACKGROUND_MAX_PASSES` | `2` | حداکثر دفعات تلاش مجدد پلتفرم‌های ناموفق در صف |
+| `SCHEDULE_TIMEZONE` | *(خالی = منطقهٔ سرور)* | منطقهٔ زمانی ساعت‌های زمان‌بند و ساعت نمایشی سرور (مثال: `Asia/Tehran`) |
 | `MEDIA_MAX_RETRY` | `3` | سقف تلاش دانلود رسانه پیش از انتشار بدون رسانه ([`TROUBLESHOOTING.md`](TROUBLESHOOTING.md) §۳.۳) |
 | `SYNC_GAP_SEC` | `5` | فاصلهٔ بین پست‌ها در `cron_sync.sh` |
 | `CHECK_INTERVAL_SEC` | `30` | فاصلهٔ بررسی در `sync_daemon.php` (legacy) |
@@ -442,6 +443,11 @@ IGAP_CHANNEL_NAME="کانال آزمایش" sudo -u file --preserve-env=IGAP_CHA
 | `POST` | `sync_manual.php?action=rewind&key=<KEY>` | `{"id":74135}` | `{success, before, lastSeenId}` |
 | `GET` | `sync_manual.php?action=queue_status&key=<KEY>` | — | `{success, running, pid, progress:{state,phase,totalPosts,summary,…}, log, launcherLog}` |
 | `POST` | `sync_manual.php?action=background_sync&key=<KEY>` | `{"profile":"main","maxPosts":50}` | `{success:true, started:true, pid}` یا `{success:true, started:false, reason:"ALREADY_RUNNING", progress}` |
+| `GET` | `sync_manual.php?action=schedule_list&key=<KEY>` | — | `{success, now, timezone, items:[{id,time,maxPosts,profile,enabled,lastRun}], nextAt, tickActive, cronLine}` |
+| `POST` | `sync_manual.php?action=schedule_add&key=<KEY>` | `{"time":"09:30","maxPosts":5,"profile":"main"}` | همان schedule_list + `added` |
+| `POST` | `sync_manual.php?action=schedule_remove&key=<KEY>` | `{"id":3}` | همان schedule_list |
+| `POST` | `sync_manual.php?action=schedule_toggle&key=<KEY>` | `{"id":3,"enabled":false}` | همان schedule_list |
+| — | `ACTION=scheduler_tick` (فقط CLI از crontab) | — | `{success, now, due, fired}` — شلیک اسلات سررسید از طریق همان `background_sync` |
 | `GET` | `sync_manual.php?key=<KEY>` (بدون action) | — | HTML داشبورد |
 
 **`action=resend` — جبران شکست جزئی بدون پست تکراری**
@@ -470,6 +476,22 @@ ACTION=resend SYNC_BODY_FILE=/tmp/resend.json php cli_run.php | jq .
 5. در پایان، گزارش مدیریتی بله با جزئیات هر پست ارسال می‌شود و `last_msg_id` فقط تا آخرین پستِ موفقِ پیوسته جلو می‌رود.
 
 اگر worker وسط کار بمیرد، داشبورد «اجرای متروک» را نشان می‌دهد؛ اجرای دوبارهٔ صف از همان‌جا ادامه می‌دهد (پست‌های قبلاً موفق رد می‌شوند).
+
+**`action=scheduler_tick` — زمان‌بندی خودکار در ساعت‌های دلخواه**
+
+پنل «زمان‌بندی خودکار» داشبورد همین خانواده را مدیریت می‌کند: ساعت‌های `HH:MM` را اضافه/حذف/غیرفعال می‌کنید و در هر ساعتِ سررسید، تا ۵ پست **جدید** (قابل تغییر هر اسلات، ۱ تا ۵۰) با همان موتور صف پس‌زمینه ارسال می‌شود.
+
+نصب فقط **یک خط crontab** است (از cPanel → Cron Jobs یا `crontab -e`)؛ بعد از آن افزودن/حذف ساعت‌ها فقط از داشبورد انجام می‌شود و این خط دیگر تغییر نمی‌کند:
+
+```cron
+* * * * * /home/file/public_html/s/scheduler_tick.sh
+```
+
+- `scheduler_tick.sh` هر دقیقه اجرا می‌شود؛ اگر ساعتی سررسید باشد (با تحمل ۲ دقیقه تأخیر)، همان مسیر `background_sync` را از CLI صدا می‌زند — یعنی همان موتور، همان قفل `flock` مشترک با cron، همان پیشرفت زنده در داشبورد.
+- هر اسلات حداکثر **یک‌بار در روز** شلیک می‌شود (کلید یکتای `schedule_id + day` در جدول `schedule_runs`).
+- اگر در لحظهٔ اسلات صف دیگری در حال اجرا باشد، همان اسلات `skipped_busy` ثبت می‌شود (بدون ارسال تکراری).
+- داشبورد با heartbeat تیک (جدول `schedule_meta`) نشان می‌دهد که کران نصب است یا نه؛ اگر نصب نباشد، خط crontab لازم را عیناً نمایش می‌دهد.
+- ساعت‌ها با منطقهٔ زمانی سرور تفسیر می‌شوند؛ برای تغییر، `SCHEDULE_TIMEZONE=Asia/Tehran` در `.env`. ساعت فعلی سرور در همان پنل نمایش داده می‌شود.
 
 همین فیلتر در `sync_single` هم هست: `{"id":…,"text":…,"only":["igap"]}`. پلتفرم‌های ردشده در پاسخ `{"ok":null,"info":"SKIPPED"}` می‌گیرند و در داشبورد با `—` نمایش داده می‌شوند.
 
@@ -599,6 +621,7 @@ ACTION=sync_single SYNC_BODY_FILE=/tmp/body.json php cli_run.php
 | 25 | **حالت `--batch` برای هر دو UserBot**: کل صف در یک مرورگر با progress-file اتمیک (به‌جای راه‌اندازی Chromium برای هر پست)؛ حفظ ترتیب، توقف روی اولین خطا و علامت‌گذاری بقیه `NOT_ATTEMPTED` | ✨ قابلیت/سرعت | `send_soroush.js`, `send_igap.js`, `lib/pw_common.js` |
 | 26 | **ارسال هم‌زمان سروش+آی‌گپ** در `dispatchToPlatforms` (قابل خاموش‌کردن با `SYNC_PARALLEL_DISPATCH=0`)؛ زمان هر پست از مجموعِ چهار پلتفرم به max(سروش, آی‌گپ) می‌رسد | ⚡ سرعت | `sync_manual.php` |
 ---
+| 27 | **زمان‌بندی خودکار**: پنل «زمان‌بندی خودکار» در داشبورد (افزودن/حذف/روشن‌وخاموش ساعت‌ها، ساعت سرور، heartbeat کران)، اکشن‌های `schedule_*` + `scheduler_tick` (CLI)، جداول `schedule`/`schedule_runs`/`schedule_meta` و `scheduler_tick.sh` — شلیک اسلات = همان مسیر صف پس‌زمینه با mutex روزانه | ✨ قابلیت | `sync_manual.php`, `scheduler_tick.sh`, `config.php` |
 
 ## ۱۳. سلب مسئولیت عملیاتی
 

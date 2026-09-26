@@ -225,6 +225,13 @@ bash -n *.sh lib/*.sh
 ### تست آفلاین بدون Playwright
 در sandbox node_modules نیست؛ یک fake ماژول playwright در `/tmp/fakepw/node_modules/playwright` ساخته شد (chromium.launchPersistentContext قلابی؛ evaluate() با تطبیق متن source جواب می‌دهد). اجرا: `NODE_PATH=/tmp/fakepw/node_modules node send_soroush.js --batch …`. توجه: NODE_PATH باید خودِ دایرکتوری node_modules باشد، نه والدش.
 
+### زمان‌بند خودکار (اضافه‌شده ۲۰۲۶-۰۹، همراه صف پس‌زمینه)
+- جداول `schedule` / `schedule_runs` (PK: schedule_id+day = mutex روزانه) / `schedule_meta` (heartbeat تیک).
+- `scheduler_tick` (CLI-only): heartbeat همیشه؛ اسلات سررسید با پنجرهٔ تحمل ۲ دقیقه (now, -1m, -2m)؛ شلیک = اجرای `ACTION=background_sync` از CLI با body موقت (بدون refactor موتور)؛ نتیجه در schedule_runs (fired/skipped_busy/error) + logs/scheduler.log.
+- نصب = فقط یک خط crontab به scheduler_tick.sh؛ افزودن/حذف ساعت‌ها فقط از داشبورد (اکشن‌های schedule_list/add/remove/toggle). داشبورد با heartbeat نصب بودن کران را تشخیص می‌دهد و خط crontab لازم را نمایش می‌دهد.
+- `SCHEDULE_TIMEZONE` (خالی = منطقهٔ سرور) هم تیک هم ساعت نمایشی داشبورد.
+- تست آفلاین زنجیره: mock php با پورت python همین منطق روی sqlite واقعی + لانچر واقعی (در /tmp/schedtest — در sandbox ماندگار نیست).
+
 ## هشدارهای مهم برای عامل‌های بعدی
 
 - روی کانال/branch دیگری کار نکنید مگر سیاست session اجازه بدهد.

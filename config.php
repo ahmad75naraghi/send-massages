@@ -220,6 +220,9 @@ define('BACKGROUND_GAP_SEC', envInt('BACKGROUND_GAP_SEC', 0));
 define('SYNC_PARALLEL_DISPATCH', envBool('SYNC_PARALLEL_DISPATCH', true));
 // حداکثر دفعات تلاش هر پلتفرم در صف پس‌زمینه برای آیتم‌های ناموفق (۱ = بدون تلاش مجدد)
 define('BACKGROUND_MAX_PASSES', envInt('BACKGROUND_MAX_PASSES', 2));
+// منطقهٔ زمانی ساعت‌های زمان‌بند (خالی = منطقهٔ پیش‌فرض سرور؛ مثال: Asia/Tehran).
+// ساعت نشان‌داده‌شدهٔ «سرور» در داشبورد هم با همین منطقه است.
+define('SCHEDULE_TIMEZONE', env('SCHEDULE_TIMEZONE', ''));
 
 // --- مسیرهای داده ---
 define('STATE_DB_PATH', env('STATE_DB_PATH', SYNC_APP_DIR . '/state.sqlite'));

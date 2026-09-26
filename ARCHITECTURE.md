@@ -811,6 +811,32 @@ sequenceDiagram
 
 **معناشنسی خطا** همان مسیر دستی است: پست با رسانهٔ شکست‌خوردهٔ زیر سقف تلاش → `deferred` و **توقف** (پست‌های بعدی `pending` می‌مانند تا چرخهٔ بعدی با لینک تازه)؛ ≥ سقف (`MEDIA_MAX_RETRY`) → انتشار فقط متن + ثبت صریح. کدهای مهلک runner (مثل `SESSION_EXPIRED`، `CHANNEL_NOT_FOUND`) کل worker را با گزارش متوقف می‌کنند تا ارسال به «چت اشتباه» اتفاق نیفتد. `last_msg_id` فقط تا آخرین پست پیوستهٔ موفق جلو می‌رود — با توقف روی `deferred`، چرخهٔ بعدی از همان‌جا ادامه می‌دهد.
 
+### ۸.۶ زمان‌بندی خودکار (`scheduler_tick`) — صف در ساعت‌های دلخواه
+
+جدول `schedule` ساعت‌های `HH:MM` را نگه می‌دارد (هر اسلات: سقف پست + پروفایل + فعال/غیرفعال). یک خط crontab (`scheduler_tick.sh` هر دقیقه) تیک را اجرا می‌کند؛ تیک اگر اسلاتی سررسید باشد (پنجرهٔ تحمل ۲ دقیقه) همان `background_sync` را از CLI صدا می‌زند — بدون هیچ مسیر اجرای جدیدی: همان موتور، همان قفل‌ها، همان progress زنده. جدول `schedule_runs` (PK: `schedule_id+day`) هر اسلات را حداکثر یک‌بار در روز شلیک می‌کند و نتیجه (`fired`/`skipped_busy`/`error`) را نگه می‌دارد؛ جدول `schedule_meta` heartbeat تیک را ثبت می‌کند تا داشبورد «نصب بودن کران» را تشخیص دهد و در غیر این صورت خط crontab لازم را نمایش دهد.
+
+```mermaid
+sequenceDiagram
+    participant C as crontab (هر دقیقه)
+    participant T as scheduler_tick.sh
+    participant K as cli_run.php scheduler_tick
+    participant B as background_sync
+    participant W as worker صف (setsid)
+    C->>T: * * * * *
+    T->>K: ACTION=scheduler_tick
+    K->>K: heartbeat + اسلات سررسید؟ (INSERT OR IGNORE روزانه)
+    alt اسلات سررسید و امروز شلیک نشده
+        K->>B: ACTION=background_sync (CLI)
+        B->>W: setsid launcher + PID
+        B-->>K: {started:true, pid}
+        K->>K: schedule_runs = fired
+    else صف مشغول / قبلاً شلیک شده
+        K->>K: skipped_busy / رد
+    end
+```
+
+نکته: `SCHEDULE_TIMEZONE` (پیش‌فرض: منطقهٔ سرور) هم تیک و هم ساعتِ نمایشی سرور در داشبورد را یکسان می‌کند تا «۰۹:۳۰» در همه‌جا یک معنا داشته باشد.
+
 ## ۹. پروتکل‌های امنیتی <a id="s9"></a>
 
 ### ۹.۱ وضعیت فعلی و ریسک‌ها

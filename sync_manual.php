@@ -59,6 +59,25 @@ $db->exec("CREATE TABLE IF NOT EXISTS delivery (
     updated_at TEXT,
     PRIMARY KEY (msg_id, platform, profile)
 )");
+// زمان‌بندی خودکار: ساعت‌های اجرای صف (HH:MM) + سابقهٔ اجرای روزانهٔ هر اسلات
+$db->exec("CREATE TABLE IF NOT EXISTS schedule (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    time_hhmm TEXT NOT NULL,
+    max_posts INTEGER NOT NULL DEFAULT 5,
+    profile TEXT NOT NULL DEFAULT 'main',
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL
+)");
+$db->exec("CREATE TABLE IF NOT EXISTS schedule_runs (
+    schedule_id INTEGER NOT NULL,
+    day TEXT NOT NULL,
+    fired_at TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'running',
+    summary TEXT,
+    PRIMARY KEY (schedule_id, day)
+)");
+// heartbeat تیکِ کرون (داشبورد از روی همین تشخیص می‌دهد که کران نصب است یا نه)
+$db->exec("CREATE TABLE IF NOT EXISTS schedule_meta (meta_key TEXT PRIMARY KEY, meta_value TEXT NOT NULL)");
 
 function getLastSeenId(PDO $db, string$channel): int {
     $stmt =$db->prepare("SELECT last_msg_id FROM sync_state WHERE channel = :channel");
@@ -1469,6 +1488,244 @@ if ($action === 'queue_status') {
 //             حالا با setsid از نشست Apache/PHP-FPM جدا می‌شود.
 //          ۳) همه‌چیز در background_sync.log ثبت می‌شود تا علت هر شکست در
 //             خود داشبورد دیده شود (از طریق queue_status → launcherLog).
+// ============================================================
+//  زمان‌بندی خودکار (schedule_*) — اجرای صف در ساعت‌های تعیین‌شده
+//  یک خط crontab هر دقیقه (scheduler_tick.sh) → این تیک، اگر ساعتی
+//  سررسید باشد، همان مسیر دکمهٔ داشبورد (background_sync) را از CLI
+//  صدا می‌زند؛ یعنی همان موتور، همان قفل‌ها، همان پیشرفت زنده.
+// ============================================================
+
+function schedulerTz(): string {
+    static $tz = null;
+    if (is_string($tz)) { return $tz; }
+    $tz = date_default_timezone_get();
+    $wanted = trim((string)SCHEDULE_TIMEZONE);
+    if ($wanted !== '') {
+        try { $tz = (new DateTimeZone($wanted))->getName(); } catch (Throwable $e) { /* منطقهٔ نامعتبر → پیش‌فرض سرور */ }
+    }
+    return $tz;
+}
+
+function schedulerNow(): DateTime {
+    return new DateTime('now', new DateTimeZone(schedulerTz()));
+}
+
+/** چند ثانیه از آخرین تیک کرون گذشته است؟ null = هنوز هیچ تیکی ثبت نشده */
+function scheduleHeartbeatAge(PDO $db): ?int {
+    try {
+        $row = $db->query("SELECT meta_value FROM schedule_meta WHERE meta_key = 'heartbeat'")->fetch();
+    } catch (Throwable $e) {
+        return null;
+    }
+    if (!is_array($row) || !is_string($row['meta_value'] ?? null)) { return null; }
+    $ts = (int)$row['meta_value'];
+    return $ts > 0 ? (time() - $ts) : null;
+}
+
+/** خروجی مشترک schedule_list / نتیجهٔ add/remove/toggle — کل وضعیت برای رندر داشبورد */
+function scheduleListPayload(PDO $db): array {
+    $now = schedulerNow();
+    $today = $now->format('Y-m-d');
+    $rows = $db->query('SELECT id, time_hhmm, max_posts, profile, enabled FROM schedule ORDER BY time_hhmm, id')->fetchAll();
+    $items = [];
+    $nextAt = null;
+    $nextTs = null;
+    $lastRunStmt = $db->prepare('SELECT status, fired_at, summary FROM schedule_runs WHERE schedule_id = ? AND day = ?');
+    foreach ($rows as $r) {
+        $sid = (int)$r['id'];
+        $lastRunStmt->execute([$sid, $today]);
+        $last = $lastRunStmt->fetch();
+        $items[] = [
+            'id'      => $sid,
+            'time'    => (string)$r['time_hhmm'],
+            'maxPosts'=> (int)$r['max_posts'],
+            'profile' => (string)$r['profile'],
+            'enabled' => ((int)$r['enabled']) === 1,
+            'lastRun' => is_array($last) ? $last : null,
+        ];
+        if (((int)$r['enabled']) === 1) {
+            $t = DateTime::createFromFormat('Y-m-d H:i', $today . ' ' . $r['time_hhmm'], new DateTimeZone(schedulerTz()));
+            if ($t !== false) {
+                if ($t <= $now) { $t->modify('+1 day'); }
+                if ($nextTs === null || $t->getTimestamp() < $nextTs) {
+                    $nextTs = $t->getTimestamp();
+                    $nextAt = $t->format('Y-m-d H:i');
+                }
+            }
+        }
+    }
+    $hbAge = scheduleHeartbeatAge($db);
+    return [
+        'success'        => true,
+        'now'            => $now->format('Y-m-d H:i:s'),
+        'nowHm'          => $now->format('H:i'),
+        'timezone'       => schedulerTz(),
+        'items'          => $items,
+        'nextAt'         => $nextAt,
+        'heartbeatAgeSec'=> $hbAge,
+        'tickActive'     => ($hbAge !== null && $hbAge < 150),
+        'cronLine'       => '* * * * * ' . rtrim((string)SYNC_APP_DIR, '/') . '/scheduler_tick.sh',
+    ];
+}
+
+if ($action === 'schedule_list') {
+    header('Content-Type: application/json; charset=utf-8');
+    echo json_encode(scheduleListPayload($db), JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
+if ($action === 'schedule_add') {
+    header('Content-Type: application/json; charset=utf-8');
+    $payload = json_decode(readRequestBody(), true);
+    if (!is_array($payload)) { $payload = []; }
+    $rawTime = trim((string)($payload['time'] ?? ($_GET['time'] ?? '')));
+    $h = 0; $m = 0;
+    if (!preg_match('#^([01]?\d|2[0-3]):([0-5]\d)$#', $rawTime, $tm)
+        || sscanf($rawTime, '%d:%d', $h, $m) !== 2) {
+        echo json_encode(['success' => false, 'error' => 'TIME_INVALID', 'message' => 'ساعت باید به شکل HH:MM باشد (مثلاً 09:30).'], JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+    $time = sprintf('%02d:%02d', $h, $m);
+    $maxPosts = (int)($payload['maxPosts'] ?? 5);
+    if ($maxPosts < 1)  { $maxPosts = 1; }
+    if ($maxPosts > 50) { $maxPosts = 50; }
+    $profile = normalizeDestinationProfile((string)($payload['profile'] ?? 'main'));
+    $dup = $db->prepare('SELECT id FROM schedule WHERE time_hhmm = ? AND profile = ?');
+    $dup->execute([$time, $profile]);
+    if ($dup->fetch() !== false) {
+        echo json_encode(['success' => false, 'error' => 'DUPLICATE', 'message' => 'برای این کانال، همین ساعت قبلاً ثبت شده است.'], JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+    $db->prepare('INSERT INTO schedule (time_hhmm, max_posts, profile, enabled, created_at) VALUES (?, ?, ?, 1, ?)')
+       ->execute([$time, $maxPosts, $profile, date('c')]);
+    $out = scheduleListPayload($db);
+    $out['added'] = (int)$db->lastInsertId();
+    echo json_encode($out, JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
+if ($action === 'schedule_remove') {
+    header('Content-Type: application/json; charset=utf-8');
+    $payload = json_decode(readRequestBody(), true);
+    if (!is_array($payload)) { $payload = []; }
+    $id = (int)($payload['id'] ?? 0);
+    if ($id <= 0) {
+        echo json_encode(['success' => false, 'error' => 'BAD_ID', 'message' => 'شناسهٔ زمان‌بند نامعتبر است.'], JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+    $db->prepare('DELETE FROM schedule WHERE id = ?')->execute([$id]);
+    $db->prepare('DELETE FROM schedule_runs WHERE schedule_id = ?')->execute([$id]);
+    echo json_encode(scheduleListPayload($db), JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
+if ($action === 'schedule_toggle') {
+    header('Content-Type: application/json; charset=utf-8');
+    $payload = json_decode(readRequestBody(), true);
+    if (!is_array($payload)) { $payload = []; }
+    $id = (int)($payload['id'] ?? 0);
+    $enabled = !empty($payload['enabled']) ? 1 : 0;
+    if ($id <= 0) {
+        echo json_encode(['success' => false, 'error' => 'BAD_ID', 'message' => 'شناسهٔ زمان‌بند نامعتبر است.'], JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+    $db->prepare('UPDATE schedule SET enabled = ? WHERE id = ?')->execute([$enabled, $id]);
+    echo json_encode(scheduleListPayload($db), JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
+if ($action === 'scheduler_tick') {
+    // فقط CLI (کران هر دقیقه)؛ از وب 403 — همان قاعدهٔ background_run
+    if (php_sapi_name() !== 'cli') {
+        header('Content-Type: application/json; charset=utf-8');
+        http_response_code(403);
+        echo json_encode(['success' => false, 'error' => 'CLI_ONLY', 'message' => 'تیک زمان‌بند فقط از طریق crontab (scheduler_tick.sh) اجرا می‌شود.'], JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+    @set_time_limit(0);
+    $logFile = rtrim(LOG_DIR, '/') . '/scheduler.log';
+    $schedLog = function (string $m) use ($logFile): void {
+        @file_put_contents($logFile, '[' . date('Y-m-d H:i:s') . '] ' . $m . "\n", FILE_APPEND);
+    };
+
+    // ---------- ۱) heartbeat: همیشه ثبت می‌شود تا داشبورد فعال بودن کران را بفهمد ----------
+    try {
+        $db->prepare("INSERT INTO schedule_meta (meta_key, meta_value) VALUES ('heartbeat', ?)
+                      ON CONFLICT(meta_key) DO UPDATE SET meta_value = excluded.meta_value")
+           ->execute([(string)time()]);
+    } catch (Throwable $e) {
+        $schedLog('heartbeat write failed: ' . $e->getMessage());
+    }
+
+    // ---------- ۲) اسلات‌های سررسید (با تحمل ۲ دقیقه تأخیر کرون) ----------
+    $now = schedulerNow();
+    $day = $now->format('Y-m-d');
+    $candidates = [];
+    for ($back = 0; $back <= 2; $back++) {
+        $candidates[] = (clone $now)->modify("-{$back} minutes")->format('H:i');
+    }
+    $marks = implode(',', array_fill(0, count($candidates), '?'));
+    $slots = $db->prepare("SELECT id, time_hhmm, max_posts, profile FROM schedule WHERE enabled = 1 AND time_hhmm IN ({$marks})");
+    $slots->execute($candidates);
+    $slots = $slots->fetchAll();
+
+    $fired = 0;
+    foreach ($slots as $slot) {
+        // mutex روزانه: هر اسلات فقط یک بار در روز شلیک می‌شود (INSERT OR IGNORE)
+        $ins = $db->prepare('INSERT OR IGNORE INTO schedule_runs (schedule_id, day, fired_at, status) VALUES (?, ?, ?, ?)');
+        $ins->execute([(int)$slot['id'], $day, $now->format('c'), 'running']);
+        if ($ins->rowCount() === 0) { continue; }
+
+        // ---------- ۳) شلیک: همان مسیر دکمهٔ داشبورد (background_sync از CLI) ----------
+        // background_sync خودش worker را با setsid جدا می‌کند، PID را ثبت می‌کند و
+        // اگر صف مشغول باشد alreadyRunning برمی‌گرداند. بدون بازنویسی موتور.
+        [$phpOk, $phpBin] = resolvePhpCliBinary();
+        if (!$phpOk) { $phpBin = (string)PHP_BINARY; }   // همین مفسر در حال اجراست؛ مطمئن‌ترین حدس
+        $bodyFile = tempnam(sys_get_temp_dir(), 'sched_body_');
+        @file_put_contents($bodyFile, json_encode([
+            'profile'  => (string)$slot['profile'],
+            'maxPosts' => (int)$slot['max_posts'],
+            'gap'      => 0,
+        ], JSON_UNESCAPED_UNICODE));
+        $cmd = 'ACTION=background_sync SYNC_BODY_FILE=' . escapeshellarg($bodyFile) . ' '
+             . escapeshellarg($phpBin) . ' -f ' . escapeshellarg(SYNC_APP_DIR . '/cli_run.php') . ' 2>&1';
+        $out = function_exists('shell_exec') ? (string)@shell_exec($cmd) : '';
+        @unlink($bodyFile);
+
+        // آخرین خط JSON خروجی background_sync
+        $res = null;
+        $lines = array_values(array_filter(array_map('trim', explode("\n", $out))));
+        if ($lines !== []) { $res = json_decode((string)end($lines), true); }
+
+        $status = 'error';
+        $summary = 'خروجی نامعتبر از background_sync';
+        if (is_array($res)) {
+            if (!empty($res['success']) && !empty($res['started'])) {
+                $status = 'fired';
+                $summary = 'صف شروع شد — pid=' . ($res['pid'] ?? '?') . ' — سقف ' . (int)$slot['max_posts'] . ' پست جدید';
+                $fired++;
+            } elseif (!empty($res['success']) && !empty($res['alreadyRunning'])) {
+                $status = 'skipped_busy';
+                $summary = 'صف دیگری در حال اجرا بود؛ این اسلات امروز رد شد (پست‌های جدید در چرخهٔ بعدی/کران قبلی می‌روند)';
+            } else {
+                $status = 'error';
+                $summary = trim(((string)($res['error'] ?? '')) . ' ' . ((string)($res['message'] ?? '')));
+            }
+        }
+        try {
+            $db->prepare('UPDATE schedule_runs SET status = ?, summary = ? WHERE schedule_id = ? AND day = ?')
+               ->execute([$status, mb_substr($summary, 0, 300), (int)$slot['id'], $day]);
+        } catch (Throwable $e) {
+            $schedLog('schedule_runs update failed: ' . $e->getMessage());
+        }
+        $schedLog("slot {$slot['time_hhmm']} (#{$slot['id']} profile={$slot['profile']}) → {$status}: {$summary}");
+    }
+
+    $schedLog('tick ok — now=' . $now->format('Y-m-d H:i') . ' due=' . count($slots) . ' fired=' . $fired);
+    echo json_encode(['success' => true, 'now' => $now->format('Y-m-d H:i'), 'due' => count($slots), 'fired' => $fired], JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
 if ($action === 'background_sync') {
     header('Content-Type: application/json; charset=utf-8');
     @mkdir(LOG_DIR, 0770, true);
@@ -2638,6 +2895,31 @@ if ($action === 'rewind') {
                 <div class="force-result" id="forceResult"></div>
             </div>
         </div>
+
+        <div class="panel">
+            <div class="panel-head">
+                <h2>زمان‌بندی خودکار</h2>
+                <p>در ساعت‌های تعیین‌شده، پست‌های <b>جدید</b> (تا سقف انتخابی، پیش‌فرض ۵ پست) با همان موتور صف پس‌زمینه و بدون دخالت شما به همهٔ پیام‌رسان‌ها ارسال می‌شوند.</p>
+            </div>
+            <div class="panel-body">
+                <div class="row space">
+                    <span class="lbl inline">ساعت سرور: <b id="schedClock">…</b></span>
+                    <span class="badge" id="schedTick">…</span>
+                </div>
+                <div class="hint" id="schedNext">در حال خواندن زمان‌بندی…</div>
+                <div class="row" style="margin-top:10px;">
+                    <input type="time" id="schedTime" value="09:00" title="ساعت اجرا (سرور)">
+                    <input type="number" id="schedPosts" min="1" max="50" value="5" style="max-width:78px" title="حداکثر تعداد پست جدید">
+                    <select id="schedProfile" style="max-width:120px" title="کانال مقصد">
+                        <option value="main">کانال اصلی</option>
+                        <option value="test">آزمایشی</option>
+                    </select>
+                    <button class="btn btn-ghost" onclick="addSchedule()">افزودن ساعت</button>
+                </div>
+                <div class="post-list" id="schedList" style="max-height:220px;"></div>
+                <div class="warnbox" id="schedCron" style="display:none;"></div>
+            </div>
+        </div>
       </aside>
     </div>
 </div>
@@ -2787,6 +3069,145 @@ if ($action === 'rewind') {
         };
         const running = await tick();
         if (running && !queuePollTimer) queuePollTimer = setInterval(tick, 2500);
+    }
+
+    // ---------- زمان‌بندی خودکار (schedule_*) ----------
+    const SCHED_STATUS_FA = {
+        fired: '✅ اجرا شد', skipped_busy: '⏭ رد شد (صف مشغول بود)',
+        running: '⏳ در حال اجرا', error: '❌ خطا',
+    };
+
+    async function loadSchedule() {
+        try {
+            const res = await fetch(apiUrl('schedule_list'));
+            const data = await res.json();
+            if (data.success) renderSchedule(data);
+        } catch (e) { /* بی‌صدا — تیک بعدی دوباره تلاش می‌کند */ }
+    }
+
+    function renderSchedule(data) {
+        const clock = $('schedClock');
+        if (clock) clock.innerText = `${faNum(data.nowHm || '')} (${data.timezone || ''})`;
+        const tick = $('schedTick');
+        if (tick) {
+            const active = !!data.tickActive;
+            tick.innerText = active ? '⏱ زمان‌بند فعال' : '⏱ کران نصب نیست';
+            tick.style.background = active ? '#14532d' : '#7f1d1d';
+            tick.style.color = active ? '#86efac' : '#fecaca';
+            tick.title = active
+                ? `آخرین تیک کرون: ${faNum(String(Math.max(0, data.heartbeatAgeSec ?? 0)))} ثانیه پیش`
+                : 'اسکریپت scheduler_tick.sh هر دقیقه از طریق crontab اجرا نمی‌شود';
+        }
+        const next = $('schedNext');
+        if (next) {
+            const items = data.items || [];
+            next.innerHTML = items.length === 0
+                ? 'هنوز ساعتی ثبت نشده است — با فرم بالا ساعت‌های دلخواه را اضافه کنید.'
+                : `⏰ اجرای بعدی: <b style="color:#7dd3fc">${faNum(data.nextAt || '—')}</b>`;
+        }
+        const cronBox = $('schedCron');
+        if (cronBox) {
+            if (!data.tickActive) {
+                cronBox.style.display = '';
+                cronBox.innerHTML = 'برای فعال‌شدن زمان‌بندی، این یک خط را به crontab سرور اضافه کنید (یک‌بار، از cPanel → Cron Jobs یا SSH):' +
+                    '<br><code style="direction:ltr;display:inline-block;background:#0f172a;padding:4px 8px;border-radius:6px;margin-top:6px;">' +
+                    escapeHtml(data.cronLine || '') + '</code>';
+            } else {
+                cronBox.style.display = 'none';
+            }
+        }
+        const list = $('schedList');
+        if (!list) return;
+        list.innerHTML = '';
+        (data.items || []).forEach(it => {
+            const row = document.createElement('div');
+            row.className = 'post-row';
+            row.style.opacity = it.enabled ? '1' : '0.55';
+            const lastRun = it.lastRun
+                ? (SCHED_STATUS_FA[it.lastRun.status] || it.lastRun.status)
+                : 'امروز هنوز نرسیده';
+            const lastTitle = it.lastRun && it.lastRun.summary ? escapeHtml(it.lastRun.summary) : '';
+            row.innerHTML =
+                `<div class="post-main">` +
+                    `<div class="post-top">` +
+                        `<span class="post-id" style="font-size:1rem">⏰ ${faNum(it.time)}</span>` +
+                        `<span class="tag ${it.enabled ? 'new' : 'old'}">${it.enabled ? 'فعال' : 'غیرفعال'}</span>` +
+                        `<span class="tag text">${faNum(String(it.maxPosts))} پست جدید</span>` +
+                        `<span class="tag ${it.profile === 'test' ? 'old' : 'media'}">${it.profile === 'test' ? 'آزمایشی' : 'اصلی'}</span>` +
+                    `</div>` +
+                    `<div class="post-txt" title="${lastTitle}">آخرین اجرا: ${lastRun}</div>` +
+                `</div>` +
+                `<div style="display:flex;gap:6px;align-items:center;flex-shrink:0">` +
+                    `<button class="btn btn-ghost" style="padding:4px 10px;font-size:0.75rem" onclick="toggleSchedule(${it.id}, ${it.enabled ? 'false' : 'true'})">${it.enabled ? 'خاموش' : 'روشن'}</button>` +
+                    `<button class="btn btn-ghost" style="padding:4px 10px;font-size:0.75rem;color:#f87171" onclick="removeSchedule(${it.id})">حذف</button>` +
+                `</div>`;
+            list.appendChild(row);
+        });
+    }
+
+    async function addSchedule() {
+        const time = ($('schedTime') || {}).value || '';
+        const maxPosts = parseInt(($('schedPosts') || {}).value, 10) || 5;
+        const profile = ($('schedProfile') || {}).value || 'main';
+        if (!/^\d{1,2}:\d{2}$/.test(time)) {
+            log('ساعت اجرا را به شکل درست (HH:MM) انتخاب کنید.', '#fbbf24');
+            return;
+        }
+        try {
+            const res = await fetch(apiUrl('schedule_add'), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ time, maxPosts, profile }),
+            });
+            const data = await res.json();
+            if (!data.success) {
+                log('❌ افزودن زمان‌بند ناموفق: ' + (data.message || data.error || 'خطای نامشخص'), '#f87171');
+                return;
+            }
+            log(`⏰ زمان‌بند ${faNum(time)} ثبت شد — تا ${faNum(String(maxPosts))} پست جدید در این ساعت.`, '#4ade80');
+            renderSchedule(data);
+        } catch (e) {
+            log('❌ خطای افزودن زمان‌بند: ' + e.message, '#f87171');
+        }
+    }
+
+    async function removeSchedule(id) {
+        if (!confirm('این ساعت از زمان‌بندی حذف شود؟')) return;
+        try {
+            const res = await fetch(apiUrl('schedule_remove'), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ id }),
+            });
+            const data = await res.json();
+            if (!data.success) {
+                log('❌ حذف زمان‌بند ناموفق: ' + (data.message || data.error || ''), '#f87171');
+                return;
+            }
+            log('⏰ زمان‌بند حذف شد.', '#fbbf24');
+            renderSchedule(data);
+        } catch (e) {
+            log('❌ خطای حذف زمان‌بند: ' + e.message, '#f87171');
+        }
+    }
+
+    async function toggleSchedule(id, enabled) {
+        try {
+            const res = await fetch(apiUrl('schedule_toggle'), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ id, enabled }),
+            });
+            const data = await res.json();
+            if (!data.success) {
+                log('❌ تغییر وضعیت زمان‌بند ناموفق: ' + (data.message || data.error || ''), '#f87171');
+                return;
+            }
+            log(`⏰ زمان‌بند ${enabled ? 'فعال' : 'غیرفعال'} شد.`, '#7dd3fc');
+            renderSchedule(data);
+        } catch (e) {
+            log('❌ خطای تغییر زمان‌بند: ' + e.message, '#f87171');
+        }
     }
 
     async function startSync() {
@@ -3334,6 +3755,8 @@ if ($action === 'rewind') {
     ['optMedia', 'optAdvance', 'optGap'].forEach(id => { const el = $(id); if (el) el.addEventListener('change', updateSummary); });
     syncPlatformUI();
     pollQueueStatus(true);
+    loadSchedule();
+    setInterval(loadSchedule, 30000);
 </script>
 
 </body>
