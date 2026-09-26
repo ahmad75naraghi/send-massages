@@ -178,8 +178,7 @@ async function waitForConcreteChatAfterClick(page, channel, beforeHash, log, lab
 }
 
 const NEW_POST_BUTTONS = [
-    // فقط داخل ستون چت مقصد؛ دکمه‌های عمومی ستون فهرست چت‌ها را لمس نمی‌کنیم
-    // تا اگر کانال اصلی composer ندارد، به چت/کانال دیگری ارسال نشود.
+    // اول فقط داخل ستون چت مقصد؛ برای جلوگیری از ارسال به چت اشتباه.
     '.MiddleColumn button:has-text("پیام جدید")',
     '.MiddleColumn [role="button"]:has-text("پیام جدید")',
     '.MiddleColumn a:has-text("پیام جدید")',
@@ -210,21 +209,58 @@ const NEW_POST_BUTTONS = [
     '#MiddleColumn button:has(i[class*="compose"])',
 ];
 
+// fallback امن: بعضی نسخه‌های سروش دکمهٔ «پیام جدید» کانال را خارج از
+// MiddleColumn رندر می‌کنند. فقط وقتی URL همین کانال به hash عددی واقعی resolve
+// شده باشد، این دکمه‌های global را امتحان می‌کنیم و بعد از کلیک هم hash باید
+// تغییر نکند؛ پس به shamimeashena1 یا چت دیگر نمی‌فرستیم.
+const GLOBAL_NEW_POST_BUTTONS = [
+    'button:has-text("پیام جدید")',
+    '[role="button"]:has-text("پیام جدید")',
+    'a:has-text("پیام جدید")',
+    '[class*="Button"]:has-text("پیام جدید")',
+    '[class*="button"]:has-text("پیام جدید")',
+    'button:has-text("ارسال پیام")',
+    '[role="button"]:has-text("ارسال پیام")',
+    'button[aria-label*="پیام"]',
+    '[role="button"][aria-label*="پیام"]',
+    'button[title*="پیام"]',
+    '[role="button"][title*="پیام"]',
+];
+
 async function ensureComposer(page, log, timeout = 12000) {
     const deadline = Date.now() + timeout;
     let clickedNewPost = false;
+    let triedGlobalNewPost = false;
     let loggedMissing = false;
 
     while (Date.now() < deadline) {
         if (await C.seen(page.locator(COMPOSER).first(), 700)) return true;
 
         if (!clickedNewPost) {
-            const newPost = await C.firstVisible(page, NEW_POST_BUTTONS, { timeout: 700, label: 'new post button' });
+            let newPost = await C.firstVisible(page, NEW_POST_BUTTONS, { timeout: 700, label: 'scoped new post button' });
+            let globalFallback = false;
+            const beforeHash = currentUrlHash(page);
+
+            if (!newPost && !triedGlobalNewPost && /^#-?\d+/.test(beforeHash)) {
+                // بعضی نسخه‌ها دکمهٔ ارسال پست کانال را خارج از MiddleColumn می‌گذارند.
+                // فقط بعد از resolve شدن کانال به hash عددی واقعی اجازهٔ fallback global داریم.
+                newPost = await C.firstVisible(page, GLOBAL_NEW_POST_BUTTONS, { timeout: 700, label: 'global new post button' });
+                globalFallback = Boolean(newPost);
+                triedGlobalNewPost = true;
+            }
+
             if (newPost) {
                 await newPost.locator.click({ force: true });
                 clickedNewPost = true;
-                log.step(`new-post button clicked via ${newPost.selector}`);
+                log.step(`${globalFallback ? 'global ' : ''}new-post button clicked via ${newPost.selector}`);
                 await C.delay(1500);
+                if (globalFallback) {
+                    const afterHash = currentUrlHash(page);
+                    if (afterHash !== beforeHash) {
+                        log.step(`global new-post changed chat hash ${beforeHash} → ${afterHash}; refusing composer`);
+                        return false;
+                    }
+                }
                 continue;
             }
             if (!loggedMissing && Date.now() + 3500 < deadline) {
