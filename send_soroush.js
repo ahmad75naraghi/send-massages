@@ -79,44 +79,64 @@ async function openChatByName(page, name, log) {
 
 async function openChatBySearch(page, channel, log, strict = false) {
     if (!channel) return false;
-    const box = page.locator('#search-input, .SearchInput input, input[type="search"], #telegram-search-input').first();
-    if (!(await C.seen(box, 5000))) { log.step('openChatBySearch: search box not found'); return false; }
     const query = strict ? `@${channel}` : channel;
-    await box.click({ force: true });
-    await box.fill(query);
-    await C.delay(2500);
+    const boxSel = '#search-input, .SearchInput input, input[type="search"], #telegram-search-input';
+    const resultSel = '.LeftSearch .ListItem, .search-results .ListItem, .LeftColumn .ListItem';
 
-    const base = page.locator('.LeftSearch .ListItem, .search-results .ListItem, .LeftColumn .ListItem');
-    let result = null;
+    const runSearch = async () => {
+        const box = page.locator(boxSel).first();
+        if (!(await C.seen(box, 5000))) { log.step('openChatBySearch: search box not found'); return false; }
+        await box.click({ force: true });
+        await box.fill('');
+        await box.fill(query);
+        await C.delay(2500);
+        return true;
+    };
+
+    if (!(await runSearch())) return false;
+
     if (strict) {
+        // اول exact username در متن نتیجه؛ اگر سروش username را در innerText پنهان کرده بود،
+        // همهٔ نتایج همین query دقیق @username را یکی‌یکی امتحان می‌کنیم تا نتیجه‌ای که composer دارد پیدا شود.
         const exactUser = new RegExp(`@${escapeRegex(channel)}(?![A-Za-z0-9_])`, 'i');
-        result = base.filter({ hasText: exactUser }).first();
-        if (!(await C.seen(result, 5000))) {
-            // بعضی نسخه‌های Soroush Web در نتیجهٔ جست‌وجو username را در innerText نشان نمی‌دهند.
-            // وقتی query دقیقاً @username است، اولین نتیجهٔ قابل مشاهده امن‌ترین fallback است؛
-            // fallback نام نمایشی عمداً غیرفعال می‌ماند تا به کانال تست هم‌نام نرود.
-            log.step('openChatBySearch(strict): exact username text not visible; trying first result for exact @query');
-            result = base.first();
-            if (!(await C.seen(result, 6000))) {
-                log.step('openChatBySearch(strict): no visible result for exact @' + channel);
-                return false;
-            }
+        const exact = page.locator(resultSel).filter({ hasText: exactUser }).first();
+        if (await C.seen(exact, 2500)) {
+            await exact.click({ force: true });
+            log.step(`openChatBySearch(strict): clicked exact username result for "${query}"`);
+            if (await C.seen(page.locator('.MiddleColumn .input-message-input, .MiddleColumn div[contenteditable="true"]').first(), 15000)) return true;
+            log.step('openChatBySearch(strict): exact result opened but composer not visible');
+        } else {
+            log.step('openChatBySearch(strict): exact username text not visible; iterating visible results for exact @query');
         }
-    } else {
-        result = page.locator('.LeftSearch .ListItem, .search-results .ListItem, .LeftColumn .ListItem:has-text("' + channel + '")').first();
-        if (!(await C.seen(result, 6000))) { log.step('openChatBySearch: no result for ' + channel); return false; }
+
+        const maxTry = Math.min(6, await page.locator(resultSel).count().catch(() => 0));
+        for (let i = 0; i < maxTry; i++) {
+            if (i > 0 && !(await runSearch())) return false;
+            const item = page.locator(resultSel).nth(i);
+            if (!(await C.seen(item, 3000))) continue;
+            const brief = await item.innerText({ timeout: 1000 }).catch(() => '');
+            await item.click({ force: true });
+            log.step(`openChatBySearch(strict): clicked result #${i + 1} for "${query}" text="${C.RunLog.brief(brief, 80)}"`);
+            if (await C.seen(page.locator('.MiddleColumn .input-message-input, .MiddleColumn div[contenteditable="true"]').first(), 15000)) return true;
+            log.step(`openChatBySearch(strict): result #${i + 1} opened but composer not visible`);
+        }
+        return false;
     }
+
+    const result = page.locator('.LeftSearch .ListItem, .search-results .ListItem, .LeftColumn .ListItem:has-text("' + channel + '")').first();
+    if (!(await C.seen(result, 6000))) { log.step('openChatBySearch: no result for ' + channel); return false; }
     await result.click({ force: true });
-    log.step(`openChatBySearch${strict ? '(strict)' : ''}: clicked result for "${query}"`);
-    return await C.seen(page.locator('.MiddleColumn .input-message-input, .MiddleColumn div[contenteditable="true"]').first(), strict ? 15000 : 8000);
+    log.step(`openChatBySearch: clicked result for "${query}"`);
+    return await C.seen(page.locator('.MiddleColumn .input-message-input, .MiddleColumn div[contenteditable="true"]').first(), 8000);
 }
 
 async function openChatByHash(page, browser, channel, log) {
     if (!channel) return false;
-    await page.goto(`https://web.splus.ir/#@${channel}`, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    const route = /^-?\d+$/.test(String(channel)) ? `#${channel}` : `#@${channel}`;
+    await page.goto(`https://web.splus.ir/${route}`, { waitUntil: 'domcontentloaded', timeout: 60000 });
     await C.delay(6000);
     const ok = await C.seen(page.locator('.MiddleColumn .input-message-input, .MiddleColumn div[contenteditable="true"]').first(), 15000);
-    log.step(`openChatByHash: #@${channel} → composer ${ok ? 'visible' : 'NOT visible'}`);
+    log.step(`openChatByHash: ${route} → url=${page.url()} composer ${ok ? 'visible' : 'NOT visible'}`);
     return ok;
 }
 
