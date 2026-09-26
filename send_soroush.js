@@ -107,8 +107,20 @@ const NEW_POST_BUTTONS = [
     '#MiddleColumn button:has-text("پیام جدید")',
     '#MiddleColumn [role="button"]:has-text("پیام جدید")',
     '#MiddleColumn a:has-text("پیام جدید")',
+    '.MiddleColumn [class*="Button"]:has-text("پیام جدید")',
+    '#MiddleColumn [class*="Button"]:has-text("پیام جدید")',
+    '.MiddleColumn [class*="button"]:has-text("پیام جدید")',
+    '#MiddleColumn [class*="button"]:has-text("پیام جدید")',
+    'button:has-text("پیام جدید")',
+    '[role="button"]:has-text("پیام جدید")',
+    'a:has-text("پیام جدید")',
+    '[class*="Button"]:has-text("پیام جدید")',
+    '[class*="button"]:has-text("پیام جدید")',
+    'text="پیام جدید"',
     '.MiddleColumn button:has-text("ارسال پیام")',
     '#MiddleColumn button:has-text("ارسال پیام")',
+    'button:has-text("ارسال پیام")',
+    '[role="button"]:has-text("ارسال پیام")',
     '.MiddleColumn button:has-text("New Message")',
     '#MiddleColumn button:has-text("New Message")',
     '.MiddleColumn button:has-text("New Post")',
@@ -116,16 +128,34 @@ const NEW_POST_BUTTONS = [
 ];
 
 async function ensureComposer(page, log, timeout = 12000) {
-    if (await C.seen(page.locator(COMPOSER).first(), 1200)) return true;
-    const newPost = await C.firstVisible(page, NEW_POST_BUTTONS, { timeout: 3500, label: 'new post button' });
-    if (newPost) {
-        await newPost.locator.click({ force: true });
-        log.step(`new-post button clicked via ${newPost.selector}`);
-        await C.delay(1200);
-        if (await C.seen(page.locator(COMPOSER).first(), timeout)) return true;
-        log.step('new-post clicked but composer still not visible');
+    const deadline = Date.now() + timeout;
+    let clickedNewPost = false;
+    let loggedMissing = false;
+
+    while (Date.now() < deadline) {
+        if (await C.seen(page.locator(COMPOSER).first(), 700)) return true;
+
+        if (!clickedNewPost) {
+            const newPost = await C.firstVisible(page, NEW_POST_BUTTONS, { timeout: 700, label: 'new post button' });
+            if (newPost) {
+                await newPost.locator.click({ force: true });
+                clickedNewPost = true;
+                log.step(`new-post button clicked via ${newPost.selector}`);
+                await C.delay(1500);
+                continue;
+            }
+            if (!loggedMissing && Date.now() + 3500 < deadline) {
+                log.step('new-post button not visible yet; waiting');
+                loggedMissing = true;
+            }
+        }
+
+        await C.delay(350);
     }
-    return await C.seen(page.locator(COMPOSER).first(), 1000);
+
+    if (clickedNewPost) log.step('new-post clicked but composer still not visible');
+    else log.step('composer/new-post button not visible within timeout');
+    return false;
 }
 
 async function openChatByName(page, name, log) {
