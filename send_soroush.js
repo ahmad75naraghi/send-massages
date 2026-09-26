@@ -92,8 +92,15 @@ async function openChatBySearch(page, channel, log, strict = false) {
         const exactUser = new RegExp(`@${escapeRegex(channel)}(?![A-Za-z0-9_])`, 'i');
         result = base.filter({ hasText: exactUser }).first();
         if (!(await C.seen(result, 5000))) {
-            log.step('openChatBySearch(strict): exact username not found for @' + channel);
-            return false;
+            // بعضی نسخه‌های Soroush Web در نتیجهٔ جست‌وجو username را در innerText نشان نمی‌دهند.
+            // وقتی query دقیقاً @username است، اولین نتیجهٔ قابل مشاهده امن‌ترین fallback است؛
+            // fallback نام نمایشی عمداً غیرفعال می‌ماند تا به کانال تست هم‌نام نرود.
+            log.step('openChatBySearch(strict): exact username text not visible; trying first result for exact @query');
+            result = base.first();
+            if (!(await C.seen(result, 6000))) {
+                log.step('openChatBySearch(strict): no visible result for exact @' + channel);
+                return false;
+            }
         }
     } else {
         result = page.locator('.LeftSearch .ListItem, .search-results .ListItem, .LeftColumn .ListItem:has-text("' + channel + '")').first();
