@@ -67,6 +67,38 @@ const MODAL_SEND = [
 ];
 
 const escapeRegex = (s) => String(s || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const normalizeBrief = (s) => String(s || '').replace(/[‌‏‪-‮]/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+
+function hasExactChannelToken(text, channel) {
+    const c = String(channel || '').replace(/^@/, '').toLowerCase();
+    if (!c) return false;
+    return new RegExp(`(^|[^A-Za-z0-9_])@?${escapeRegex(c)}($|[^A-Za-z0-9_])`, 'i').test(normalizeBrief(text));
+}
+
+function hasWrongChannelVariant(text, channel) {
+    const c = String(channel || '').replace(/^@/, '').toLowerCase();
+    if (!c) return false;
+    const n = normalizeBrief(text);
+    // نمونهٔ خطرناک واقعی: جست‌وجوی @shamimeashena نتیجهٔ shamimeashena1 را هم می‌آورد.
+    return new RegExp(`(^|[^A-Za-z0-9_@])@?${escapeRegex(c)}[A-Za-z0-9_]+`, 'i').test(n)
+        && !hasExactChannelToken(n, c);
+}
+
+function strictCandidateStatus(brief, channel, expectedName) {
+    const name = normalizeBrief(expectedName || '');
+    const text = normalizeBrief(brief);
+    if (hasWrongChannelVariant(text, channel)) {
+        return { ok: false, reason: 'near-match username is not exact target' };
+    }
+    if (name && text.includes(name)) {
+        return { ok: true, reason: 'display-name match' };
+    }
+    if (hasExactChannelToken(text, channel)) {
+        return { ok: true, reason: 'exact username match' };
+    }
+    return { ok: false, reason: 'no exact username/display-name evidence' };
+}
+
 const COMPOSER = '.MiddleColumn .input-message-input, .MiddleColumn div[contenteditable="true"], #MiddleColumn .input-message-input, #MiddleColumn div[contenteditable="true"]';
 const NEW_POST_BUTTONS = [
     '.MiddleColumn button:has-text("پیام جدید")',
@@ -105,7 +137,7 @@ async function openChatByName(page, name, log) {
     return await ensureComposer(page, log, 8000);
 }
 
-async function openChatBySearch(page, channel, log, strict = false) {
+async function openChatBySearch(page, channel, log, strict = false, expectedName = null) {
     if (!channel) return false;
     const query = strict ? `@${channel}` : channel;
     const boxSel = '#search-input, .SearchInput input, input[type="search"], #telegram-search-input';
@@ -143,8 +175,13 @@ async function openChatBySearch(page, channel, log, strict = false) {
             const item = page.locator(resultSel).nth(i);
             if (!(await C.seen(item, 3000))) continue;
             const brief = await item.innerText({ timeout: 1000 }).catch(() => '');
+            const status = strictCandidateStatus(brief, channel, expectedName);
+            if (!status.ok) {
+                log.step(`openChatBySearch(strict): skipped result #${i + 1} for "${query}" (${status.reason}) text="${C.RunLog.brief(brief, 80)}"`);
+                continue;
+            }
             await item.click({ force: true });
-            log.step(`openChatBySearch(strict): clicked result #${i + 1} for "${query}" text="${C.RunLog.brief(brief, 80)}"`);
+            log.step(`openChatBySearch(strict): clicked result #${i + 1} for "${query}" (${status.reason}) text="${C.RunLog.brief(brief, 80)}"`);
             if (await ensureComposer(page, log, 15000)) return true;
             log.step(`openChatBySearch(strict): result #${i + 1} opened but composer not visible`);
         }
@@ -163,6 +200,11 @@ async function openChatByHash(page, browser, channel, log) {
     const route = /^-?\d+$/.test(String(channel)) ? `#${channel}` : `#@${channel}`;
     await page.goto(`https://web.splus.ir/${route}`, { waitUntil: 'domcontentloaded', timeout: 60000 });
     await C.delay(6000);
+    const url = page.url();
+    if (route.startsWith('#@') && !url.includes('#')) {
+        log.step(`openChatByHash: ${route} → url=${url} did not resolve to a chat hash`);
+        return false;
+    }
     const ok = await ensureComposer(page, log, 15000);
     log.step(`openChatByHash: ${route} → url=${page.url()} composer ${ok ? 'visible' : 'NOT visible'}`);
     return ok;
@@ -268,7 +310,7 @@ async function readActivePreview(page) {
         if (opts.strictChannel) {
             // hash route uses the exact username and avoids the duplicate display-name problem.
             strategies.push(['by-hash-strict', () => openChatByHash(page, browser, opts.channel, log)]);
-            strategies.push(['by-search-strict', () => openChatBySearch(page, opts.channel, log, true)]);
+            strategies.push(['by-search-strict', () => openChatBySearch(page, opts.channel, log, true, opts.channelName)]);
         } else {
             strategies.push(['by-hash', () => openChatByHash(page, browser, opts.channel, log)]);
             strategies.push(['by-search', () => openChatBySearch(page, opts.channel, log, false)]);
