@@ -128,7 +128,7 @@ function isConcreteChatHash(hash, channel) {
     // #@username is only the unresolved public route. After a real search-result click,
     // Soroush Web resolves channels to an internal numeric hash like #-1001243691.
     if (c && h === `#@${c}`) return false;
-    return /^#-?\d+/.test(h) || (c ? h.includes(c) : true);
+    return /^#-?\d+/.test(h);
 }
 
 async function waitForConcreteChatAfterClick(page, channel, beforeHash, log, label, timeout = 10000) {
