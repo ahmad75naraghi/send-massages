@@ -57,6 +57,7 @@
 | cron اجرا نمی‌شود | [§۹.۱](#s9-1) |
 | `jq: command not found` | [§۹.۲](#s9-2) |
 | نام فایل فارسی خراب شد | [§۹.۳](#s9-3) |
+| دکمهٔ صف پس‌زمینه فوراً می‌ایستد / «اجرای متروک» | [§۸.۱۰](#s8-10) |
 
 ---
 
@@ -1981,6 +1982,35 @@ grep -nE 'file injected via|FILE_INJECT_FAILED' "$APP"/logs/send_*.log | tail -1
 ```
 
 ---
+
+### ۸.۱۰ دکمهٔ «اجرای صف پس‌زمینه» کار نمی‌کند / فوراً «پایان» می‌شود <a id="s8-10"></a>
+
+**علائم**
+
+- کلیک روی دکمه فوراً پیام «پایان/متوقف شد» می‌دهد.
+- یا کارت پیشرفت روی «در حال اجرا» می‌ماند ولی worker مرده است (داشبورد «اجرای متروک» می‌گوید).
+
+**تشخیص — به این ترتیب:**
+
+```bash
+cd /home/file/public_html/s
+tail -30 logs/background_sync.log        # ۱) لاگ launcher: کدام PHP؟ خطای راه‌اندازی؟
+head -c 800 logs/background_progress.json 2>/dev/null; echo   # ۲) آخرین وضعیت worker
+cat logs/sync_worker.pid 2>/dev/null     # ۳) PID ادعایی؛ هست؟
+ACTION=queue_status php cli_run.php      # ۴) همان چیزی که داشبورد می‌بیند
+```
+
+**علت‌ها و رفع‌ها:**
+
+| پیام/کد | علت | رفع |
+|---|---|---|
+| `PHP_CLI_NOT_FOUND` | هیچ باینری PHP ≥8 سالم پیدا نشد (لیست تلاش‌ها در پاسخ JSON و لاگ است) | `PHP_CLI_BIN=/opt/cpanel/ea-php83/root/usr/bin/php` در `.env` بگذارید (یا `PHP_BIN` را که ابزارهای shell هم می‌خوانند) |
+| `SHELL_EXEC_DISABLED` | `shell_exec` در `disable_functions` است | §۵.۳ |
+| Worker مرد و progress روی `running` ماند (اجرای متروک) | kill سرور/OOM وسط کار | اجرای دوبارهٔ صف از همان‌جا ادامه می‌یابد (جدول `delivery` پست‌های موفق را رد می‌کند)؛ برای شروع تازه: `rm logs/background_progress.json logs/sync_worker.pid` |
+| `SESSION_EXPIRED` در گزارش مدیریتی | session سروش/آی‌گپ منقضی شده (runner مهلقاً متوقف شده تا به چت اشتباه نرود) | §۲.۱ ورود دوباره، بعد اجرای صف |
+| `RUNNER_TIMEOUT` | یک پست بیشتر از `USERBOT_TIMEOUT_SEC` طول کشید | دوباره اجرا کنید (ادامه از همان‌جا)؛ اگر تکرار شد §۱.۳ |
+
+**پیشگیری** — `health_check.sh` وضعیت PHP و اکستنشن‌ها را می‌سنجد؛ بعد از هر تغییر سرور اجرایش کنید.
 
 ## ۹. خودکارسازی (Cron / systemd)
 

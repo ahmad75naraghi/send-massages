@@ -771,6 +771,46 @@ async function processQueue() {
 
 ---
 
+### ۸.۵ صف پس‌زمینهٔ کامل (`background_sync` + `background_run`) — عبور از بودجهٔ زمانی Apache
+
+Micro-batching مشکل تایم‌اوت را حل می‌کند ولی دو ضعف داشت: حلقه در مرورگر کاربر است (بستن تب = توقف صف) و هر پست هنوز ~۶۰–۹۰ ثانیه طول می‌کشد (هر UserBot برای هر پست یک Chromium جدید بالا می‌آورد). صف پس‌زمینه هر دو را حل می‌کند:
+
+```mermaid
+sequenceDiagram
+    participant D as داشبورد (تب باز)
+    participant W as sync_manual.php (وب)
+    participant L as background_launcher.sh (setsid)
+    participant R as cli_run.php background_run
+    D->>W: POST background_sync {profile,maxPosts}
+    W->>W: resolvePhpCliBinary() (-v + اکستنشن‌ها + lint)
+    W->>L: setsid nohup bash launcher &  (فوری برمی‌گردد)
+    L->>R: ACTION=background_run SYNC_BODY_FILE=… php -f cli_run.php &
+    L->>L: echo $! > logs/sync_worker.pid ; wait
+    loop هر ۲.۵ ثانیه
+        D->>W: GET queue_status
+        W-->>D: progress از logs/background_progress.json
+    end
+    R->>R: scrape → دانلود گروهی → ۴ worker موازی → retry → گزارش بله
+    R-->>D: progress {state:"done", summary}
+```
+
+| مؤلفه | نقش |
+|---|---|
+| `background_sync` (وب) | باینری PHP را **اعتبارسنجی** می‌کند (`-v`≥8، اکستنشن‌های pdo_sqlite/curl/dom/mbstring، `php -l` روی خود sync_manual.php)، body JSON و launcher می‌سازد و با `setsid nohup` اجرا می‌کند تا مرگِ Apache/PHP وب، worker را نکشد. PID در `logs/sync_worker.pid`. |
+| `background_run` (CLI-only) | موتور کامل صف. فقط از CLI اجرا می‌شود؛ درخواست وب 403 می‌گیرد. |
+| `logs/background_progress.json` | وضعیت زندهٔ هر پست/پلتفرم؛ با rename اتمیک نوشته می‌شود تا خوانندهٔ هم‌زمان (وب) هرگز JSON نیم‌کاره نبیند. |
+| جدول `delivery` (SQLite) | دفتر تحویل با PK سه‌بخشی `(msg_id, platform, profile)`؛ اجرای دوبارهٔ صف، پلتفرم‌های قبلاً موفق هر پست را رد می‌کند (idempotency). |
+
+**سه اهرم سرعت** (پیش‌فرض فعال):
+
+| اهرم | اثر | کنترل |
+|---|---|---|
+| حالت `--batch` سروش/آی‌گپ | کل صف در **یک** مرورگرِ از پیش باز به‌جای یک Chromium برای هر پست؛ صرفه‌جویی ~۲۰s × تعداد پست | خودکار |
+| ارسال هم‌زمان | زمان هر پست = max(سروش, آی‌گپ) به‌جای مجموع چهار پلتفرم | `SYNC_PARALLEL_DISPATCH` |
+| بدون مکث | فاصلهٔ بین پست‌ها فقط در مسیر دستی/cron (`SYNC_GAP_SEC`)؛ صف پس‌زمینه `BACKGROUND_GAP_SEC=0` | `BACKGROUND_GAP_SEC` |
+
+**معناشنسی خطا** همان مسیر دستی است: پست با رسانهٔ شکست‌خوردهٔ زیر سقف تلاش → `deferred` و **توقف** (پست‌های بعدی `pending` می‌مانند تا چرخهٔ بعدی با لینک تازه)؛ ≥ سقف (`MEDIA_MAX_RETRY`) → انتشار فقط متن + ثبت صریح. کدهای مهلک runner (مثل `SESSION_EXPIRED`، `CHANNEL_NOT_FOUND`) کل worker را با گزارش متوقف می‌کنند تا ارسال به «چت اشتباه» اتفاق نیفتد. `last_msg_id` فقط تا آخرین پست پیوستهٔ موفق جلو می‌رود — با توقف روی `deferred`، چرخهٔ بعدی از همان‌جا ادامه می‌دهد.
+
 ## ۹. پروتکل‌های امنیتی <a id="s9"></a>
 
 ### ۹.۱ وضعیت فعلی و ریسک‌ها

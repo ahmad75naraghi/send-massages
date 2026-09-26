@@ -202,6 +202,29 @@ bash -n *.sh lib/*.sh
 - `584e584` — جلوگیری از کلیک روی کنترل‌های pinned سروش
 - `9ece887` — scope صحیح دکمهٔ ارسال مودال سروش
 
+## صف پس‌زمینه (background_sync / background_run) — دانش انتقال
+
+این بخش توسط بازنویسی «سرعت + دکمهٔ صف پس‌زمینه» (2026-09) اضافه شد.
+
+### چرا دکمه قبلاً فوراً «پایان» می‌داد
+نسخهٔ قدیمی باینری PHP را با `command -v php` پیدا می‌کرد (روی cPanel اغلب به php.fpm یا نسخهٔ اشتباه می‌رسید)، worker را با `nohup` ساده (بدون `setsid`) می‌زداشت که با پایان Apache می‌مرد، و پیشرفتی هم برای داشبورد نمی‌نوشت. هر سه رفع شده‌اند.
+
+### اجزا
+- `background_sync` (وب): `resolvePhpCliBinary()` باینری را **اعتبارسنجی** می‌کند (is_executable + `-v`≥8 + اکستنشن‌های pdo_sqlite/curl/dom/mbstring + `php -l` روی sync_manual.php؛ نتیجه static-cache). سپس `logs/background_body_<ts>.json` و `logs/background_launcher.sh` (0700) می‌سازد و با `setsid nohup bash launcher … &` اجرا می‌کند. PID worker توسط خود launcher در `logs/sync_worker.pid` نوشته می‌شود.
+- `background_run` (CLI-only؛ از وب 403): موتور صف — scrape پست‌های جدید (id > last_msg_id، قدیمی‌ترین اول، سقف `BACKGROUND_MAX_POSTS`)، ردِ پلتفرم‌های موفقِ قبلی از جدول `delivery`، دانلود گروهی رسانه، ارسال موازی (دو runner Node batch + دو worker HTTP بله/روبیکا)، تلاش مجدد تا `BACKGROUND_MAX_PASSES`، گزارش مدیریتی بله (`sendAdminReportLines`، chunk ≤3500)، جلو بردن `last_msg_id` فقط تا آخرین پست پیوستهٔ موفق.
+- `queue_status` (وب): وضعیت worker + محتوای `logs/background_progress.json` + دم لاگ‌ها.
+
+### قرارداد batch دو sender (`send_*.js --batch <file>`)
+- batch: `{items:[{id,text,file,type,fileName}…], progressFile:"/abs"}` → progress اتمیک per-item با `writeJsonFileAtomic` (rename)؛ آیتم‌ها **به‌ترتیب**، اولین شکست → ادامه NOT_ATTEMPTED؛ stdout آخرین خط JSON `{status:OK|PARTIAL|ERROR,sent,failed,total,stoppedAt,log}`؛ exit 0 مگر خطای راه‌اندازی مهلک.
+- کدهای مهلک (worker را متوقف می‌کنند): SESSION_EXPIRED, CHANNEL_NOT_FOUND, COMPOSER_NOT_AVAILABLE, APP_NOT_LOADED, NODE_DEPS_MISSING, BAD_BATCH, SHELL_EXEC_DISABLED, BATCH_WRITE_FAILED, LAUNCH_FAILED.
+- نکتهٔ ساختاری مهم: خروج مشترک (بستن مرورگر + emit + exitCode) باید در `finally` یک try بیرونی باشد؛ returnهای زودهنگام حالت تک‌پیام باید از آن عبور کنند. (این قبلاً شکسته بود و با smoke test با Playwright قلابی گرفته شد.)
+
+### دفتر تحویل و idempotency
+جدول `delivery` (PK: msg_id+platform+profile) در SQLite؛ `markDelivery()` upsert می‌کند و `deliveredOkPlatforms()` پلتفرم‌های موفقِ قبلی را برمی‌گرداند. `dispatchToPlatforms($only,$text,$localFile,$mediaType,$fileName,$profile,$db,$msgId)` خودش در پایان ثبت می‌کند. اجرای دوبارهٔ صف هیچ پست/پلتفرم موفق را دوباره نمی‌فرستد.
+
+### تست آفلاین بدون Playwright
+در sandbox node_modules نیست؛ یک fake ماژول playwright در `/tmp/fakepw/node_modules/playwright` ساخته شد (chromium.launchPersistentContext قلابی؛ evaluate() با تطبیق متن source جواب می‌دهد). اجرا: `NODE_PATH=/tmp/fakepw/node_modules node send_soroush.js --batch …`. توجه: NODE_PATH باید خودِ دایرکتوری node_modules باشد، نه والدش.
+
 ## هشدارهای مهم برای عامل‌های بعدی
 
 - روی کانال/branch دیگری کار نکنید مگر سیاست session اجازه بدهد.
