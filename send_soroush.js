@@ -57,19 +57,17 @@ const MENU_DOC = [
     '.MenuItem:has-text("فایل")',
 ];
 
-const MODAL = '.modal-dialog, .Modal, [role="dialog"]';
+const MODAL = ':is(.modal-dialog, .Modal, [role="dialog"])';
 const MODAL_SEND = [
+    `${MODAL} button:has-text("ارسال")`,
+    `${MODAL} [role="button"]:has-text("ارسال")`,
+    `${MODAL} button:has-text("Send")`,
+    `${MODAL} [role="button"]:has-text("Send")`,
     `${MODAL} button.confirm-dialog-button`,
     `${MODAL} button.primary`,
     `${MODAL} button.btn-primary`,
-    `${MODAL} button:has-text("ارسال")`,
-    `${MODAL} button:has-text("Send")`,
     `${MODAL} button:has(i[class*="send"])`,
     `${MODAL} [role="button"]:has(i[class*="send"])`,
-    `${MODAL} button:has(svg)`,
-    `${MODAL} [role="button"]:has(svg)`,
-    `${MODAL} button`,
-    `${MODAL} [role="button"]`,
 ];
 
 const escapeRegex = (s) => String(s || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -124,22 +122,32 @@ async function firstEnabled(page, selectors, { timeout = 20000, label = 'button'
 }
 
 
-async function clickModalBottomRight(page, log, label = 'modal bottom-right') {
+async function clickModalSendBottomLeft(page, log, label = 'modal send bottom-left') {
     const box = await page.evaluate(() => {
         const selectors = ['[role="dialog"]', '.modal-dialog', '.Modal'];
         const nodes = [];
         for (const sel of selectors) nodes.push(...document.querySelectorAll(sel));
         const visible = nodes
-            .map(el => ({ el, r: el.getBoundingClientRect(), text: (el.innerText || '').slice(0, 120) }))
-            .filter(x => x.r.width > 160 && x.r.height > 120 && x.r.bottom > 0 && x.r.right > 0 && getComputedStyle(x.el).visibility !== 'hidden');
-        visible.sort((a, b) => (b.r.width * b.r.height) - (a.r.width * a.r.height));
-        const x = visible.find(v => /ارسال|Send|عکس|ویدیو|رسانه/i.test(v.text)) || visible[0];
+            .map(el => ({ el, r: el.getBoundingClientRect(), text: (el.innerText || '').slice(0, 180) }))
+            .filter(x => {
+                const cs = getComputedStyle(x.el);
+                return x.r.width > 220 && x.r.height > 180 && x.r.bottom > 0 && x.r.right > 0
+                    && x.r.width < window.innerWidth * 0.9 && x.r.height < window.innerHeight * 0.95
+                    && cs.visibility !== 'hidden' && cs.display !== 'none';
+            });
+        visible.sort((a, b) => {
+            const as = /ارسال|Send|عکس|ویدیو|رسانه/i.test(a.text) ? 1 : 0;
+            const bs = /ارسال|Send|عکس|ویدیو|رسانه/i.test(b.text) ? 1 : 0;
+            return (bs - as) || ((b.r.width * b.r.height) - (a.r.width * a.r.height));
+        });
+        const x = visible[0];
         if (!x) return null;
         return { left: x.r.left, top: x.r.top, right: x.r.right, bottom: x.r.bottom, width: x.r.width, height: x.r.height, text: x.text };
     }).catch(() => null);
     if (!box) { log.step(`${label}: modal box not found`); return false; }
-    const x = Math.max(box.left + 20, box.right - 55);
-    const y = Math.max(box.top + 20, box.bottom - 55);
+    // در مودال RTL سروش، دکمهٔ آبی «ارسال» پایینِ چپ است.
+    const x = Math.min(box.right - 20, box.left + 45);
+    const y = Math.max(box.top + 20, box.bottom - 28);
     await page.mouse.click(x, y);
     log.step(`${label}: clicked at ${Math.round(x)},${Math.round(y)} box=${Math.round(box.width)}x${Math.round(box.height)} text="${C.RunLog.brief(box.text, 50)}"`);
     return true;
@@ -593,17 +601,24 @@ async function readActivePreview(page) {
             if (sendBtn && !sendBtn.disabled) {
                 await sendBtn.locator.click({ force: true });
                 sentVia = 'modal-button:' + sendBtn.selector;
+                await C.delay(3000);
+                if (await page.locator(MODAL).last().isVisible().catch(() => false)) {
+                    log.step('modal still visible after selector send; trying bottom-left send button');
+                    const clicked = await clickModalSendBottomLeft(page, log, 'modal send fallback');
+                    if (clicked) sentVia += '+bottom-left-click';
+                }
             } else {
                 if (sendBtn && sendBtn.disabled) log.step('WARNING: modal send button stayed disabled; trying modal coordinate fallback');
-                const clicked = await clickModalBottomRight(page, log, 'modal send fallback');
-                sentVia = clicked ? 'modal-bottom-right-click' : 'modal-fallback-missing';
-                await C.delay(1200);
-                const modalStill = await page.locator(MODAL).last().isVisible().catch(() => false);
-                if (!clicked || modalStill) {
-                    log.step('modal still visible after coordinate fallback; trying Ctrl+Enter');
-                    await page.keyboard.press('Control+Enter');
-                    sentVia += '+ctrl+enter';
-                }
+                const clicked = await clickModalSendBottomLeft(page, log, 'modal send fallback');
+                sentVia = clicked ? 'modal-bottom-left-click' : 'modal-fallback-missing';
+            }
+            await C.delay(1800);
+            const modalStill = await page.locator(MODAL).last().isVisible().catch(() => false);
+            if (modalStill) {
+                log.step('modal still visible after send clicks; trying Ctrl+Enter');
+                await page.keyboard.press('Control+Enter');
+                sentVia += '+ctrl+enter';
+                await C.delay(1800);
             }
             log.step(`media submit via ${sentVia}`);
             await C.delay(5000);
@@ -645,7 +660,7 @@ async function readActivePreview(page) {
                 if (sentVia === 'composer-enter' && composerCleared) { verified = true; how = 'composer-cleared'; return true; }
                 if (opts.file && modalGone && sentVia !== 'none') { acceptedButNotVisual = true; how = 'modal-closed-accepted'; return true; }
                 return false;
-            }, { timeout: opts.file ? 30000 : 20000, interval: 700, label: 'send verification' });
+            }, { timeout: opts.file ? 45000 : 20000, interval: 700, label: 'send verification' });
         } catch (e) {
             log.step('verification window elapsed without positive signal: ' + e.message);
         }
