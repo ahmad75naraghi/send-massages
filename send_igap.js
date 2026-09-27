@@ -42,7 +42,30 @@ const DEFAULT_CHANNEL_NAME = 'شمیم آشنا';
 const INITIAL_WAIT_MS = Number(C.env('IGAP_INITIAL_WAIT_MS', '3500')) || 3500;
 const VERIFY_TIMEOUT_MS = Number(C.env('IGAP_VERIFY_TIMEOUT_MS', C.env('USERBOT_VERIFY_TIMEOUT_MS', '8000'))) || 8000;
 
-const LOGIN_MARKERS = ['input[type="tel"]', 'input[placeholder*="موبایل"]', 'input[placeholder*="شماره"]'];
+const LOGIN_MARKERS = [
+    'input[type="tel"]', 'input[inputmode="tel"]', 'input[autocomplete="tel"]',
+    'input[placeholder*="موبایل"]', 'input[placeholder*="شماره"]',
+    'input[name*="phone"]', 'input[name*="mobile"]',
+];
+
+/**
+ * تشخیص صفحهٔ ورود بر اساس «متن صفحه» — برای فرم جدید آی‌گپ (سپتامبر ۲۰۲۶:
+ * انتخابگر کشور + شماره، بدون placeholder/type قابل‌اتکا).
+ * فقط وقتی صدا زده می‌شود که لیست گفت‌وگوها در مهلتش نیامده باشد؛ پس خطر
+ * مثبت کاذب (پیش‌نمایش پیام‌ها) موضوعیت ندارد.
+ * خروجی: marker یا null + اسنیپت متن برای پیام خطا.
+ */
+async function igapLoginProbe(page) {
+    let text = '';
+    try {
+        text = ((await page.locator('body').innerText({ timeout: 3000 })) || '');
+    } catch (e) { /* صفحه ناپایدار — همان APP_NOT_LOADED */ }
+    const flat = text.replace(/\u200c/g, ' ').replace(/\s+/g, ' ').trim();
+    if (/شماره\s*موبایل|کد\s*کشور|شماره\s*تلفن\s*خود\s*وارد/i.test(flat)) {
+        return { login: true, snippet: flat.slice(0, 160) };
+    }
+    return { login: false, snippet: flat.slice(0, 160) };
+}
 
 const ATTACH_BTN = ['button:has(i.icon-ig-attachment-outline)'];
 
@@ -488,10 +511,13 @@ async function sendOneIgap(page, name, item, log, tempo) {
                 if (!listReady) {
                     await C.safeScreenshot(page, 'last_igap_send.jpg', log);
                     stopRest(0);
-                    const err = loginMarker
-                        ? `صفحهٔ ورود آی‌گپ دیده شد (${loginMarker}). با login_igap.js دوباره وارد شوید.`
-                        : 'لیست گفت‌وگوهای آی‌گپ بارگذاری نشد (شبکه یا session)';
-                    const code = loginMarker ? 'SESSION_EXPIRED' : 'APP_NOT_LOADED';
+                    // فرم جدید ورود (بدون placeholder/type قدیمی) را با متن صفحه تشخیص بده
+                    const probe = await igapLoginProbe(page);
+                    const marker = loginMarker || (probe.login ? 'فرم ورود جدید (متن صفحه)' : null);
+                    const err = marker
+                        ? `صفحهٔ ورود آی‌گپ دیده شد (${marker}). با login_igap.js دوباره وارد شوید.`
+                        : `لیست گفت‌وگوهای آی‌گپ در مهلت بارگذاری نشد (شبکه یا session). متن صفحه: «${probe.snippet}»`;
+                    const code = marker ? 'SESSION_EXPIRED' : 'APP_NOT_LOADED';
                     progress.error = { code, message: err };
                     writeProgress();
                     result = { status: 'ERROR', code, error: err, log: log.file };
@@ -616,10 +642,13 @@ async function sendOneIgap(page, name, item, log, tempo) {
             const listReady = await C.seen(page.locator('#LeftColumn div[aria-haspopup="true"]').first(), 20000);
             if (!listReady) {
                 await C.safeScreenshot(page, 'last_igap_send.jpg', log);
-                if (loginMarker) {
-                    result = { status: 'ERROR', code: 'SESSION_EXPIRED', error: `صفحهٔ ورود آی‌گپ دیده شد (${loginMarker}). با login_igap.js دوباره وارد شوید.`, log: log.file };
+                // فرم جدید ورود (بدون placeholder/type قدیمی) را با متن صفحه تشخیص بده
+                const probe = await igapLoginProbe(page);
+                if (loginMarker || probe.login) {
+                    const marker = loginMarker || 'فرم ورود جدید (متن صفحه)';
+                    result = { status: 'ERROR', code: 'SESSION_EXPIRED', error: `صفحهٔ ورود آی‌گپ دیده شد (${marker}). با login_igap.js دوباره وارد شوید.`, log: log.file };
                 } else {
-                    result = { status: 'ERROR', code: 'APP_NOT_LOADED', error: 'لیست گفت‌وگوهای آی‌گپ بارگذاری نشد (شبکه یا session)', log: log.file };
+                    result = { status: 'ERROR', code: 'APP_NOT_LOADED', error: `لیست گفت‌وگوهای آی‌گپ در مهلت بارگذاری نشد (شبکه یا session). متن صفحه: «${probe.snippet}»`, log: log.file };
                 }
                 exitCode = 1;
                 return;

@@ -27,7 +27,7 @@ const TARGETS = {
     igap: {
         url: 'https://web.igap.net',
         profile: 'igap_profile',
-        loginMarkers: ['input[type="tel"]', 'input[placeholder*="شماره"]', '#auth_number'],
+        loginMarkers: ['input[type="tel"]', 'input[inputmode="tel"]', 'input[placeholder*="شماره"]', 'input[name*="phone"]', 'input[name*="mobile"]', '#auth_number'],
         keywords: ['پیوست', 'ضمیمه', 'Attach', 'عکس', 'تصویر', 'ویدیو', 'ویدئو', 'سند', 'فایل',
             'ارسال', 'Send', 'Media', 'File', 'caption', 'توضیح']
     },
