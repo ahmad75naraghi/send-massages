@@ -194,6 +194,9 @@ bash -n *.sh lib/*.sh
 
 `npm test` فقط `node --check` اجرا می‌کند و runtime مرورگر را اثبات نمی‌کند؛ تست تولید با profile واقعی لازم است.
 
+### دکمهٔ به‌روزرسانی (self_update — اضافه ۲۰۲۶-۰۹)
+اکشن وب `self_update` (POST+key): قفل `/tmp/cron_sync.lock` مشترک با cron/صف؛ رد درخت کثیف (`git status --porcelain --untracked-files=no`)؛ fetch از `origin/<UPDATE_GIT_REF>` (پیش‌فرض main، بدون ورودی کاربر)؛ اگر FETCH_HEAD==HEAD یا ancestor → «به‌روزی نیست»؛ واگرایی → DIVERGED؛ فقط `merge --ff-only`؛ بعد از merge با resolvePhpCliBinary سه فایل PHP را `-l` و با NODE_BIN پنج فایل JS را `--check` می‌کند؛ شکست → `git reset --hard <old>` (UPDATE_ROLLED_BACK). خروجی: from/to/files/commits. دکمهٔ `updateBtn` در هدر داشبورد + selfUpdate() با confirm و پیشنهاد رفرش.
+
 ## یادآوری‌های عملیاتی → REMINDERS.md
 هر موضوع «روز بد» (لاگ‌اوت session، ورود دستی با تونل، پشتیبان‌ها، کران، جبران resend، چک‌لیست آپدیت) در `REMINDERS.md` است — آن فایل را مرجع نگه دارید و با هر درس جدیدِ تولید به‌روزش کنید.
 

@@ -226,6 +226,8 @@ define('BACKGROUND_STAGGER_SEC', envInt('BACKGROUND_STAGGER_SEC', 12));
 // منطقهٔ زمانی ساعت‌های زمان‌بند (خالی = منطقهٔ پیش‌فرض سرور؛ مثال: Asia/Tehran).
 // ساعت نشان‌داده‌شدهٔ «سرور» در داشبورد هم با همین منطقه است.
 define('SCHEDULE_TIMEZONE', env('SCHEDULE_TIMEZONE', ''));
+// شاخه/برچسب مبنا برای دکمهٔ «به‌روزرسانی از گیت» داشبورد (action=self_update)
+define('UPDATE_GIT_REF', env('UPDATE_GIT_REF', 'main'));
 
 // --- مسیرهای داده ---
 define('STATE_DB_PATH', env('STATE_DB_PATH', SYNC_APP_DIR . '/state.sqlite'));

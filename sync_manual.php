@@ -1731,6 +1731,167 @@ if ($action === 'scheduler_tick') {
     exit;
 }
 
+// ============================================================
+//  self_update — به‌روزرسانی برنامه از گیت (دکمهٔ داشبورد)
+//  اصل: «هیچ‌وقت وضعیت نیمه‌خراب تحویل نده» —
+//   ۱) اگر صف/کرن در حال اجراست → رد (قفل مشترک flock)
+//   ۲) اگر درخت git کثیف است (تغییر محلی) → رد با فهرست فایل‌ها
+//   ۳) فقط merge --ff-only (هرگز conflict/تاریخچهٔ واگرا نمی‌سازد)
+//   ۴) بعد از merge، php -l و node --check روی فایل‌های اصلی؛
+//      اگر خراب بود → git reset --hard به وضعیت قبل (بازگشت خودکار)
+//  منبع آپدیت: origin/<UPDATE_GIT_REF> (پیش‌فرض main؛ قابل تغییر از .env)
+//  ورودی کاربر پذیرفته نمی‌شود (نه ref دلخواه، نه force).
+// ============================================================
+if ($action === 'self_update') {
+    header('Content-Type: application/json; charset=utf-8');
+    @set_time_limit(300);
+    @ignore_user_abort(true);
+
+    $updOut = function (array $payload, int $http = 200): void {
+        if ($http !== 200) { http_response_code($http); }
+        echo json_encode($payload, JSON_UNESCAPED_UNICODE);
+        exit;
+    };
+
+    if (!function_exists('shell_exec') || !is_callable('shell_exec')) {
+        $updOut(['success' => false, 'error' => 'SHELL_EXEC_DISABLED', 'message' => 'برای به‌روزرسانی، shell_exec باید در PHP فعال باشد.'], 500);
+    }
+
+    // اجرای git در دایرکتوری برنامه + گرفتن کد خروج (shell_exit rc نمی‌دهد؛ با نشانک آخر خط)
+    $gitRun = function (string $args): array {
+        $cmd = 'cd ' . escapeshellarg(SYNC_APP_DIR) . ' 2>/dev/null && git ' . $args . ' 2>&1; echo "__RC__=$?"';
+        $out = (string)@shell_exec($cmd);
+        $lines = array_map('trim', explode("\n", trim($out)));
+        $rc = 1;
+        if ($lines !== []) {
+            $last = (string)array_pop($lines);
+            if (preg_match('/^__RC__=(\d+)$/', $last, $m)) { $rc = (int)$m[1]; } else { $lines[] = $last; }
+        }
+        return [$lines, $rc];
+    };
+
+    // ---------- ۱) هیچ فرایند دیگری در حال اجرا نباشد ----------
+    [$running, $pid] = syncWorkerStatus();
+    if ($running) {
+        $updOut(['success' => false, 'error' => 'WORKER_RUNNING', 'message' => "صف پس‌زمینه در حال اجراست (PID {$pid})؛ تا پایانش صبر کنید بعد به‌روزرسانی کنید."], 409);
+    }
+    $lockFp = @fopen('/tmp/cron_sync.lock', 'c');
+    $lockHeld = false;
+    if ($lockFp !== false) {
+        if (!flock($lockFp, LOCK_EX | LOCK_NB)) {
+            @fclose($lockFp);
+            $updOut(['success' => false, 'error' => 'SYNC_BUSY', 'message' => 'چرخهٔ همگام‌سازی دیگری (cron/صف) همین الان قفل را دارد؛ چند لحظه بعد دوباره بزنید.'], 409);
+        }
+        $lockHeld = true;
+    }
+
+    try {
+        // ---------- ۲) git سالم است؟ ----------
+        [$verLines, $verRc] = $gitRun('--version');
+        if ($verRc !== 0 || !implode(' ', $verLines) || stripos(implode(' ', $verLines), 'git version') === false) {
+            $updOut(['success' => false, 'error' => 'GIT_MISSING', 'message' => 'git روی سرور در دسترس نیست: ' . implode(' ', array_slice($verLines, 0, 2))], 500);
+        }
+
+        // ---------- ۳) درخت تمیز؟ (تغییر محلی = رد؛ .env/پروفایل‌ها/لاگ‌ها ignored هستند و مانع نمی‌شوند) ----------
+        [$dirtyLines] = $gitRun('status --porcelain --untracked-files=no');
+        $dirty = array_values(array_filter($dirtyLines));
+        if ($dirty !== []) {
+            $updOut(['success' => false, 'error' => 'DIRTY_TREE', 'message' => 'فایل‌های زیر تغییر محلی دارند؛ اول آن‌ها را برگردانید (git checkout -- <فایل>) یا stash کنید:', 'details' => array_slice($dirty, 0, 15)], 409);
+        }
+
+        // ---------- ۴) وضعیت فعلی ----------
+        [$oldLines, $oldRc] = $gitRun('rev-parse HEAD');
+        $old = (string)implode('', $oldLines);
+        if ($oldRc !== 0 || !preg_match('/^[0-9a-f]{40}$/', $old)) {
+            $updOut(['success' => false, 'error' => 'NO_GIT_REPO', 'message' => 'این دایرکتوری یک clone سالم git نیست: ' . implode(' ', array_slice($oldLines, 0, 2))], 500);
+        }
+
+        // ---------- ۵) fetch از origin/<UPDATE_GIT_REF> ----------
+        $ref = preg_replace('/[^A-Za-z0-9._\/-]/', '', (string)UPDATE_GIT_REF);
+        if ($ref === '') { $ref = 'main'; }
+        [$fetchLines, $fetchRc] = $gitRun('fetch origin ' . escapeshellarg($ref));
+        if ($fetchRc !== 0) {
+            $updOut(['success' => false, 'error' => 'FETCH_FAILED', 'message' => 'دریابی از گیت ناموفق بود (شبکه/دسترسی):', 'details' => array_slice($fetchLines, 0, 8)], 502);
+        }
+        [$newLines, $newRc] = $gitRun('rev-parse FETCH_HEAD');
+        $new = (string)implode('', $newLines);
+        if ($newRc !== 0 || !preg_match('/^[0-9a-f]{40}$/', $new)) {
+            $updOut(['success' => false, 'error' => 'FETCH_FAILED', 'message' => 'شاخهٔ مبنا (' . $ref . ") روی origin پیدا نشد."], 502);
+        }
+
+        if ($new === $old) {
+            $updOut(['success' => true, 'updated' => false, 'from' => substr($old, 0, 7), 'message' => 'هم‌اکنون به‌روز هستید — نسخهٔ جدیدی روی ' . $ref . ' نیست.']);
+        }
+
+        // سرور جلوتر از origin است؟ (مثلاً PR هنوز merge نشده) — به‌روزرسانی‌ای وجود ندارد
+        [, $aheadRc] = $gitRun('merge-base --is-ancestor ' . escapeshellarg($new) . ' ' . escapeshellarg($old));
+        if ($aheadRc === 0) {
+            $updOut(['success' => true, 'updated' => false, 'from' => substr($old, 0, 7), 'message' => 'نسخهٔ سرور (' . substr($old, 0, 7) . ') جلوتر از ' . $ref . ' است؛ به‌روزرسانی جدیدی وجود ندارد (احتمالاً PR هنوز merge نشده).']);
+        }
+
+        // واگرایی؟ (تاریخچه‌های متفاوت) — هرگز خودسرانه حل نکن
+        [, $behindRc] = $gitRun('merge-base --is-ancestor ' . escapeshellarg($old) . ' ' . escapeshellarg($new));
+        if ($behindRc !== 0) {
+            $updOut(['success' => false, 'error' => 'DIVERGED', 'message' => 'تاریخچهٔ سرور با ' . $ref . ' واگرا شده؛ به‌روزرسانی خودکار امن نیست. با دستور «git log --oneline -5» وضعیت را بررسی/گزارش کنید.'], 409);
+        }
+
+        // ---------- ۶) merge فقط fast-forward ----------
+        [$mergeLines, $mergeRc] = $gitRun('merge --ff-only FETCH_HEAD');
+        [$nowLines] = $gitRun('rev-parse HEAD');
+        $now = (string)implode('', $nowLines);
+        if ($mergeRc !== 0 || $now !== $new) {
+            $gitRun('merge --abort');   // اگر وسط merge مانده باشد
+            $updOut(['success' => false, 'error' => 'MERGE_FAILED', 'message' => 'merge ناموفق بود؛ هیچ چیزی عوض نشد.', 'details' => array_slice($mergeLines, 0, 8)], 500);
+        }
+
+        // ---------- ۷) تأیید سلامت؛ خراب بود → بازگشت خودکار ----------
+        $lintFail = null;
+        [$phpOk, $phpBin] = resolvePhpCliBinary();
+        if ($phpOk) {
+            foreach (['sync_manual.php', 'config.php', 'cli_run.php'] as $f) {
+                $out = (string)@shell_exec(escapeshellarg($phpBin) . ' -l ' . escapeshellarg(SYNC_APP_DIR . '/' . $f) . ' 2>&1');
+                if (stripos($out, 'No syntax errors') === false) {
+                    $lintFail = "php -l {$f}: " . trim(explode("\n", $out)[0] ?? '');
+                    break;
+                }
+            }
+        }
+        if ($lintFail === null && is_executable((string)NODE_BIN)) {
+            foreach (['send_soroush.js', 'send_igap.js', 'login_igap.js', 'login_soroush.js', 'lib/pw_common.js'] as $f) {
+                $cmd = escapeshellarg((string)NODE_BIN) . ' --check ' . escapeshellarg(SYNC_APP_DIR . '/' . $f) . ' 2>&1; echo "__RC__=$?"';
+                $out = (string)@shell_exec($cmd);
+                if (strpos($out, '__RC__=0') === false) {
+                    $lintFail = "node --check {$f}: " . trim(explode("\n", $out)[0] ?? '');
+                    break;
+                }
+            }
+        }
+        if ($lintFail !== null) {
+            $gitRun('reset --hard ' . escapeshellarg($old));
+            $updOut(['success' => false, 'error' => 'UPDATE_ROLLED_BACK', 'message' => 'به‌روزرسانی اعمال شد ولی بررسی سلامت شکست خورد و به‌طور خودکار به نسخهٔ قبلی برگشت: ' . $lintFail], 500);
+        }
+
+        // ---------- ۸) گزارش ----------
+        [$commitLines] = $gitRun('log --oneline ' . escapeshellarg($old) . '..' . escapeshellarg($new));
+        [$fileLines] = $gitRun('diff --name-only ' . escapeshellarg($old) . '..' . escapeshellarg($new));
+        $commits = array_values(array_filter($commitLines));
+        $updOut([
+            'success' => true,
+            'updated' => true,
+            'from'    => substr($old, 0, 7),
+            'to'      => substr($new, 0, 7),
+            'files'   => count(array_filter($fileLines)),
+            'commits' => array_slice($commits, 0, 15),
+            'message' => 'به‌روزرسانی انجام شد: ' . substr($old, 0, 7) . ' → ' . substr($new, 0, 7) . ' (' . count(array_filter($fileLines)) . ' فایل). برای دیدن نسخهٔ جدید داشبورد، صفحه را رفرش کنید.',
+        ]);
+    } finally {
+        if ($lockFp !== false) {
+            if ($lockHeld) { @flock($lockFp, LOCK_UN); }
+            @fclose($lockFp);
+        }
+    }
+}
+
 if ($action === 'background_sync') {
     header('Content-Type: application/json; charset=utf-8');
     @mkdir(LOG_DIR, 0770, true);
@@ -2833,6 +2994,7 @@ if ($action === 'rewind') {
             <button id="queueBtn" class="btn" style="background:#0d9488" onclick="startBackgroundSync('main')">اجرای صف پس‌زمینه (همهٔ پست‌های جدید)</button>
             <button id="startBtn" class="btn" onclick="startSync()">اجرای دستی (۵ پست اصلی)</button>
             <button id="testBtn" class="btn" style="background:#7c3aed" onclick="startTestSync()">تست کانال‌های قبلی</button>
+            <button id="updateBtn" class="btn" style="background:#475569" onclick="selfUpdate()" title="به‌روزرسانی کد برنامه از گیت (ایمن: قفل صف، فقط fast-forward، بررسی سلامت و بازگشت خودکار)">↻ به‌روزرسانی از گیت</button>
         </div>
     </div>
 
@@ -3224,6 +3386,42 @@ if ($action === 'rewind') {
             renderSchedule(data);
         } catch (e) {
             log('❌ خطای تغییر زمان‌بند: ' + e.message, '#f87171');
+        }
+    }
+
+    // ---------- به‌روزرسانی از گیت (self_update) ----------
+    async function selfUpdate() {
+        if (!confirm('به‌روزرسانی برنامه از گیت اجرا شود؟\n(ایمن: اگر صف در حال اجرا باشد رد می‌شود؛ فقط fast-forward؛ در صورت خرابی خودکار به قبلی برمی‌گردد)')) return;
+        const btn = document.getElementById('updateBtn');
+        const oldLabel = btn.innerText;
+        btn.disabled = true;
+        btn.innerText = '⏳ در حال به‌روزرسانی…';
+        document.getElementById('statusText').innerText = 'در حال به‌روزرسانی از گیت…';
+        log('↻ شروع به‌روزرسانی از گیت…', '#7dd3fc');
+        try {
+            const res = await fetch(apiUrl('self_update'), { method: 'POST' });
+            const data = await res.json();
+            if (!data.success) {
+                log('❌ به‌روزرسانی نشد: ' + (data.message || data.error || 'خطای نامشخص'), '#f87171');
+                (data.details || []).forEach(d => log('   ' + d, '#fca5a5'));
+                document.getElementById('statusText').innerText = 'به‌روزرسانی ناموفق بود (سیستم دست‌نخورده است).';
+            } else if (!data.updated) {
+                log('✔ ' + data.message, '#4ade80');
+                document.getElementById('statusText').innerText = data.message;
+            } else {
+                log(`✔ به‌روزرسانی انجام شد: ${data.from} → ${data.to} (${faNum(data.files || 0)} فایل)`, '#4ade80');
+                (data.commits || []).forEach(c => log('   ' + c, '#94a3b8'));
+                document.getElementById('statusText').innerText = `به‌روزرسانی شد: ${data.from} → ${data.to}`;
+                setTimeout(() => {
+                    if (confirm('به‌روزرسانی کامل شد. صفحه برای بارگذاری نسخهٔ جدید رفرش شود؟')) location.reload();
+                }, 800);
+            }
+        } catch (e) {
+            log('❌ خطای به‌روزرسانی: ' + e.message, '#f87171');
+            document.getElementById('statusText').innerText = 'به‌روزرسانی ناموفق بود.';
+        } finally {
+            btn.disabled = false;
+            btn.innerText = oldLabel;
         }
     }
 

@@ -455,6 +455,7 @@ IGAP_CHANNEL_NAME="کانال آزمایش" sudo -u file --preserve-env=IGAP_CHA
 | `POST` | `sync_manual.php?action=schedule_remove&key=<KEY>` | `{"id":3}` | همان schedule_list |
 | `POST` | `sync_manual.php?action=schedule_toggle&key=<KEY>` | `{"id":3,"enabled":false}` | همان schedule_list |
 | — | `ACTION=scheduler_tick` (فقط CLI از crontab) | — | `{success, now, due, fired}` — شلیک اسلات سررسید از طریق همان `background_sync` |
+| `POST` | `sync_manual.php?action=self_update&key=<KEY>` | — | به‌روزرسانی از گیت: `{success, updated, from, to, files, commits[]}`؛ خطاهای `WORKER_RUNNING`/`SYNC_BUSY`/`DIRTY_TREE`/`DIVERGED`/`UPDATE_ROLLED_BACK` |
 | `GET` | `sync_manual.php?key=<KEY>` (بدون action) | — | HTML داشبورد |
 
 **`action=resend` — جبران شکست جزئی بدون پست تکراری**
@@ -637,6 +638,7 @@ ACTION=sync_single SYNC_BODY_FILE=/tmp/body.json php cli_run.php
 | 31 | **`manual_login.sh` — ورود دستی از مرورگر خودتان**: کرومیوم سرور با CDP روی 127.0.0.1 + تونل SSH + DevTools Screencast؛ اثبات آماده‌بودن CDP با `/json/version`؛ راه‌حل نهاییِ هر تغییر فرم ورود | ✨ قابلیت | `manual_login.sh`, `start_browser.sh` |
 | 32 | **[`REMINDERS.md`](REMINDERS.md)** — یادآوری‌های خیلی مهم عملیاتی (session، پشتیبان، کران، جبران، چک‌لیست آپدیت) به‌عنوان سند مرجع روز بد | 📚 Documentation | `REMINDERS.md`, `README.md` |
 ## ۱۳. سلب مسئولیت عملیاتی
+| 33 | **دکمهٔ «↻ به‌روزرسانی از گیت»**: اکشن `self_update` — قفل مشترک با صف/cron، ردِ درختِ کثیف با فهرست فایل‌ها، فقط merge --ff-only (بدون امکان conflict)، تشخیص واگرایی، و بعد از merge بررسی `php -l` + `node --check` با **بازگشت خودکار** در صورت شکست؛ شاخهٔ مبنا `UPDATE_GIT_REF` (پیش‌فرض `main`) | ✨ قابلیت | `sync_manual.php`, `config.php` |
 
 - مسیرهای UserBot (سروش‌پلاس و آی‌گپ) به **رابط وب رسمی** این پیام‌رسان‌ها وابسته‌اند. هر به‌روزرسانی سمت آن‌ها ممکن است سلکتورهای DOM را باطل کند؛ در این صورت [`PLAYWRIGHT_SPECS.md`](PLAYWRIGHT_SPECS.md) §۸ (playbook بازسازی سلکتور) را دنبال کنید.
 - استفاده از حساب کاربری واقعی برای خودکارسازی، مشروط به رعایت **شرایط استفادهٔ هر پلتفرم** است. پیش از استقرار تولید، از انطباق قانونی آن اطمینان حاصل کنید.
