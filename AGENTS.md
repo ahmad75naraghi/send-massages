@@ -194,13 +194,59 @@ bash -n *.sh lib/*.sh
 
 `npm test` فقط `node --check` اجرا می‌کند و runtime مرورگر را اثبات نمی‌کند؛ تست تولید با profile واقعی لازم است.
 
+### دکمهٔ به‌روزرسانی (self_update — اضافه ۲۰۲۶-۰۹)
+اکشن وب `self_update` (POST+key): قفل `/tmp/cron_sync.lock` مشترک با cron/صف؛ رد درخت کثیف (`git status --porcelain --untracked-files=no`)؛ fetch از `origin/<UPDATE_GIT_REF>` (پیش‌فرض main، بدون ورودی کاربر)؛ اگر FETCH_HEAD==HEAD یا ancestor → «به‌روزی نیست»؛ واگرایی → DIVERGED؛ فقط `merge --ff-only`؛ بعد از merge با resolvePhpCliBinary سه فایل PHP را `-l` و با NODE_BIN پنج فایل JS را `--check` می‌کند؛ شکست → `git reset --hard <old>` (UPDATE_ROLLED_BACK). خروجی: from/to/files/commits. دکمهٔ `updateBtn` در هدر داشبورد + selfUpdate() با confirm و پیشنهاد رفرش.
+
+## یادآوری‌های عملیاتی → REMINDERS.md
+هر موضوع «روز بد» (لاگ‌اوت session، ورود دستی با تونل، پشتیبان‌ها، کران، جبران resend، چک‌لیست آپدیت) در `REMINDERS.md` است — آن فایل را مرجع نگه دارید و با هر درس جدیدِ تولید به‌روزش کنید.
+
 ## آخرین commitهای مهم این کار
 
+- `ad34941` — manual_login.sh: اثبات آماده‌بودن CDP قبل از راهنمایی کاربر
+- `21b9b6d` — manual_login.sh: ورود دستی با تونل SSH + Screencast (راه‌حل نهایی تغییر فرم ورود)
+- `def9b8a` — login_igap.js: submit مقاوم + توقف صادقانه (پیامک درخواست نشده)
+- `c9d5337` — تشخیص session آی‌گپ با فرم ورود جدید (متن صفحه) + متن صفحه در APP_NOT_LOADED
+- `4c96071` — رفع «آیگپ ✕» صف: stagger دو مرورگر + مهلت ۲۰s + retry غیرمهلک
+- `f026b6f` — زمان‌بندی خودکار (schedule_* + scheduler_tick)
+- `eb5c927` — صف پس‌زمینهٔ کامل + batch + موازی‌سازی
 - `36e49cd` — جدا کردن stdout JSON از stderr در userbot runner PHP
 - `4976edc` — قبول ارسال‌های رسانه‌ای آی‌گپ با شواهد معتبر
 - `5204605` — scope صحیح selectorهای مودال آی‌گپ
 - `584e584` — جلوگیری از کلیک روی کنترل‌های pinned سروش
 - `9ece887` — scope صحیح دکمهٔ ارسال مودال سروش
+
+## صف پس‌زمینه (background_sync / background_run) — دانش انتقال
+
+این بخش توسط بازنویسی «سرعت + دکمهٔ صف پس‌زمینه» (2026-09) اضافه شد.
+
+### چرا دکمه قبلاً فوراً «پایان» می‌داد
+نسخهٔ قدیمی باینری PHP را با `command -v php` پیدا می‌کرد (روی cPanel اغلب به php.fpm یا نسخهٔ اشتباه می‌رسید)، worker را با `nohup` ساده (بدون `setsid`) می‌زداشت که با پایان Apache می‌مرد، و پیشرفتی هم برای داشبورد نمی‌نوشت. هر سه رفع شده‌اند.
+
+### اجزا
+- `background_sync` (وب): `resolvePhpCliBinary()` باینری را **اعتبارسنجی** می‌کند (is_executable + `-v`≥8 + اکستنشن‌های pdo_sqlite/curl/dom/mbstring + `php -l` روی sync_manual.php؛ نتیجه static-cache). سپس `logs/background_body_<ts>.json` و `logs/background_launcher.sh` (0700) می‌سازد و با `setsid nohup bash launcher … &` اجرا می‌کند. PID worker توسط خود launcher در `logs/sync_worker.pid` نوشته می‌شود.
+- `background_run` (CLI-only؛ از وب 403): موتور صف — scrape پست‌های جدید (id > last_msg_id، قدیمی‌ترین اول، سقف `BACKGROUND_MAX_POSTS`)، ردِ پلتفرم‌های موفقِ قبلی از جدول `delivery`، دانلود گروهی رسانه، ارسال موازی (دو runner Node batch + دو worker HTTP بله/روبیکا)، تلاش مجدد تا `BACKGROUND_MAX_PASSES`، گزارش مدیریتی بله (`sendAdminReportLines`، chunk ≤3500)، جلو بردن `last_msg_id` فقط تا آخرین پست پیوستهٔ موفق.
+- `queue_status` (وب): وضعیت worker + محتوای `logs/background_progress.json` + دم لاگ‌ها.
+
+### قرارداد batch دو sender (`send_*.js --batch <file>`)
+- batch: `{items:[{id,text,file,type,fileName}…], progressFile:"/abs"}` → progress اتمیک per-item با `writeJsonFileAtomic` (rename)؛ آیتم‌ها **به‌ترتیب**، اولین شکست → ادامه NOT_ATTEMPTED؛ stdout آخرین خط JSON `{status:OK|PARTIAL|ERROR,sent,failed,total,stoppedAt,log}`؛ exit 0 مگر خطای راه‌اندازی مهلک.
+- کدهای مهلک (worker را متوقف می‌کنند): SESSION_EXPIRED, CHANNEL_NOT_FOUND, COMPOSER_NOT_AVAILABLE, NODE_DEPS_MISSING, BAD_BATCH, SHELL_EXEC_DISABLED, BATCH_WRITE_FAILED, LAUNCH_FAILED. (APP_NOT_LOADED مهلک «نیست»: در فشار cold-start موازی گذراست و در پاس دوم دوباره تلاش می‌شود؛ مهلت لیست آی‌گپ هم ۲۰ ثانیه است و بین دو راه‌اندازی BACKGROUND_STAGGER_SEC=12 فاصله می‌افتد.)
+- نکتهٔ ساختاری مهم: خروج مشترک (بستن مرورگر + emit + exitCode) باید در `finally` یک try بیرونی باشد؛ returnهای زودهنگام حالت تک‌پیام باید از آن عبور کنند. (این قبلاً شکسته بود و با smoke test با Playwright قلابی گرفته شد.)
+
+### دفتر تحویل و idempotency
+جدول `delivery` (PK: msg_id+platform+profile) در SQLite؛ `markDelivery()` upsert می‌کند و `deliveredOkPlatforms()` پلتفرم‌های موفقِ قبلی را برمی‌گرداند. `dispatchToPlatforms($only,$text,$localFile,$mediaType,$fileName,$profile,$db,$msgId)` خودش در پایان ثبت می‌کند. اجرای دوبارهٔ صف هیچ پست/پلتفرم موفق را دوباره نمی‌فرستد.
+
+### تست آفلاین بدون Playwright
+در sandbox node_modules نیست؛ یک fake ماژول playwright در `/tmp/fakepw/node_modules/playwright` ساخته شد (chromium.launchPersistentContext قلابی؛ evaluate() با تطبیق متن source جواب می‌دهد). اجرا: `NODE_PATH=/tmp/fakepw/node_modules node send_soroush.js --batch …`. توجه: NODE_PATH باید خودِ دایرکتوری node_modules باشد، نه والدش.
+
+### زمان‌بند خودکار (اضافه‌شده ۲۰۲۶-۰۹، همراه صف پس‌زمینه)
+- جداول `schedule` / `schedule_runs` (PK: schedule_id+day = mutex روزانه) / `schedule_meta` (heartbeat تیک).
+- `scheduler_tick` (CLI-only): heartbeat همیشه؛ اسلات سررسید با پنجرهٔ تحمل ۲ دقیقه (now, -1m, -2m)؛ شلیک = اجرای `ACTION=background_sync` از CLI با body موقت (بدون refactor موتور)؛ نتیجه در schedule_runs (fired/skipped_busy/error) + logs/scheduler.log.
+- نصب = فقط یک خط crontab به scheduler_tick.sh؛ افزودن/حذف ساعت‌ها فقط از داشبورد (اکشن‌های schedule_list/add/remove/toggle). داشبورد با heartbeat نصب بودن کران را تشخیص می‌دهد و خط crontab لازم را نمایش می‌دهد.
+- `SCHEDULE_TIMEZONE` (خالی = منطقهٔ سرور) هم تیک هم ساعت نمایشی داشبورد.
+- تست آفلاین زنجیره: mock php با پورت python همین منطق روی sqlite واقعی + لانچر واقعی (در /tmp/schedtest — در sandbox ماندگار نیست).
+
+### ورود دستی (fallback نهایی)
+`manual_login.sh igap|soroush` = start_browser.sh (CDP فقط 127.0.0.1، پورت با REMOTE_DEBUG_PORT/MANUAL_LOGIN_PORT) + راهنمای تونل SSH؛ کاربر صفحهٔ کرومیومِ سرور را با DevTools Screencast (http://127.0.0.1:PORT از طریق ssh -L) می‌بیند و دستی لاگین می‌کند. session همان جا ساخته می‌شود؛ Ctrl+C بسته می‌کند + پاک‌سازی Singleton. وقتی فرم ورود وب‌کلاینت عوض شده بهترین راه است.
 
 ## هشدارهای مهم برای عامل‌های بعدی
 

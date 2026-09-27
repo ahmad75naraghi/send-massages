@@ -11,6 +11,14 @@
  *    ACTION=send_report SYNC_BODY_FILE=/tmp/report.json php cli_run.php
  *    ACTION=sync_recent SYNC_BODY_FILE=/tmp/recent.json php cli_run.php
  *    ACTION=queue_status php cli_run.php
+ *    ACTION=background_run SYNC_BODY_FILE=/tmp/bg.json php cli_run.php
+ *      ← موتور صف پس‌زمینه؛ همان چیزی که دکمهٔ داشبورد با launcher اجرا می‌کند.
+ *         فقط CLI مجاز است (از وب 403 می‌گیرد). بدنهٔ JSON:
+ *         {"profile":"main","maxPosts":50,"gap":0,"only":["bale","rubika","soroush","igap"]}
+ *    ACTION=schedule_list php cli_run.php
+ *      ← فهرست ساعت‌های زمان‌بندی + وضعیت تیک کرون
+ *    ACTION=scheduler_tick php cli_run.php     ← فقط از crontab (scheduler_tick.sh)
+ *      اگر ساعتی سررسید باشد، همان مسیر background_sync را شلیک می‌کند.
  */
 declare(strict_types=1);
 

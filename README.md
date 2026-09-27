@@ -27,6 +27,12 @@
    - **سروش‌پلاس** و **آی‌گپ** از طریق **UserBot مبتنی بر Playwright** (چون API رسمی آن‌ها اجازهٔ ارسال به کانال با حساب کاربری را نمی‌دهد).
 5. نتیجهٔ هر پست را به‌صورت badge در داشبورد وب نمایش می‌دهد و گزارش تجمیعی را برای مدیر در بله ارسال می‌کند.
 
+> **⚠️ خیلی مهم — [REMINDERS.md](REMINDERS.md) را همیشه دم‌دست نگه دارید.**
+> یادآوری‌های عملیاتیِ حیاتی آنجا است: بازیابی session لاگ‌اوت‌شده با ورود دستی
+> (`manual_login.sh` + تونل SSH)، پشتیبان/بازگردانی session، خط کران زمان‌بند،
+> سه لاگی که اول از همه باید دید، جبران پست بدون تکرار، و چک‌لیست بعد از هر آپدیت.
+> همهٔ آن موارد در تولید واقعاً رخ داده‌اند.
+
 معماری به‌گونه‌ای طراحی شده که **هر پست در یک درخواست HTTP مستقل** پردازش شود؛ این تصمیم مستقیماً مشکل `504 Gateway Timeout` و `500 Internal Server Error` ناشی از محدودیت زمانی Apache/FastCGI را حل کرده است (نگاه کنید به [`ARCHITECTURE.md`](ARCHITECTURE.md) §۶).
 
 ---
@@ -411,6 +417,13 @@ IGAP_CHANNEL_NAME="کانال آزمایش" sudo -u file --preserve-env=IGAP_CHA
 | کلید | پیش‌فرض | نقش |
 |---|---|---|
 | `USERBOT_TIMEOUT_SEC` | `240` | کرانهٔ سخت هر اجرای UserBot (`timeout` دور subprocess) |
+| `PHP_CLI_BIN` | *(خالی = تشخیص خودکار؛ fallback از `PHP_BIN`)* | باینری PHP برای worker صف پس‌زمینه — باید PHP 8 + اکستنشن‌ها + lint سالم باشد |
+| `BACKGROUND_MAX_POSTS` | `50` | سقف پست‌های جدید در هر اجرای صف پس‌زمینه |
+| `BACKGROUND_GAP_SEC` | `0` | مکث بین پست‌ها در صف پس‌زمینه (۰ = بدون مکث؛ `SYNC_GAP_SEC` فقط مسیر دستی/cron) |
+| `SYNC_PARALLEL_DISPATCH` | `true` | ارسال هم‌زمان سروش+آی‌گپ (دو Chromium موازی)؛ برای سرور کم‌رمز `0` |
+| `BACKGROUND_MAX_PASSES` | `2` | حداکثر دفعات تلاش مجدد پلتفرم‌های ناموفق در صف |
+| `BACKGROUND_STAGGER_SEC` | `12` | فاصلهٔ عمدی بین راه‌اندازی دو مرورگر در ارسال موازی (۰ = بدون فاصله) |
+| `SCHEDULE_TIMEZONE` | *(خالی = منطقهٔ سرور)* | منطقهٔ زمانی ساعت‌های زمان‌بند و ساعت نمایشی سرور (مثال: `Asia/Tehran`) |
 | `MEDIA_MAX_RETRY` | `3` | سقف تلاش دانلود رسانه پیش از انتشار بدون رسانه ([`TROUBLESHOOTING.md`](TROUBLESHOOTING.md) §۳.۳) |
 | `SYNC_GAP_SEC` | `5` | فاصلهٔ بین پست‌ها در `cron_sync.sh` |
 | `CHECK_INTERVAL_SEC` | `30` | فاصلهٔ بررسی در `sync_daemon.php` (legacy) |
@@ -435,6 +448,14 @@ IGAP_CHANNEL_NAME="کانال آزمایش" sudo -u file --preserve-env=IGAP_CHA
 | `GET` | `sync_manual.php?action=list_posts&key=<KEY>&limit=10` | — | `{success, lastSeenId, limit, count, posts:[{id,text,preview,mediaType,fileName,hasMedia,sentBefore}]}` |
 | `POST` | `sync_manual.php?action=resend&key=<KEY>` | `{"ids":[…]}` یا `{"from":74136,"to":74142}` + `{"only":[…]}` + `{"no_media":bool,"advance":bool}` | `{success, only, count, lastSeenId, results:[…]}` |
 | `POST` | `sync_manual.php?action=rewind&key=<KEY>` | `{"id":74135}` | `{success, before, lastSeenId}` |
+| `GET` | `sync_manual.php?action=queue_status&key=<KEY>` | — | `{success, running, pid, progress:{state,phase,totalPosts,summary,…}, log, launcherLog}` |
+| `POST` | `sync_manual.php?action=background_sync&key=<KEY>` | `{"profile":"main","maxPosts":50}` | `{success:true, started:true, pid}` یا `{success:true, started:false, reason:"ALREADY_RUNNING", progress}` |
+| `GET` | `sync_manual.php?action=schedule_list&key=<KEY>` | — | `{success, now, timezone, items:[{id,time,maxPosts,profile,enabled,lastRun}], nextAt, tickActive, cronLine}` |
+| `POST` | `sync_manual.php?action=schedule_add&key=<KEY>` | `{"time":"09:30","maxPosts":5,"profile":"main"}` | همان schedule_list + `added` |
+| `POST` | `sync_manual.php?action=schedule_remove&key=<KEY>` | `{"id":3}` | همان schedule_list |
+| `POST` | `sync_manual.php?action=schedule_toggle&key=<KEY>` | `{"id":3,"enabled":false}` | همان schedule_list |
+| — | `ACTION=scheduler_tick` (فقط CLI از crontab) | — | `{success, now, due, fired}` — شلیک اسلات سررسید از طریق همان `background_sync` |
+| `POST` | `sync_manual.php?action=self_update&key=<KEY>` | — | به‌روزرسانی از گیت: `{success, updated, from, to, files, commits[]}`؛ خطاهای `WORKER_RUNNING`/`SYNC_BUSY`/`DIRTY_TREE`/`DIVERGED`/`UPDATE_ROLLED_BACK` |
 | `GET` | `sync_manual.php?key=<KEY>` (بدون action) | — | HTML داشبورد |
 
 **`action=resend` — جبران شکست جزئی بدون پست تکراری**
@@ -451,6 +472,34 @@ curl -s -X POST "https://دامنه/s/sync_manual.php?action=resend&key=$KEY" \
 echo '{"ids":[74136,74137],"only":["soroush","igap"]}' > /tmp/resend.json
 ACTION=resend SYNC_BODY_FILE=/tmp/resend.json php cli_run.php | jq .
 ```
+
+**`action=background_sync` — صف پس‌زمینهٔ کامل (دکمهٔ داشبورد)**
+
+دکمهٔ «اجرای صف پس‌زمینه» روی داشبورد همین action را صدا می‌زند. جریان:
+
+1. PHP وب، باینری PHP سالم را تأیید می‌کند (`resolvePhpCliBinary`: `-v`، اکستنشن‌ها و `php -l`)، یک body JSON و یک `logs/background_launcher.sh` می‌سازد و آن را با `setsid nohup` **مستقل از Apache** اجرا می‌کند؛ PID worker در `logs/sync_worker.pid` ثبت می‌شود.
+2. worker (`ACTION=background_run`) از CLI اجرا می‌شود: پست‌های جدید (id > `last_msg_id`، قدیمی‌ترین اول، حداکثر `BACKGROUND_MAX_POSTS`) را از ایتا می‌خواند، رسانه‌ها را یک‌جا دانلود می‌کند و **هم‌زمان** به چهار پلتفرم می‌فرستد: دو runner Node (سروش‌پلاس + آی‌گپ، هرکدام کل صف را در یک مرورگر می‌فرستد) و دو worker HTTP (بله/روبیکا). هیچ مکثی بین پست‌ها نیست (`BACKGROUND_GAP_SEC=0`).
+3. پیشرفت لحظه‌ای در `logs/background_progress.json` نوشته می‌شود (نوشتن اتمیک) و داشبورد هر ۲.۵ ثانیه آن را با `queue_status` می‌خواند — بدون باز نگه‌داشتن هیچ درخواست وبی.
+4. هر پست فقط یک‌بار می‌رود: جدول `delivery` (PK: msg_id+platform+profile) موفقیت‌ها را ثبت می‌کند و تلاش دوباره همان پست، پلتفرم‌های قبلاً موفق را رد می‌کند.
+5. در پایان، گزارش مدیریتی بله با جزئیات هر پست ارسال می‌شود و `last_msg_id` فقط تا آخرین پستِ موفقِ پیوسته جلو می‌رود.
+
+اگر worker وسط کار بمیرد، داشبورد «اجرای متروک» را نشان می‌دهد؛ اجرای دوبارهٔ صف از همان‌جا ادامه می‌دهد (پست‌های قبلاً موفق رد می‌شوند).
+
+**`action=scheduler_tick` — زمان‌بندی خودکار در ساعت‌های دلخواه**
+
+پنل «زمان‌بندی خودکار» داشبورد همین خانواده را مدیریت می‌کند: ساعت‌های `HH:MM` را اضافه/حذف/غیرفعال می‌کنید و در هر ساعتِ سررسید، تا ۵ پست **جدید** (قابل تغییر هر اسلات، ۱ تا ۵۰) با همان موتور صف پس‌زمینه ارسال می‌شود.
+
+نصب فقط **یک خط crontab** است (از cPanel → Cron Jobs یا `crontab -e`)؛ بعد از آن افزودن/حذف ساعت‌ها فقط از داشبورد انجام می‌شود و این خط دیگر تغییر نمی‌کند:
+
+```cron
+* * * * * /home/file/public_html/s/scheduler_tick.sh
+```
+
+- `scheduler_tick.sh` هر دقیقه اجرا می‌شود؛ اگر ساعتی سررسید باشد (با تحمل ۲ دقیقه تأخیر)، همان مسیر `background_sync` را از CLI صدا می‌زند — یعنی همان موتور، همان قفل `flock` مشترک با cron، همان پیشرفت زنده در داشبورد.
+- هر اسلات حداکثر **یک‌بار در روز** شلیک می‌شود (کلید یکتای `schedule_id + day` در جدول `schedule_runs`).
+- اگر در لحظهٔ اسلات صف دیگری در حال اجرا باشد، همان اسلات `skipped_busy` ثبت می‌شود (بدون ارسال تکراری).
+- داشبورد با heartbeat تیک (جدول `schedule_meta`) نشان می‌دهد که کران نصب است یا نه؛ اگر نصب نباشد، خط crontab لازم را عیناً نمایش می‌دهد.
+- ساعت‌ها با منطقهٔ زمانی سرور تفسیر می‌شوند؛ برای تغییر، `SCHEDULE_TIMEZONE=Asia/Tehran` در `.env`. ساعت فعلی سرور در همان پنل نمایش داده می‌شود.
 
 همین فیلتر در `sync_single` هم هست: `{"id":…,"text":…,"only":["igap"]}`. پلتفرم‌های ردشده در پاسخ `{"ok":null,"info":"SKIPPED"}` می‌گیرند و در داشبورد با `—` نمایش داده می‌شوند.
 
@@ -545,6 +594,7 @@ ACTION=sync_single SYNC_BODY_FILE=/tmp/body.json php cli_run.php
 | [`DEPLOYMENT.md`](DEPLOYMENT.md) | نصب پکیج‌ها، مجوزها، مقداردهی اولیه session، Cron و Systemd، `.htaccess`، مانیتورینگ، رول‌بک |
 | [`PLAYWRIGHT_SPECS.md`](PLAYWRIGHT_SPECS.md) | مشخصات کامل سلکتورهای سروش‌پلاس و آی‌گپ، مدیریت race condition، workaround های headless، playbook نگهداری سلکتور |
 | [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md) | Runbook دسته‌بندی‌شده با دستورات دقیق bash برای هر حالت خرابی |
+| [`REMINDERS.md`](REMINDERS.md) | **یادآوری‌های خیلی مهم عملیاتی** — بازیابی session، پشتیبان‌ها، کران، جبران؛ اول این را ببین |
 
 ---
 
@@ -576,9 +626,19 @@ ACTION=sync_single SYNC_BODY_FILE=/tmp/body.json php cli_run.php
 | 22 | پنل کناری «بررسی و شروع همگام‌سازی» در داشبورد: انتخاب N پست آخر، ارسال **اجباری** بدون توجه به `last_msg_id`، انتخاب مقصدها، گزینهٔ بدون رسانه، `advance` اختیاری، فاصلهٔ بین پست‌ها، هشدار پست تکراری و نتیجهٔ رنگی به‌تفکیک پلتفرم + action جدید `list_posts` | ✨ قابلیت | `sync_manual.php` |
 | 23 | افزودن `DASHBOARD_ALLOWED_IP` (محدودسازی IP داشبورد از `.env`) و `IGAP_ITEM_ID` (انتقال `--item-id` به Node) | ✨ قابلیت | `config.php`, `sync_manual.php` |
 
+| 24 | **صف پس‌زمینهٔ کامل**: actionهای `background_sync` (launcher مستقل با `setsid nohup` + ثبت PID) و `background_run` (موتور CLI: دانلود گروهی رسانه، چهار worker موازی، دفتر تحویل `delivery` برای idempotency، تلاش مجدد، گزارش مدیریتی) و `queue_status` (پیشرفت زنده) + رندر کارت‌به‌کارت پیشرفت در داشبورد | ✨ قابلیت | `sync_manual.php`, `config.php`, `cli_run.php` |
+| 25 | **حالت `--batch` برای هر دو UserBot**: کل صف در یک مرورگر با progress-file اتمیک (به‌جای راه‌اندازی Chromium برای هر پست)؛ حفظ ترتیب، توقف روی اولین خطا و علامت‌گذاری بقیه `NOT_ATTEMPTED` | ✨ قابلیت/سرعت | `send_soroush.js`, `send_igap.js`, `lib/pw_common.js` |
+| 26 | **ارسال هم‌زمان سروش+آی‌گپ** در `dispatchToPlatforms` (قابل خاموش‌کردن با `SYNC_PARALLEL_DISPATCH=0`)؛ زمان هر پست از مجموعِ چهار پلتفرم به max(سروش, آی‌گپ) می‌رسد | ⚡ سرعت | `sync_manual.php` |
 ---
+| 27 | **زمان‌بندی خودکار**: پنل «زمان‌بندی خودکار» در داشبورد (افزودن/حذف/روشن‌وخاموش ساعت‌ها، ساعت سرور، heartbeat کران)، اکشن‌های `schedule_*` + `scheduler_tick` (CLI)، جداول `schedule`/`schedule_runs`/`schedule_meta` و `scheduler_tick.sh` — شلیک اسلات = همان مسیر صف پس‌زمینه با mutex روزانه | ✨ قابلیت | `sync_manual.php`, `scheduler_tick.sh`, `config.php` |
 
+| 28 | **رفع «آیگپ ✕» در صف** (مشاهدهٔ تولید): فاصلهٔ عمدی بین راه‌اندازی دو مرورگر (`BACKGROUND_STAGGER_SEC=12`)، مهلت لیست آی‌گپ ۸→۲۰ ثانیه، و `APP_NOT_LOADED` دیگر مهلک نیست (پاس دوم خودکار) | 🐛 Bugfix | `sync_manual.php`, `send_igap.js`, `config.php` |
+| 29 | **تشخیص session منقضی آی‌گپ با فرم ورود جدید** (سپتامبر ۲۰۲۶): فرم جدید نه `type=tel` داشت نه placeholder؛ لایهٔ دوم تشخیص با متن صفحه + آوردن «متن صفحه» داخل خود پیام `APP_NOT_LOADED` | 🐛 Bugfix | `send_igap.js`, `dump_dom.js` |
+| 30 | **بازنویسی `login_igap.js`**: انتخاب کشور، submit مقاوم با تأیید واقعی رفتن به مرحلهٔ کد، توقف صادقانه وقتی پیامکی درخواست نشده (قبلاً بی‌صدا منتظر کد می‌ماند!)، اسنپ‌شات متنی هر مرحله | 🐛 Bugfix | `login_igap.js` |
+| 31 | **`manual_login.sh` — ورود دستی از مرورگر خودتان**: کرومیوم سرور با CDP روی 127.0.0.1 + تونل SSH + DevTools Screencast؛ اثبات آماده‌بودن CDP با `/json/version`؛ راه‌حل نهاییِ هر تغییر فرم ورود | ✨ قابلیت | `manual_login.sh`, `start_browser.sh` |
+| 32 | **[`REMINDERS.md`](REMINDERS.md)** — یادآوری‌های خیلی مهم عملیاتی (session، پشتیبان، کران، جبران، چک‌لیست آپدیت) به‌عنوان سند مرجع روز بد | 📚 Documentation | `REMINDERS.md`, `README.md` |
 ## ۱۳. سلب مسئولیت عملیاتی
+| 33 | **دکمهٔ «↻ به‌روزرسانی از گیت»**: اکشن `self_update` — قفل مشترک با صف/cron، ردِ درختِ کثیف با فهرست فایل‌ها، فقط merge --ff-only (بدون امکان conflict)، تشخیص واگرایی، و بعد از merge بررسی `php -l` + `node --check` با **بازگشت خودکار** در صورت شکست؛ شاخهٔ مبنا `UPDATE_GIT_REF` (پیش‌فرض `main`) | ✨ قابلیت | `sync_manual.php`, `config.php` |
 
 - مسیرهای UserBot (سروش‌پلاس و آی‌گپ) به **رابط وب رسمی** این پیام‌رسان‌ها وابسته‌اند. هر به‌روزرسانی سمت آن‌ها ممکن است سلکتورهای DOM را باطل کند؛ در این صورت [`PLAYWRIGHT_SPECS.md`](PLAYWRIGHT_SPECS.md) §۸ (playbook بازسازی سلکتور) را دنبال کنید.
 - استفاده از حساب کاربری واقعی برای خودکارسازی، مشروط به رعایت **شرایط استفادهٔ هر پلتفرم** است. پیش از استقرار تولید، از انطباق قانونی آن اطمینان حاصل کنید.

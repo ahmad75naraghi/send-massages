@@ -207,6 +207,28 @@ define('SYNC_GAP_SEC', envInt('SYNC_GAP_SEC', 5));
 define('CHECK_INTERVAL_SEC', envInt('CHECK_INTERVAL_SEC', 30));
 define('ENABLE_SOROUSH_BOT', envBool('ENABLE_SOROUSH_BOT', false));
 
+// --- صف پس‌زمینه و سرعت ---
+// باینری PHP برای worker پس‌زمینه؛ خالی = تشخیص خودکارِ تأییدشده (PHP_BINARY،
+// ea-php8*، lsphp8*، php مسیر). فقط نسخهٔ ۸ به بالا و سالمِ lint شده پذیرفته می‌شود.
+// اگر PHP_CLI_BIN ست نشده ولی PHP_BIN (کلید ابزارهای shell) ست باشد، از همان استفاده می‌شود.
+define('PHP_CLI_BIN', env('PHP_CLI_BIN', env('PHP_BIN', '')));
+// سقف تعداد پست‌های جدید که صف پس‌زمینه در یک اجرا می‌گیرد (نمای وب ایتا معمولاً ~۲۰ پست نشان می‌دهد)
+define('BACKGROUND_MAX_POSTS', envInt('BACKGROUND_MAX_POSTS', 50));
+// مکث بین پست‌ها در صف پس‌زمینه (۰ = بدون مکث؛ SYNC_GAP_SEC فقط برای مسیر دستی/cron است)
+define('BACKGROUND_GAP_SEC', envInt('BACKGROUND_GAP_SEC', 0));
+// ارسال هم‌زمان به سروش‌پلاس و آی‌گپ (دو مرورگر Chromium هم‌زمان؛ اگر سرور کم‌رمز است 0 کنید)
+define('SYNC_PARALLEL_DISPATCH', envBool('SYNC_PARALLEL_DISPATCH', true));
+// حداکثر دفعات تلاش هر پلتفرم در صف پس‌زمینه برای آیتم‌های ناموفق (۱ = بدون تلاش مجدد)
+define('BACKGROUND_MAX_PASSES', envInt('BACKGROUND_MAX_PASSES', 2));
+// فاصلهٔ عمدی بین راه‌اندازی دو مرورگر (سروش و آی‌گپ) در ارسال موازی؛ دو
+// cold-start هم‌زمان می‌تواند اپ آی‌گپ را در سکتهٔ رم/CPU جا بیندازد (۰ = بدون فاصله)
+define('BACKGROUND_STAGGER_SEC', envInt('BACKGROUND_STAGGER_SEC', 12));
+// منطقهٔ زمانی ساعت‌های زمان‌بند (خالی = منطقهٔ پیش‌فرض سرور؛ مثال: Asia/Tehran).
+// ساعت نشان‌داده‌شدهٔ «سرور» در داشبورد هم با همین منطقه است.
+define('SCHEDULE_TIMEZONE', env('SCHEDULE_TIMEZONE', ''));
+// شاخه/برچسب مبنا برای دکمهٔ «به‌روزرسانی از گیت» داشبورد (action=self_update)
+define('UPDATE_GIT_REF', env('UPDATE_GIT_REF', 'main'));
+
 // --- مسیرهای داده ---
 define('STATE_DB_PATH', env('STATE_DB_PATH', SYNC_APP_DIR . '/state.sqlite'));
 define('LOG_DIR', env('LOG_DIR', SYNC_APP_DIR . '/logs'));

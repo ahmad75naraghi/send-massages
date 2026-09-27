@@ -5,6 +5,9 @@
 #    bash start_browser.sh soroush        # پروفایل سروش‌پلاس
 #    bash start_browser.sh igap           # پروفایل آی‌گپ
 #    bash start_browser.sh igap --headed  # پنجرهٔ قابل دیدن (نیاز به DISPLAY)
+#    REMOTE_DEBUG_PORT=9333 bash start_browser.sh igap   # پورت دلخواه CDP
+#
+#  ورود دستی با تونل SSH و دیدن صفحه از مرورگر خودتان: manual_login.sh
 #
 #  ⚠️ تفاوت حیاتی با نسخهٔ پیشین: پورت دیباگ فقط روی 127.0.0.1 باز می‌شود.
 #     نسخهٔ قبلی --remote-debugging-address=0.0.0.0 داشت؛ یعنی هر کسی که
@@ -50,7 +53,7 @@ sleep 1
 rm -f "$PROFILE"/Singleton* 2>/dev/null || true
 
 exec "$CHROME" \
-  --remote-debugging-port=9222 \
+  --remote-debugging-port="${REMOTE_DEBUG_PORT:-9222}" \
   --remote-debugging-address=127.0.0.1 \
   --user-data-dir="$PROFILE" \
   --no-sandbox \

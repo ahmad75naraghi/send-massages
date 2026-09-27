@@ -49,6 +49,35 @@ $db->exec('PRAGMA busy_timeout = 10000');
 $db->exec('PRAGMA journal_mode = WAL');
 $db->exec("CREATE TABLE IF NOT EXISTS sync_state (channel TEXT PRIMARY KEY, last_msg_id INTEGER NOT NULL)");
 $db->exec("CREATE TABLE IF NOT EXISTS media_fail (msg_id INTEGER PRIMARY KEY, fails INTEGER NOT NULL DEFAULT 0, last_reason TEXT, updated_at TEXT)");
+// دفتر تحویل: «پست × پلتفرم × پروفایل» → ok|fail (برای idempotency صف پس‌زمینه)
+$db->exec("CREATE TABLE IF NOT EXISTS delivery (
+    msg_id INTEGER NOT NULL,
+    platform TEXT NOT NULL,
+    profile TEXT NOT NULL DEFAULT 'main',
+    status TEXT NOT NULL,
+    info TEXT DEFAULT '',
+    updated_at TEXT,
+    PRIMARY KEY (msg_id, platform, profile)
+)");
+// زمان‌بندی خودکار: ساعت‌های اجرای صف (HH:MM) + سابقهٔ اجرای روزانهٔ هر اسلات
+$db->exec("CREATE TABLE IF NOT EXISTS schedule (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    time_hhmm TEXT NOT NULL,
+    max_posts INTEGER NOT NULL DEFAULT 5,
+    profile TEXT NOT NULL DEFAULT 'main',
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL
+)");
+$db->exec("CREATE TABLE IF NOT EXISTS schedule_runs (
+    schedule_id INTEGER NOT NULL,
+    day TEXT NOT NULL,
+    fired_at TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'running',
+    summary TEXT,
+    PRIMARY KEY (schedule_id, day)
+)");
+// heartbeat تیکِ کرون (داشبورد از روی همین تشخیص می‌دهد که کران نصب است یا نه)
+$db->exec("CREATE TABLE IF NOT EXISTS schedule_meta (meta_key TEXT PRIMARY KEY, meta_value TEXT NOT NULL)");
 
 function getLastSeenId(PDO $db, string$channel): int {
     $stmt =$db->prepare("SELECT last_msg_id FROM sync_state WHERE channel = :channel");
@@ -192,6 +221,69 @@ function clearMediaFail(PDO $db, int $msgId): void {
     $db->prepare('DELETE FROM media_fail WHERE msg_id = :id')->execute([':id' => $msgId]);
 }
 
+// ============================================================
+//  دفتر تحویل (delivery ledger)
+// ------------------------------------------------------------
+//  برای هر «پست × پلتفرم × پروفایل» ثبت می‌شود که ارسال موفق بوده
+//  یا نه. صف پس‌زمینه با آن idempotent می‌شود: اگر یک اجرا وسط راه
+//  متوقف شود، اجرای بعدی فقط پلتفرم‌های جاافتادهٔ هر پست را می‌فرستد
+//  و در پلتفرم‌های موفق پست تکراری نمی‌سازد.
+// ============================================================
+function markDelivery(PDO $db, int $msgId, string $platform, string $profile, bool $ok, string $info = ''): void {
+    if (!in_array($platform, ['bale', 'rubika', 'soroush', 'igap'], true)) {
+        return;
+    }
+    $profile = normalizeDestinationProfile($profile);
+    $stmt = $db->prepare('INSERT INTO delivery (msg_id, platform, profile, status, info, updated_at)
+                          VALUES (:m, :p, :pr, :s, :i, :t)
+                          ON CONFLICT(msg_id, platform, profile) DO UPDATE
+                          SET status = excluded.status, info = excluded.info, updated_at = excluded.updated_at');
+    $stmt->execute([
+        ':m'  => $msgId,
+        ':p'  => $platform,
+        ':pr' => $profile,
+        ':s'  => $ok ? 'ok' : 'fail',
+        ':i'  => mb_substr($info, 0, 300),
+        ':t'  => date('c'),
+    ]);
+}
+
+/** پلتفرم‌هایی که این پست در آن‌ها قبلاً با موفقیت تحویل شده است */
+function deliveredOkPlatforms(PDO $db, int $msgId, string $profile): array {
+    $profile = normalizeDestinationProfile($profile);
+    $stmt = $db->prepare("SELECT platform FROM delivery WHERE msg_id = :m AND profile = :pr AND status = 'ok'");
+    $stmt->execute([':m' => $msgId, ':pr' => $profile]);
+    $rows = $stmt->fetchAll(PDO::FETCH_COLUMN);
+    return is_array($rows) ? $rows : [];
+}
+
+/** نوشتن اتمیک JSON روی دیسک (tmp + rename) تا خوانندهٔ هم‌زمان هرگز نیم‌کاره نخواند */
+function writeJsonFileAtomic(string $path, array $data): bool {
+    $dir = dirname($path);
+    if ($dir !== '' && $dir !== '.' && !is_dir($dir)) {
+        @mkdir($dir, 0770, true);
+    }
+    $tmp = $path . '.' . getmypid() . '.tmp';
+    if (@file_put_contents($tmp, json_encode($data, JSON_UNESCAPED_UNICODE)) === false) {
+        return false;
+    }
+    return @rename($tmp, $path);
+}
+
+/** خواندن JSON از فایل؛ فایل نبود/خراب بود → null */
+function readJsonFile(?string $path): ?array {
+    if ($path === null || $path === '' || !is_readable($path)) {
+        return null;
+    }
+    $decoded = json_decode((string)@file_get_contents($path), true);
+    return is_array($decoded) ? $decoded : null;
+}
+
+/** فایل پیشرفت مشترک صف پس‌زمینه (worker می‌نویسد، داشبورد از queue_status می‌خواند) */
+function backgroundProgressFile(): string {
+    return rtrim(LOG_DIR, '/') . '/background_progress.json';
+}
+
 // استخراج آخرین JSON معتبر از خروجی اسکریپت Node
 // (هشدارهای Playwright/Chromium که با 2>&1 به stdout می‌آیند، json_decode کل رشته را نامعتبر می‌کنند)
 function parseNodeJsonOutput(string $output): ?array {
@@ -257,6 +349,127 @@ function currentSyncWorkerPid(): int {
         return 0;
     }
     return max(0, (int)trim((string)file_get_contents($pidFile)));
+}
+
+/** خط فرمان یک فرایند زنده (برای تشخیص PID بازیافتی/نامربوط) */
+function processCmdline(int $pid): string {
+    if ($pid <= 0) {
+        return '';
+    }
+    $raw = @file_get_contents('/proc/' . $pid . '/cmdline');
+    if (!is_string($raw) || $raw === '') {
+        return '';
+    }
+    return str_replace("\0", ' ', $raw);
+}
+
+/**
+ * وضعیت worker صف پس‌زمینه: زنده است یا نه؟
+ * PID ذخیره‌شده باید واقعاً متعلق به worker ما باشد (cmdline شامل cli_run.php
+ * یا background_launcher)؛ وگرنه PID بازیافتیِ فرایند دیگری است و پاک می‌شود.
+ * خروجی: [running(bool), pid(int), stale(bool)]
+ */
+function syncWorkerStatus(): array {
+    $pid = currentSyncWorkerPid();
+    if ($pid <= 0) {
+        return [false, 0, false];
+    }
+    if (!isPidRunning($pid)) {
+        @unlink(syncWorkerPidFile());
+        return [false, $pid, true];
+    }
+    $cmdline = processCmdline($pid);
+    if ($cmdline !== '' && !str_contains($cmdline, 'cli_run.php') && !str_contains($cmdline, 'background_launcher')) {
+        @unlink(syncWorkerPidFile());
+        return [false, $pid, true];
+    }
+    return [true, $pid, false];
+}
+
+/**
+ * یافتن باینری PHP CLI «سالم و تأییدشده» برای worker پس‌زمینه.
+ * چرا این‌قدر سخت‌گیرانه؟ ریشهٔ خرابی دکمهٔ صف پس‌زمینه همین بود:
+ * `command -v php` در محیط وب گاهی PHP قدیمی/فاقد اکستنشن برمی‌گرداند و
+ * worker بی‌صدا در همان ثانیهٔ اول می‌مُرد. اینجا هر کاندید را با -v،
+ * اکستنشن‌های لازم و lint خود sync_manual.php آزمایش می‌کنیم.
+ * خروجی: [ok(bool), bin(string), attempts(array of string)]
+ */
+function resolvePhpCliBinary(): array {
+    static $cached = null;
+    if (is_array($cached)) {
+        return $cached;
+    }
+
+    $candidates = [];
+    if (PHP_CLI_BIN !== '') {
+        $candidates[] = PHP_CLI_BIN;
+    }
+    // PHP_BINARY همان مفسری است که همین الان داره صفحه را اجرا می‌کند؛
+    // فقط خروجی‌های fpm (که CLI نیستند) را کنار می‌گذاریم.
+    if (defined('PHP_BINARY') && PHP_BINARY !== '' && !preg_match('#fpm#i', basename(PHP_BINARY))) {
+        $candidates[] = PHP_BINARY;
+    }
+    foreach ([
+        '/opt/cpanel/ea-php83/root/usr/bin/php',
+        '/opt/cpanel/ea-php82/root/usr/bin/php',
+        '/opt/cpanel/ea-php81/root/usr/bin/php',
+    ] as $cPanelPhp) {
+        $candidates[] = $cPanelPhp;
+    }
+    foreach (array_merge(
+        glob('/opt/cpanel/ea-php8*/root/usr/bin/php') ?: [],
+        glob('/usr/local/lsws/lsphp8*/bin/php') ?: [],
+        glob('/usr/local/bin/php8*') ?: []
+    ) as $g) {
+        $candidates[] = $g;
+    }
+    $candidates[] = '/usr/bin/php';
+    $candidates[] = '/usr/local/bin/php';
+    if (function_exists('shell_exec') && is_callable('shell_exec')) {
+        $which = trim((string)@shell_exec('command -v php 2>/dev/null'));
+        if ($which !== '') {
+            $candidates[] = $which;
+        }
+    }
+    $candidates = array_values(array_unique(array_filter($candidates, fn($c) => is_string($c) && $c !== '')));
+
+    $attempts = [];
+    $canShell = function_exists('shell_exec') && is_callable('shell_exec');
+
+    foreach ($candidates as $bin) {
+        if (!is_executable($bin)) {
+            $attempts[] = "{$bin}: NOT_EXECUTABLE";
+            continue;
+        }
+        if (!$canShell) {
+            // بدون shell_exec اصلاً نمی‌شود worker راه‌انداخت؛ همان اولی را برای پیام خطا برگردان
+            $cached = [true, $bin, $attempts];
+            return $cached;
+        }
+        $q = escapeshellarg($bin);
+        $ver = trim((string)@shell_exec($q . ' -v 2>&1'));
+        if (!preg_match('#^PHP\s+(\d+)\.#', $ver, $m) || (int)$m[1] < 8) {
+            $attempts[] = "{$bin}: " . mb_substr(preg_replace('/\s+/u', ' ', $ver) ?: 'NO_OUTPUT', 0, 70);
+            continue;
+        }
+        // اکستنشن‌های لازم برای worker (pdo_sqlite/curl/dom/mbstring)
+        $probe = 'exit((int)!(extension_loaded("pdo_sqlite") && extension_loaded("curl") && extension_loaded("dom") && extension_loaded("mbstring")));';
+        $probeOut = trim((string)@shell_exec($q . ' -r ' . escapeshellarg($probe) . ' 2>&1; echo "RC=$?"'));
+        if (!str_contains($probeOut, 'RC=0')) {
+            $attempts[] = "{$bin}: MISSING_EXTENSIONS";
+            continue;
+        }
+        $lint = trim((string)@shell_exec($q . ' -l ' . escapeshellarg(__FILE__) . ' 2>&1'));
+        if (!str_contains($lint, 'No syntax errors')) {
+            $attempts[] = "{$bin}: LINT_FAIL " . mb_substr(preg_replace('/\s+/u', ' ', $lint) ?: '', 0, 70);
+            continue;
+        }
+        $cached = [true, $bin, $attempts];
+        return $cached;
+    }
+
+    $cached = [false, '', $attempts];
+    return $cached;
 }
 
 function callApi(string $url, mixed$data, bool $isMultipart, array$headers = []): array {
@@ -370,14 +583,17 @@ function nodeEnvProblem(string $script): string {
  *  ۴) وضعیت UNVERIFIED (ارسال شد ولی تأیید نشد) به‌صورت شکستِ صادقانه
  *     نگاشت می‌شود، نه OK کاذب.
  */
-function runUserbot(string $script, string $profileDir, string $channel, string $channelName, string $text, ?string $filePath, ?string $mediaType, array $extraArgs = []): array {
-    if (trim($text) === '' and (!$filePath or !file_exists($filePath))) {
-        return ['success' => true, 'message' => 'SKIP: محتوایی برای ارسال نیست', 'skipped' => true];
-    }
-
+/**
+ * ساخت خط فرمان اجرای یک UserBot (بدون اجرای آن).
+ * خروجی: ['ok'=>true, 'cmd'=>string] یا ['ok'=>false, 'code'=>string, 'message'=>string]
+ *
+ * از این سازنده هم مسیر blocking (runUserbot) و هم مسیر هم‌زمان (صف پس‌زمینه)
+ * استفاده می‌کنند تا خط فرمان هر دو دقیقاً یکی بماند.
+ */
+function buildUserbotCommand(string $script, string $profileDir, string $channel, string $channelName, string $text, ?string $filePath, ?string $mediaType, array $extraArgs = []): array {
     if (!function_exists('shell_exec') || !is_callable('shell_exec')) {
         return [
-            'success' => false,
+            'ok'      => false,
             'code'    => 'SHELL_EXEC_DISABLED',
             'message' => 'تابع shell_exec در PHP غیرفعال است؛ مسیر UserBot (سروش/آی‌گپ) اجرا نمی‌شود. در تنظیمات PHP آن را از disable_functions حذف کنید.',
         ];
@@ -386,7 +602,7 @@ function runUserbot(string $script, string $profileDir, string $channel, string 
     // پیش‌بررسی: اگر playwright/Node نباشد، به‌جای stack trace خام، پیام روشن بده
     $envProblem = nodeEnvProblem($script);
     if ($envProblem !== '') {
-        return ['success' => false, 'code' => 'NODE_DEPS_MISSING', 'message' => $envProblem];
+        return ['ok' => false, 'code' => 'NODE_DEPS_MISSING', 'message' => $envProblem];
     }
 
     $cleanChannel = ltrim($channel, '@');
@@ -412,20 +628,18 @@ function runUserbot(string $script, string $profileDir, string $channel, string 
         $cmd .= ' --' . $flag . '=' . escapeshellarg((string)$value);
     }
 
-    // stdout قرارداد JSON اسکریپت Node است. stderr را جدا نگه می‌داریم تا
-    // لاگ‌های مرحله‌ای باعث خراب شدن json_decode در مسیرهای PHP/OPcache قدیمی نشوند.
-    $errFile = tempnam(sys_get_temp_dir(), 'userbot_stderr_');
-    $stderrRedir = $errFile ? (' 2>' . escapeshellarg($errFile)) : ' 2>&1';
-    $output = shell_exec($cmd . $stderrRedir);
-    $stderr = ($errFile && is_readable($errFile)) ? (string)file_get_contents($errFile) : '';
-    if ($errFile) {
-        @unlink($errFile);
-    }
+    return ['ok' => true, 'cmd' => $cmd];
+}
+
+/**
+ * نگاشت خروجی خام اسکریپت Node به نتیجهٔ قراردادی PHP.
+ * هم مسیر blocking و هم مسیر هم‌زمان از همین استفاده می‌کنند.
+ */
+function userbotResultFromOutput(string $output, string $stderr, string $profileDir): array {
     @array_map('unlink', glob($profileDir . '/Singleton*') ?: []);
 
-    $combinedOutput = trim((string)$output . "
-" . $stderr);
-    $result = parseNodeJsonOutput((string)$output) ?? parseNodeJsonOutput($combinedOutput);
+    $combinedOutput = trim($output . "\n" . $stderr);
+    $result = parseNodeJsonOutput($output) ?? parseNodeJsonOutput($combinedOutput);
     $status = $result['status'] ?? null;
 
     // اگر Node به خاطر ماژول گم‌شده مرده باشد، JSON قرارداد تولید نمی‌شود؛
@@ -471,6 +685,322 @@ function runUserbot(string $script, string $profileDir, string $channel, string 
                    . ($detail !== '' ? $detail : ($raw !== '' ? mb_substr($raw, -300) : 'Fail'))
                    . $logRef,
     ];
+}
+
+function runUserbot(string $script, string $profileDir, string $channel, string $channelName, string $text, ?string $filePath, ?string $mediaType, array $extraArgs = []): array {
+    if (trim($text) === '' and (!$filePath or !file_exists($filePath))) {
+        return ['success' => true, 'message' => 'SKIP: محتوایی برای ارسال نیست', 'skipped' => true];
+    }
+
+    $built = buildUserbotCommand($script, $profileDir, $channel, $channelName, $text, $filePath, $mediaType, $extraArgs);
+    if (!$built['ok']) {
+        return ['success' => false, 'code' => $built['code'], 'message' => $built['message']];
+    }
+
+    // stdout قرارداد JSON اسکریپت Node است. stderr را جدا نگه می‌داریم تا
+    // لاگ‌های مرحله‌ای باعث خراب شدن json_decode در مسیرهای PHP/OPcache قدیمی نشوند.
+    $errFile = tempnam(sys_get_temp_dir(), 'userbot_stderr_');
+    $stderrRedir = $errFile ? (' 2>' . escapeshellarg($errFile)) : ' 2>&1';
+    $output = shell_exec($built['cmd'] . $stderrRedir);
+    $stderr = ($errFile && is_readable($errFile)) ? (string)file_get_contents($errFile) : '';
+    if ($errFile) {
+        @unlink($errFile);
+    }
+
+    return userbotResultFromOutput((string)$output, $stderr, $profileDir);
+}
+
+/**
+ * اجرای هم‌زمان (غیرمسدودکننده) یک UserBot: فرایند با nohup در پس‌زمینه
+ * شروع می‌شود و خروجی‌اش در فایل‌های موقت می‌نشیند. خروجی:
+ *   ['pid'=>int, 'out'=>path, 'err'=>path, 'rc'=>path, 'started'=>int]
+ * یا null در صورت شکست راه‌اندازی.
+ *
+ * چرا لازم است؟ سروش و آی‌گپ پروفایل‌های مرورگر مستقل دارند؛ اجرای هم‌زمانشان
+ * زمان هر پست را از «مجموعِ دو مرورگر» به «کندترینِ دو مرورگر» می‌رساند.
+ */
+function launchUserbotAsync(string $cmd, string $profileDir): ?array {
+    @array_map('unlink', glob($profileDir . '/Singleton*') ?: []);
+
+    $out = tempnam(sys_get_temp_dir(), 'ub_out_');
+    $err = tempnam(sys_get_temp_dir(), 'ub_err_');
+    $rc  = tempnam(sys_get_temp_dir(), 'ub_rc_');
+    if (!$out || !$err || !$rc) {
+        foreach ([$out, $err, $rc] as $f) { if ($f) { @unlink($f); } }
+        return null;
+    }
+    @unlink($rc);   // rc فقط پس از پایان فرایند ساخته می‌شود
+
+    $inner = $cmd . ' > ' . escapeshellarg($out) . ' 2> ' . escapeshellarg($err) . '; echo $? > ' . escapeshellarg($rc);
+    $wrap  = 'nohup bash -c ' . escapeshellarg($inner) . ' >/dev/null 2>&1 </dev/null & echo $!';
+    $raw = (string)@shell_exec($wrap);
+    $pid = preg_match('/\b(\d+)\b/', $raw, $m) ? (int)$m[1] : 0;
+    if ($pid <= 0) {
+        foreach ([$out, $err] as $f) { @unlink($f); }
+        return null;
+    }
+    return ['pid' => $pid, 'out' => $out, 'err' => $err, 'rc' => $rc, 'started' => time()];
+}
+
+/** آیا فرایندِ هم‌زمان‌شده پایان یافته است؟ (rc ساخته شده یا PID مرده) */
+function userbotAsyncDone(array $handle): bool {
+    if (is_readable($handle['rc'] ?? '')) {
+        return true;
+    }
+    return !isPidRunning((int)($handle['pid'] ?? 0));
+}
+
+/** انتظار برای پایان فرایند هم‌زمان (با سقف زمانی) */
+function waitForUserbotAsync(array $handle, int $timeoutSec): bool {
+    $deadline = time() + max(5, $timeoutSec);
+    while (time() < $deadline) {
+        if (userbotAsyncDone($handle)) {
+            sleep(1);   // فایل‌های خروجی کامل شوند
+            return true;
+        }
+        sleep(1);
+    }
+    return userbotAsyncDone($handle);
+}
+
+/** جمع‌کردن نتیجهٔ فرایند هم‌زمان و پاک‌سازی فایل‌های موقت آن */
+function collectUserbotAsync(array $handle, string $profileDir): array {
+    $output = is_readable($handle['out'] ?? '') ? (string)file_get_contents($handle['out']) : '';
+    $stderr = is_readable($handle['err'] ?? '') ? (string)file_get_contents($handle['err']) : '';
+    foreach (['out', 'err', 'rc'] as $k) {
+        if (!empty($handle[$k])) { @unlink($handle[$k]); }
+    }
+    return userbotResultFromOutput($output, $stderr, $profileDir);
+}
+
+/**
+ * کشتن یک گروه فرایند (برای متوقف کردن مرورگر runner صف پس‌زمینه در حالت گیرکردن).
+ * pid باید session leader باشد تا -PID کل درخت فرایند (bash+node+chromium) را بگیرد.
+ */
+function killProcessGroup(int $pgid): void {
+    if ($pgid <= 0) {
+        return;
+    }
+    @shell_exec('kill -TERM ' . escapeshellarg('-' . $pgid) . ' 2>/dev/null');
+    usleep(300000);
+    @shell_exec('kill -KILL ' . escapeshellarg('-' . $pgid) . ' 2>/dev/null');
+}
+
+/**
+ * راه‌اندازی runner یک پلتفرم UserBot برای «کل صف» با حالت batch اسکریپت‌های Node:
+ * مرورگر یک بار باز می‌شود، کانال یک بار، و همهٔ آیتم‌ها پشت‌سرهم ارسال می‌شوند.
+ * خروجی (handle): ['pid', 'pgid', 'batchFile', 'progressFile', 'out', 'err', 'rc', 'timeout', 'deadline']
+ * یا ['ok'=>false, 'code', 'message'] در صورت عدم امکان راه‌اندازی.
+ *
+ * نکته: متن/فایل آیتم‌ها داخل batchFile می‌رود (نه خط فرمان) تا محدودیت طول
+ * argv برای صف‌های بزرگ و متن‌های بلند مسئله‌ساز نشود.
+ */
+function launchUserbotBatch(string $platform, array $items, array $dest): array {
+    $script     = $platform === 'soroush' ? SOROUSH_SCRIPT : IGAP_SCRIPT;
+    $profileDir = $platform === 'soroush' ? SOROUSH_PROFILE_DIR : IGAP_PROFILE_DIR;
+    $channel    = $platform === 'soroush' ? $dest['soroushChannel'] : $dest['igapChannel'];
+    $channelName= $platform === 'soroush' ? $dest['soroushName'] : $dest['igapName'];
+    $extra      = $platform === 'soroush' ? ['strict-channel' => '1'] : ['item-id' => (string)$dest['igapItemId']];
+
+    $envProblem = nodeEnvProblem($script);
+    if ($envProblem !== '') {
+        return ['ok' => false, 'code' => 'NODE_DEPS_MISSING', 'message' => $envProblem];
+    }
+    if (!function_exists('shell_exec') || !is_callable('shell_exec')) {
+        return ['ok' => false, 'code' => 'SHELL_EXEC_DISABLED', 'message' => 'shell_exec غیرفعال است.'];
+    }
+
+    $batchFile     = tempnam(sys_get_temp_dir(), 'ub_batch_');
+    $progressFile  = $batchFile . '.progress.json';
+    if (!writeJsonFileAtomic($batchFile, ['items' => array_values($items), 'progressFile' => $progressFile])) {
+        return ['ok' => false, 'code' => 'BATCH_WRITE_FAILED', 'message' => "نوشتن فایل batch ناموفق بود: {$batchFile}"];
+    }
+
+    $timeout = 180 + (int)USERBOT_TIMEOUT_SEC * max(1, count($items));
+
+    @array_map('unlink', glob($profileDir . '/Singleton*') ?: []);
+    $cmd  = 'timeout ' . $timeout . ' ' . escapeshellarg(NODE_BIN) . ' ' . escapeshellarg($script);
+    $cmd .= ' --batch=' . escapeshellarg($batchFile);
+    $cmd .= ' --channel=' . escapeshellarg(ltrim((string)$channel, '@'));
+    if ((string)$channelName !== '') {
+        $cmd .= ' --channel-name=' . escapeshellarg((string)$channelName);
+    }
+    foreach ($extra as $flag => $value) {
+        if ($value === null or $value === '') {
+            continue;
+        }
+        $cmd .= ' --' . $flag . '=' . escapeshellarg((string)$value);
+    }
+
+    $out = tempnam(sys_get_temp_dir(), 'ub_out_');
+    $err = tempnam(sys_get_temp_dir(), 'ub_err_');
+    $rc  = tempnam(sys_get_temp_dir(), 'ub_rc_');
+    if (!$out || !$err || !$rc) {
+        return ['ok' => false, 'code' => 'TEMP_NOT_WRITABLE', 'message' => 'ساخت فایل‌های موقت ناموفق بود.'];
+    }
+    @unlink($rc);
+
+    // setsid: runner و مرورگرش گروه فرایند خودش را دارند تا در حالت گیرکردن،
+    // worker بتواند کل درخت (bash+node+chromium) را یک‌جا متوقف کند.
+    $inner = $cmd . ' > ' . escapeshellarg($out) . ' 2> ' . escapeshellarg($err) . '; echo $? > ' . escapeshellarg($rc);
+    $wrap  = 'setsid nohup bash -c ' . escapeshellarg($inner) . ' >/dev/null 2>&1 </dev/null & echo $!';
+    $raw = (string)@shell_exec($wrap);
+    $pid = preg_match('/\b(\d+)\b/', $raw, $m) ? (int)$m[1] : 0;
+    if ($pid <= 0) {
+        foreach ([$out, $err, $batchFile] as $f) { @unlink($f); }
+        return ['ok' => false, 'code' => 'LAUNCH_FAILED', 'message' => 'شروع فرایند runner ناموفق بود: ' . trim($raw)];
+    }
+
+    return [
+        'ok'           => true,
+        'platform'     => $platform,
+        'pid'          => $pid,
+        'pgid'         => $pid,   // به‌خاطر setsid، pid همان رهبر گروه فرایند است
+        'batchFile'    => $batchFile,
+        'progressFile' => $progressFile,
+        'out'          => $out,
+        'err'          => $err,
+        'rc'           => $rc,
+        'timeout'      => $timeout,
+        'deadline'     => time() + $timeout + 60,
+    ];
+}
+
+/** پاک‌سازی فایل‌های موقت یک runner پس از پایان آن */
+function cleanupUserbotBatch(array $handle): void {
+    foreach (['batchFile', 'progressFile', 'out', 'err', 'rc'] as $k) {
+        if (!empty($handle[$k])) { @unlink($handle[$k]); }
+    }
+}
+
+/**
+ * دانلود هم‌زمان رسانهٔ چند پست با curl_multi.
+ * ورودی: [['id'=>.., 'mediaUrl'=>.., 'fileName'=>..], ...]
+ * خروجی: [id => ['ok'=>bool, 'path'=>?string, 'reason'=>?string]]
+ * همان سیاست‌های downloadMedia: Referer ایتا، مهلت ۱۸۰ ثانیه، بدنهٔ >۱۰۰ بایت.
+ */
+function downloadMediaBatch(array $posts): array {
+    $results = [];
+    $entries = [];
+    $mh = curl_multi_init();
+    if ($mh === false) {
+        foreach ($posts as $p) {
+            $results[(int)$p['id']] = ['ok' => false, 'path' => null, 'reason' => 'CURL_MULTI_INIT_FAILED'];
+        }
+        return $results;
+    }
+
+    foreach ($posts as $p) {
+        $id  = (int)$p['id'];
+        $url = eitaaAbsoluteUrl((string)($p['mediaUrl'] ?? ''));
+        $results[$id] = ['ok' => false, 'path' => null, 'reason' => 'NO_URL'];
+        if ($url === '' || !preg_match('#^https?://#i', $url)) {
+            continue;
+        }
+        $target = safeFileName((string)($p['fileName'] ?? 'media.bin'), 'media.bin');
+        $tmpPath = sys_get_temp_dir() . '/sync_bg_' . uniqid('', true) . '_' . $target;
+        $fp = fopen($tmpPath, 'w+');
+        if (!$fp) {
+            $results[$id]['reason'] = 'TEMP_NOT_WRITABLE';
+            continue;
+        }
+        $ch = curl_init($url);
+        if ($ch === false) {
+            fclose($fp);
+            @unlink($tmpPath);
+            $results[$id]['reason'] = 'CURL_INIT_FAILED';
+            continue;
+        }
+        curl_setopt_array($ch, [
+            CURLOPT_FILE           => $fp,
+            CURLOPT_TIMEOUT        => 180,
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_SSL_VERIFYPEER => false,
+            CURLOPT_SSL_VERIFYHOST => false,
+            CURLOPT_USERAGENT      => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+            CURLOPT_HTTPHEADER     => [
+                'Referer: https://eitaa.com/' . EITAA_CHANNEL_ID,
+                'Accept-Encoding: identity',
+            ],
+        ]);
+        curl_multi_add_handle($mh, $ch);
+        $entries[(int)$ch] = ['id' => $id, 'fp' => $fp, 'path' => $tmpPath, 'ch' => $ch];
+        $results[$id]['reason'] = 'IN_PROGRESS';
+    }
+
+    $finalize = function (array $entry, int $code, int $errno) use (&$results) {
+        $size = (int)@filesize($entry['path']);
+        @fclose($entry['fp']);
+        if ($code > 0 && in_array($code, [200, 206], true) && $errno === 0 && $size > 100) {
+            $results[$entry['id']] = ['ok' => true, 'path' => $entry['path'], 'reason' => null];
+            return;
+        }
+        @unlink($entry['path']);
+        if ($errno !== 0) {
+            $reason = 'CURL_ERROR_' . $errno;
+        } elseif ($code === 403 || $code === 401) {
+            $reason = 'TOKEN_EXPIRED_HTTP_' . $code;
+        } elseif ($code === 404) {
+            $reason = 'MEDIA_GONE_HTTP_404';
+        } elseif ($code >= 500) {
+            $reason = 'UPSTREAM_HTTP_' . $code;
+        } elseif ($size <= 100) {
+            $reason = 'EMPTY_OR_PLACEHOLDER_BODY';
+        } else {
+            $reason = 'HTTP_' . $code;
+        }
+        $results[$entry['id']] = ['ok' => false, 'path' => null, 'reason' => $reason];
+    };
+
+    $active = 0;
+    do {
+        $status = curl_multi_exec($mh, $active);
+        if ($status !== CURLM_OK) {
+            break;
+        }
+        while (($info = curl_multi_info_read($mh)) !== false) {
+            $ch = $info['handle'];
+            $key = (int)$ch;
+            if (!isset($entries[$key])) {
+                continue;
+            }
+            $entry = $entries[$key];
+            unset($entries[$key]);
+            $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            $errno = (int)($info['result'] ?? 0) !== 0 ? (int)$info['result'] : (int)curl_errno($ch);
+            curl_multi_remove_handle($mh, $ch);
+            curl_close($ch);
+            $finalize($entry, $code, $errno);
+        }
+        if ($active > 0) {
+            curl_multi_select($mh, 0.25);
+        }
+    } while ($active > 0);
+
+    // تخلیهٔ نهایی و هر handle جامانده (مثلاً در صورت شکست curl_multi_exec)
+    while (($info = curl_multi_info_read($mh)) !== false) {
+        $ch = $info['handle'];
+        $key = (int)$ch;
+        if (isset($entries[$key])) {
+            $entry = $entries[$key];
+            unset($entries[$key]);
+            $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            $errno = (int)($info['result'] ?? 0) !== 0 ? (int)$info['result'] : (int)curl_errno($ch);
+            curl_multi_remove_handle($mh, $ch);
+            curl_close($ch);
+            $finalize($entry, $code, $errno);
+        }
+    }
+    foreach ($entries as $key => $entry) {
+        curl_multi_remove_handle($mh, $entry['ch']);
+        curl_close($entry['ch']);
+        @fclose($entry['fp']);
+        @unlink($entry['path']);
+        $results[$entry['id']] = ['ok' => false, 'path' => null, 'reason' => 'CURLM_ABORTED'];
+    }
+    curl_multi_close($mh);
+
+    return $results;
 }
 
 /**
@@ -541,7 +1071,7 @@ function deliveredPlatformCount(array $sent, array $only): int {
     return $count;
 }
 
-function dispatchToPlatforms(array $only, string $text, ?string $localFile, ?string $mediaType, string $fileName, string $profile = 'main'): array {
+function dispatchToPlatforms(array $only, string $text, ?string $localFile, ?string $mediaType, string $fileName, string $profile = 'main', ?PDO $db = null, ?int $msgId = null): array {
     $all = ['bale', 'rubika', 'soroush', 'igap'];
     $only = normalizePlatformList($only);
     $dest = destinationProfile($profile);
@@ -551,6 +1081,43 @@ function dispatchToPlatforms(array $only, string $text, ?string $localFile, ?str
     foreach ($all as $platform) {
         if (!in_array($platform, $only, true)) {
             $out[$platform] = ['ok' => null, 'info' => 'SKIPPED'];
+        }
+    }
+
+    // ---------- اجرای هم‌زمان سروش + آی‌گپ (پروفایل‌های مستقل) ----------
+    // بله/روبیکا HTTP سریع‌اند و در همین فاصله ارسال می‌شوند؛ نتیجه:
+    // زمان هر پست = max(سروش, آی‌گپ) به‌جای مجموعِ هر چهار پلتفرم.
+    // با SYNC_PARALLEL_DISPATCH=0 در .env می‌توان به رفتار ترتیبی قبلی برگشت.
+    $handles = [];
+    $hasContent = (trim($text) !== '') || ($localFile !== null && file_exists($localFile));
+    if (SYNC_PARALLEL_DISPATCH && $hasContent && in_array('soroush', $only, true) && in_array('igap', $only, true)) {
+        $builtSoroush = buildUserbotCommand(
+            SOROUSH_SCRIPT, SOROUSH_PROFILE_DIR, $dest['soroushChannel'], $dest['soroushName'],
+            $text, $localFile, $mediaType, ['strict-channel' => '1']
+        );
+        if ($builtSoroush['ok']) {
+            $h = launchUserbotAsync($builtSoroush['cmd'], SOROUSH_PROFILE_DIR);
+            if ($h) { $handles['soroush'] = $h; }
+        }
+        // فاصلهٔ عمدی بین دو cold-start کرومیوم — هم‌زمانی، آی‌گپِ سنگین‌تر را
+        // ممکن است در سکتهٔ رم/CPU جا بیندازد (APP_NOT_LOADED).
+        if (isset($handles['soroush']) && BACKGROUND_STAGGER_SEC > 0) {
+            sleep(BACKGROUND_STAGGER_SEC);
+        }
+        $builtIgap = buildUserbotCommand(
+            IGAP_SCRIPT, IGAP_PROFILE_DIR, $dest['igapChannel'], $dest['igapName'],
+            $text, $localFile, $mediaType, ['item-id' => $dest['igapItemId']]
+        );
+        if ($builtIgap['ok']) {
+            $h = launchUserbotAsync($builtIgap['cmd'], IGAP_PROFILE_DIR);
+            if ($h) { $handles['igap'] = $h; }
+        }
+        // اگر راه‌اندازی هم‌زمان ممکن نشد، همان پلتفرم در ادامه ترتیبی اجرا می‌شود
+        if (isset($builtSoroush['ok']) && !$builtSoroush['ok'] && !isset($handles['soroush'])) {
+            $out['soroush'] = ['ok' => false, 'info' => $builtSoroush['message'], 'code' => $builtSoroush['code']];
+        }
+        if (isset($builtIgap['ok']) && !$builtIgap['ok'] && !isset($handles['igap'])) {
+            $out['igap'] = ['ok' => false, 'info' => $builtIgap['message'], 'code' => $builtIgap['code']];
         }
     }
 
@@ -568,7 +1135,17 @@ function dispatchToPlatforms(array $only, string $text, ?string $localFile, ?str
             'info' => $r['code'] ?? 'ERR',
         ];
     }
-    if (in_array('soroush', $only, true)) {
+
+    if (isset($handles['soroush'])) {
+        $timeout = (int)USERBOT_TIMEOUT_SEC + 90;
+        waitForUserbotAsync($handles['soroush'], $timeout);
+        $r = collectUserbotAsync($handles['soroush'], SOROUSH_PROFILE_DIR);
+        $out['soroush'] = [
+            'ok'   => ($r['success'] === true),
+            'info' => $r['message'] ?? 'ERR',
+            'code' => $r['code'] ?? '',
+        ];
+    } elseif (in_array('soroush', $only, true) && !array_key_exists('soroush', $out)) {
         $r = sendToSoroush($dest['soroushChannel'], $text, $localFile, $mediaType, $dest['soroushName']);
         $out['soroush'] = [
             'ok'   => ($r['success'] === true),
@@ -576,7 +1153,17 @@ function dispatchToPlatforms(array $only, string $text, ?string $localFile, ?str
             'code' => $r['code'] ?? '',
         ];
     }
-    if (in_array('igap', $only, true)) {
+
+    if (isset($handles['igap'])) {
+        $timeout = (int)USERBOT_TIMEOUT_SEC + 90;
+        waitForUserbotAsync($handles['igap'], $timeout);
+        $r = collectUserbotAsync($handles['igap'], IGAP_PROFILE_DIR);
+        $out['igap'] = [
+            'ok'   => userbotAccepted($r),
+            'info' => $r['message'] ?? 'ERR',
+            'code' => $r['code'] ?? '',
+        ];
+    } elseif (in_array('igap', $only, true) && !array_key_exists('igap', $out)) {
         $r = sendToIgap($dest['igapChannel'], $text, $localFile, $mediaType, $dest['igapName'], $dest['igapItemId']);
         $out['igap'] = [
             'ok'   => userbotAccepted($r),
@@ -585,8 +1172,18 @@ function dispatchToPlatforms(array $only, string $text, ?string $localFile, ?str
         ];
     }
 
+    // ---------- ثبت در دفتر تحویل (idempotency صف پس‌زمینه) ----------
+    if ($db !== null && $msgId !== null && $msgId > 0) {
+        foreach ($all as $platform) {
+            if (($out[$platform]['ok'] ?? null) !== null) {
+                markDelivery($db, $msgId, $platform, $profile, $out[$platform]['ok'] === true, (string)($out[$platform]['info'] ?? ''));
+            }
+        }
+    }
+
     return $out;
 }
+
 
 function sendToSoroush(string $channel, string $text = '', ?string $filePath = null, ?string $mediaType = null, ?string $channelName = null): array {
     return runUserbot(SOROUSH_SCRIPT, SOROUSH_PROFILE_DIR, $channel, $channelName ?? SOROUSH_CHANNEL_NAME, $text, $filePath, $mediaType, ['strict-channel' => '1']);
@@ -817,7 +1414,7 @@ if ($action === 'sync_recent') {
 
         $hasDeliverable = (trim($text) !== '') || ($localFile && file_exists($localFile));
         if ($hasDeliverable) {
-            $sent = dispatchToPlatforms($only, $text, $localFile, $mediaType, $fileName, $profile);
+            $sent = dispatchToPlatforms($only, $text, $localFile, $mediaType, $fileName, $profile, $db, $msgId);
         } else {
             $sent = [];
             foreach (['bale', 'rubika', 'soroush', 'igap'] as $p) {
@@ -869,29 +1466,445 @@ if ($action === 'sync_recent') {
     exit;
 }
 
-// ۱-د) وضعیت اجرای پس‌زمینه/صف cron
+// ۱-د) وضعیت اجرای صف پس‌زمینه: running + فایل پیشرفت زندهٔ worker
 if ($action === 'queue_status') {
     header('Content-Type: application/json; charset=utf-8');
-    $pid = currentSyncWorkerPid();
-    $running = isPidRunning($pid);
+    [$running, $pid] = syncWorkerStatus();
     echo json_encode([
-        'success' => true,
-        'running' => $running,
-        'pid'     => $running ? $pid : 0,
-        'log'     => tailText(rtrim(LOG_DIR, '/') . '/cron_sync.log', 80),
+        'success'     => true,
+        'running'     => $running,
+        'pid'         => $running ? $pid : 0,
+        'progress'    => readJsonFile(backgroundProgressFile()),
+        'log'         => tailText(rtrim(LOG_DIR, '/') . '/cron_sync.log', 80),
         'launcherLog' => tailText(rtrim(LOG_DIR, '/') . '/background_sync.log', 30),
     ], JSON_UNESCAPED_UNICODE);
     exit;
 }
 
-// ۱-د) اجرای صف در پس‌زمینه: کاربر منتظر ارسال تک‌تک پست‌ها نمی‌ماند
+// ۱-د-۲) شروع صف پس‌زمینه (وب): فقط worker را با یک launcher مستقل و
+//         «تأییدشده» راه می‌اندازد و بلافاصله برمی‌گردد. خودِ پردازش در
+//         action=background_run (CLI) انجام می‌شود.
+//
+//         چرا نسخهٔ قبلی کار نمی‌کرد؟
+//          ۱) `command -v ea-php83 || … || php` در محیط وب اغلب PHP غلط/قدیمی
+//             برمی‌گرداند (یا هیچ‌چیز) و worker در همان ثانیهٔ اول می‌مُرد؛
+//             حالا باینری با resolvePhpCliBinary() «آزموده و تأییدشده» است.
+//          ۲) nohup بدون setsid: با پایان درخواست وب، فرایند می‌توانست کشته شود؛
+//             حالا با setsid از نشست Apache/PHP-FPM جدا می‌شود.
+//          ۳) همه‌چیز در background_sync.log ثبت می‌شود تا علت هر شکست در
+//             خود داشبورد دیده شود (از طریق queue_status → launcherLog).
+// ============================================================
+//  زمان‌بندی خودکار (schedule_*) — اجرای صف در ساعت‌های تعیین‌شده
+//  یک خط crontab هر دقیقه (scheduler_tick.sh) → این تیک، اگر ساعتی
+//  سررسید باشد، همان مسیر دکمهٔ داشبورد (background_sync) را از CLI
+//  صدا می‌زند؛ یعنی همان موتور، همان قفل‌ها، همان پیشرفت زنده.
+// ============================================================
+
+function schedulerTz(): string {
+    static $tz = null;
+    if (is_string($tz)) { return $tz; }
+    $tz = date_default_timezone_get();
+    $wanted = trim((string)SCHEDULE_TIMEZONE);
+    if ($wanted !== '') {
+        try { $tz = (new DateTimeZone($wanted))->getName(); } catch (Throwable $e) { /* منطقهٔ نامعتبر → پیش‌فرض سرور */ }
+    }
+    return $tz;
+}
+
+function schedulerNow(): DateTime {
+    return new DateTime('now', new DateTimeZone(schedulerTz()));
+}
+
+/** چند ثانیه از آخرین تیک کرون گذشته است؟ null = هنوز هیچ تیکی ثبت نشده */
+function scheduleHeartbeatAge(PDO $db): ?int {
+    try {
+        $row = $db->query("SELECT meta_value FROM schedule_meta WHERE meta_key = 'heartbeat'")->fetch();
+    } catch (Throwable $e) {
+        return null;
+    }
+    if (!is_array($row) || !is_string($row['meta_value'] ?? null)) { return null; }
+    $ts = (int)$row['meta_value'];
+    return $ts > 0 ? (time() - $ts) : null;
+}
+
+/** خروجی مشترک schedule_list / نتیجهٔ add/remove/toggle — کل وضعیت برای رندر داشبورد */
+function scheduleListPayload(PDO $db): array {
+    $now = schedulerNow();
+    $today = $now->format('Y-m-d');
+    $rows = $db->query('SELECT id, time_hhmm, max_posts, profile, enabled FROM schedule ORDER BY time_hhmm, id')->fetchAll();
+    $items = [];
+    $nextAt = null;
+    $nextTs = null;
+    $lastRunStmt = $db->prepare('SELECT status, fired_at, summary FROM schedule_runs WHERE schedule_id = ? AND day = ?');
+    foreach ($rows as $r) {
+        $sid = (int)$r['id'];
+        $lastRunStmt->execute([$sid, $today]);
+        $last = $lastRunStmt->fetch();
+        $items[] = [
+            'id'      => $sid,
+            'time'    => (string)$r['time_hhmm'],
+            'maxPosts'=> (int)$r['max_posts'],
+            'profile' => (string)$r['profile'],
+            'enabled' => ((int)$r['enabled']) === 1,
+            'lastRun' => is_array($last) ? $last : null,
+        ];
+        if (((int)$r['enabled']) === 1) {
+            $t = DateTime::createFromFormat('Y-m-d H:i', $today . ' ' . $r['time_hhmm'], new DateTimeZone(schedulerTz()));
+            if ($t !== false) {
+                if ($t <= $now) { $t->modify('+1 day'); }
+                if ($nextTs === null || $t->getTimestamp() < $nextTs) {
+                    $nextTs = $t->getTimestamp();
+                    $nextAt = $t->format('Y-m-d H:i');
+                }
+            }
+        }
+    }
+    $hbAge = scheduleHeartbeatAge($db);
+    return [
+        'success'        => true,
+        'now'            => $now->format('Y-m-d H:i:s'),
+        'nowHm'          => $now->format('H:i'),
+        'timezone'       => schedulerTz(),
+        'items'          => $items,
+        'nextAt'         => $nextAt,
+        'heartbeatAgeSec'=> $hbAge,
+        'tickActive'     => ($hbAge !== null && $hbAge < 150),
+        'cronLine'       => '* * * * * ' . rtrim((string)SYNC_APP_DIR, '/') . '/scheduler_tick.sh',
+    ];
+}
+
+if ($action === 'schedule_list') {
+    header('Content-Type: application/json; charset=utf-8');
+    echo json_encode(scheduleListPayload($db), JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
+if ($action === 'schedule_add') {
+    header('Content-Type: application/json; charset=utf-8');
+    $payload = json_decode(readRequestBody(), true);
+    if (!is_array($payload)) { $payload = []; }
+    $rawTime = trim((string)($payload['time'] ?? ($_GET['time'] ?? '')));
+    $h = 0; $m = 0;
+    if (!preg_match('#^([01]?\d|2[0-3]):([0-5]\d)$#', $rawTime, $tm)
+        || sscanf($rawTime, '%d:%d', $h, $m) !== 2) {
+        echo json_encode(['success' => false, 'error' => 'TIME_INVALID', 'message' => 'ساعت باید به شکل HH:MM باشد (مثلاً 09:30).'], JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+    $time = sprintf('%02d:%02d', $h, $m);
+    $maxPosts = (int)($payload['maxPosts'] ?? 5);
+    if ($maxPosts < 1)  { $maxPosts = 1; }
+    if ($maxPosts > 50) { $maxPosts = 50; }
+    $profile = normalizeDestinationProfile((string)($payload['profile'] ?? 'main'));
+    $dup = $db->prepare('SELECT id FROM schedule WHERE time_hhmm = ? AND profile = ?');
+    $dup->execute([$time, $profile]);
+    if ($dup->fetch() !== false) {
+        echo json_encode(['success' => false, 'error' => 'DUPLICATE', 'message' => 'برای این کانال، همین ساعت قبلاً ثبت شده است.'], JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+    $db->prepare('INSERT INTO schedule (time_hhmm, max_posts, profile, enabled, created_at) VALUES (?, ?, ?, 1, ?)')
+       ->execute([$time, $maxPosts, $profile, date('c')]);
+    $out = scheduleListPayload($db);
+    $out['added'] = (int)$db->lastInsertId();
+    echo json_encode($out, JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
+if ($action === 'schedule_remove') {
+    header('Content-Type: application/json; charset=utf-8');
+    $payload = json_decode(readRequestBody(), true);
+    if (!is_array($payload)) { $payload = []; }
+    $id = (int)($payload['id'] ?? 0);
+    if ($id <= 0) {
+        echo json_encode(['success' => false, 'error' => 'BAD_ID', 'message' => 'شناسهٔ زمان‌بند نامعتبر است.'], JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+    $db->prepare('DELETE FROM schedule WHERE id = ?')->execute([$id]);
+    $db->prepare('DELETE FROM schedule_runs WHERE schedule_id = ?')->execute([$id]);
+    echo json_encode(scheduleListPayload($db), JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
+if ($action === 'schedule_toggle') {
+    header('Content-Type: application/json; charset=utf-8');
+    $payload = json_decode(readRequestBody(), true);
+    if (!is_array($payload)) { $payload = []; }
+    $id = (int)($payload['id'] ?? 0);
+    $enabled = !empty($payload['enabled']) ? 1 : 0;
+    if ($id <= 0) {
+        echo json_encode(['success' => false, 'error' => 'BAD_ID', 'message' => 'شناسهٔ زمان‌بند نامعتبر است.'], JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+    $db->prepare('UPDATE schedule SET enabled = ? WHERE id = ?')->execute([$enabled, $id]);
+    echo json_encode(scheduleListPayload($db), JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
+if ($action === 'scheduler_tick') {
+    // فقط CLI (کران هر دقیقه)؛ از وب 403 — همان قاعدهٔ background_run
+    if (php_sapi_name() !== 'cli') {
+        header('Content-Type: application/json; charset=utf-8');
+        http_response_code(403);
+        echo json_encode(['success' => false, 'error' => 'CLI_ONLY', 'message' => 'تیک زمان‌بند فقط از طریق crontab (scheduler_tick.sh) اجرا می‌شود.'], JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+    @set_time_limit(0);
+    $logFile = rtrim(LOG_DIR, '/') . '/scheduler.log';
+    $schedLog = function (string $m) use ($logFile): void {
+        @file_put_contents($logFile, '[' . date('Y-m-d H:i:s') . '] ' . $m . "\n", FILE_APPEND);
+    };
+
+    // ---------- ۱) heartbeat: همیشه ثبت می‌شود تا داشبورد فعال بودن کران را بفهمد ----------
+    try {
+        $db->prepare("INSERT INTO schedule_meta (meta_key, meta_value) VALUES ('heartbeat', ?)
+                      ON CONFLICT(meta_key) DO UPDATE SET meta_value = excluded.meta_value")
+           ->execute([(string)time()]);
+    } catch (Throwable $e) {
+        $schedLog('heartbeat write failed: ' . $e->getMessage());
+    }
+
+    // ---------- ۲) اسلات‌های سررسید (با تحمل ۲ دقیقه تأخیر کرون) ----------
+    $now = schedulerNow();
+    $day = $now->format('Y-m-d');
+    $candidates = [];
+    for ($back = 0; $back <= 2; $back++) {
+        $candidates[] = (clone $now)->modify("-{$back} minutes")->format('H:i');
+    }
+    $marks = implode(',', array_fill(0, count($candidates), '?'));
+    $slots = $db->prepare("SELECT id, time_hhmm, max_posts, profile FROM schedule WHERE enabled = 1 AND time_hhmm IN ({$marks})");
+    $slots->execute($candidates);
+    $slots = $slots->fetchAll();
+
+    $fired = 0;
+    foreach ($slots as $slot) {
+        // mutex روزانه: هر اسلات فقط یک بار در روز شلیک می‌شود (INSERT OR IGNORE)
+        $ins = $db->prepare('INSERT OR IGNORE INTO schedule_runs (schedule_id, day, fired_at, status) VALUES (?, ?, ?, ?)');
+        $ins->execute([(int)$slot['id'], $day, $now->format('c'), 'running']);
+        if ($ins->rowCount() === 0) { continue; }
+
+        // ---------- ۳) شلیک: همان مسیر دکمهٔ داشبورد (background_sync از CLI) ----------
+        // background_sync خودش worker را با setsid جدا می‌کند، PID را ثبت می‌کند و
+        // اگر صف مشغول باشد alreadyRunning برمی‌گرداند. بدون بازنویسی موتور.
+        [$phpOk, $phpBin] = resolvePhpCliBinary();
+        if (!$phpOk) { $phpBin = (string)PHP_BINARY; }   // همین مفسر در حال اجراست؛ مطمئن‌ترین حدس
+        $bodyFile = tempnam(sys_get_temp_dir(), 'sched_body_');
+        @file_put_contents($bodyFile, json_encode([
+            'profile'  => (string)$slot['profile'],
+            'maxPosts' => (int)$slot['max_posts'],
+            'gap'      => 0,
+        ], JSON_UNESCAPED_UNICODE));
+        $cmd = 'ACTION=background_sync SYNC_BODY_FILE=' . escapeshellarg($bodyFile) . ' '
+             . escapeshellarg($phpBin) . ' -f ' . escapeshellarg(SYNC_APP_DIR . '/cli_run.php') . ' 2>&1';
+        $out = function_exists('shell_exec') ? (string)@shell_exec($cmd) : '';
+        @unlink($bodyFile);
+
+        // آخرین خط JSON خروجی background_sync
+        $res = null;
+        $lines = array_values(array_filter(array_map('trim', explode("\n", $out))));
+        if ($lines !== []) { $res = json_decode((string)end($lines), true); }
+
+        $status = 'error';
+        $summary = 'خروجی نامعتبر از background_sync';
+        if (is_array($res)) {
+            if (!empty($res['success']) && !empty($res['started'])) {
+                $status = 'fired';
+                $summary = 'صف شروع شد — pid=' . ($res['pid'] ?? '?') . ' — سقف ' . (int)$slot['max_posts'] . ' پست جدید';
+                $fired++;
+            } elseif (!empty($res['success']) && !empty($res['alreadyRunning'])) {
+                $status = 'skipped_busy';
+                $summary = 'صف دیگری در حال اجرا بود؛ این اسلات امروز رد شد (پست‌های جدید در چرخهٔ بعدی/کران قبلی می‌روند)';
+            } else {
+                $status = 'error';
+                $summary = trim(((string)($res['error'] ?? '')) . ' ' . ((string)($res['message'] ?? '')));
+            }
+        }
+        try {
+            $db->prepare('UPDATE schedule_runs SET status = ?, summary = ? WHERE schedule_id = ? AND day = ?')
+               ->execute([$status, mb_substr($summary, 0, 300), (int)$slot['id'], $day]);
+        } catch (Throwable $e) {
+            $schedLog('schedule_runs update failed: ' . $e->getMessage());
+        }
+        $schedLog("slot {$slot['time_hhmm']} (#{$slot['id']} profile={$slot['profile']}) → {$status}: {$summary}");
+    }
+
+    $schedLog('tick ok — now=' . $now->format('Y-m-d H:i') . ' due=' . count($slots) . ' fired=' . $fired);
+    echo json_encode(['success' => true, 'now' => $now->format('Y-m-d H:i'), 'due' => count($slots), 'fired' => $fired], JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
+// ============================================================
+//  self_update — به‌روزرسانی برنامه از گیت (دکمهٔ داشبورد)
+//  اصل: «هیچ‌وقت وضعیت نیمه‌خراب تحویل نده» —
+//   ۱) اگر صف/کرن در حال اجراست → رد (قفل مشترک flock)
+//   ۲) اگر درخت git کثیف است (تغییر محلی) → رد با فهرست فایل‌ها
+//   ۳) فقط merge --ff-only (هرگز conflict/تاریخچهٔ واگرا نمی‌سازد)
+//   ۴) بعد از merge، php -l و node --check روی فایل‌های اصلی؛
+//      اگر خراب بود → git reset --hard به وضعیت قبل (بازگشت خودکار)
+//  منبع آپدیت: origin/<UPDATE_GIT_REF> (پیش‌فرض main؛ قابل تغییر از .env)
+//  ورودی کاربر پذیرفته نمی‌شود (نه ref دلخواه، نه force).
+// ============================================================
+if ($action === 'self_update') {
+    header('Content-Type: application/json; charset=utf-8');
+    @set_time_limit(300);
+    @ignore_user_abort(true);
+
+    $updOut = function (array $payload, int $http = 200): void {
+        if ($http !== 200) { http_response_code($http); }
+        echo json_encode($payload, JSON_UNESCAPED_UNICODE);
+        exit;
+    };
+
+    if (!function_exists('shell_exec') || !is_callable('shell_exec')) {
+        $updOut(['success' => false, 'error' => 'SHELL_EXEC_DISABLED', 'message' => 'برای به‌روزرسانی، shell_exec باید در PHP فعال باشد.'], 500);
+    }
+
+    // اجرای git در دایرکتوری برنامه + گرفتن کد خروج (shell_exit rc نمی‌دهد؛ با نشانک آخر خط)
+    $gitRun = function (string $args): array {
+        $cmd = 'cd ' . escapeshellarg(SYNC_APP_DIR) . ' 2>/dev/null && git ' . $args . ' 2>&1; echo "__RC__=$?"';
+        $out = (string)@shell_exec($cmd);
+        $lines = array_map('trim', explode("\n", trim($out)));
+        $rc = 1;
+        if ($lines !== []) {
+            $last = (string)array_pop($lines);
+            if (preg_match('/^__RC__=(\d+)$/', $last, $m)) { $rc = (int)$m[1]; } else { $lines[] = $last; }
+        }
+        return [$lines, $rc];
+    };
+
+    // ---------- ۱) هیچ فرایند دیگری در حال اجرا نباشد ----------
+    [$running, $pid] = syncWorkerStatus();
+    if ($running) {
+        $updOut(['success' => false, 'error' => 'WORKER_RUNNING', 'message' => "صف پس‌زمینه در حال اجراست (PID {$pid})؛ تا پایانش صبر کنید بعد به‌روزرسانی کنید."], 409);
+    }
+    $lockFp = @fopen('/tmp/cron_sync.lock', 'c');
+    $lockHeld = false;
+    if ($lockFp !== false) {
+        if (!flock($lockFp, LOCK_EX | LOCK_NB)) {
+            @fclose($lockFp);
+            $updOut(['success' => false, 'error' => 'SYNC_BUSY', 'message' => 'چرخهٔ همگام‌سازی دیگری (cron/صف) همین الان قفل را دارد؛ چند لحظه بعد دوباره بزنید.'], 409);
+        }
+        $lockHeld = true;
+    }
+
+    try {
+        // ---------- ۲) git سالم است؟ ----------
+        [$verLines, $verRc] = $gitRun('--version');
+        if ($verRc !== 0 || !implode(' ', $verLines) || stripos(implode(' ', $verLines), 'git version') === false) {
+            $updOut(['success' => false, 'error' => 'GIT_MISSING', 'message' => 'git روی سرور در دسترس نیست: ' . implode(' ', array_slice($verLines, 0, 2))], 500);
+        }
+
+        // ---------- ۳) درخت تمیز؟ (تغییر محلی = رد؛ .env/پروفایل‌ها/لاگ‌ها ignored هستند و مانع نمی‌شوند) ----------
+        [$dirtyLines] = $gitRun('status --porcelain --untracked-files=no');
+        $dirty = array_values(array_filter($dirtyLines));
+        if ($dirty !== []) {
+            $updOut(['success' => false, 'error' => 'DIRTY_TREE', 'message' => 'فایل‌های زیر تغییر محلی دارند؛ اول آن‌ها را برگردانید (git checkout -- <فایل>) یا stash کنید:', 'details' => array_slice($dirty, 0, 15)], 409);
+        }
+
+        // ---------- ۴) وضعیت فعلی ----------
+        [$oldLines, $oldRc] = $gitRun('rev-parse HEAD');
+        $old = (string)implode('', $oldLines);
+        if ($oldRc !== 0 || !preg_match('/^[0-9a-f]{40}$/', $old)) {
+            $updOut(['success' => false, 'error' => 'NO_GIT_REPO', 'message' => 'این دایرکتوری یک clone سالم git نیست: ' . implode(' ', array_slice($oldLines, 0, 2))], 500);
+        }
+
+        // ---------- ۵) fetch از origin/<UPDATE_GIT_REF> ----------
+        $ref = preg_replace('/[^A-Za-z0-9._\/-]/', '', (string)UPDATE_GIT_REF);
+        if ($ref === '') { $ref = 'main'; }
+        [$fetchLines, $fetchRc] = $gitRun('fetch origin ' . escapeshellarg($ref));
+        if ($fetchRc !== 0) {
+            $updOut(['success' => false, 'error' => 'FETCH_FAILED', 'message' => 'دریابی از گیت ناموفق بود (شبکه/دسترسی):', 'details' => array_slice($fetchLines, 0, 8)], 502);
+        }
+        [$newLines, $newRc] = $gitRun('rev-parse FETCH_HEAD');
+        $new = (string)implode('', $newLines);
+        if ($newRc !== 0 || !preg_match('/^[0-9a-f]{40}$/', $new)) {
+            $updOut(['success' => false, 'error' => 'FETCH_FAILED', 'message' => 'شاخهٔ مبنا (' . $ref . ") روی origin پیدا نشد."], 502);
+        }
+
+        if ($new === $old) {
+            $updOut(['success' => true, 'updated' => false, 'from' => substr($old, 0, 7), 'message' => 'هم‌اکنون به‌روز هستید — نسخهٔ جدیدی روی ' . $ref . ' نیست.']);
+        }
+
+        // سرور جلوتر از origin است؟ (مثلاً PR هنوز merge نشده) — به‌روزرسانی‌ای وجود ندارد
+        [, $aheadRc] = $gitRun('merge-base --is-ancestor ' . escapeshellarg($new) . ' ' . escapeshellarg($old));
+        if ($aheadRc === 0) {
+            $updOut(['success' => true, 'updated' => false, 'from' => substr($old, 0, 7), 'message' => 'نسخهٔ سرور (' . substr($old, 0, 7) . ') جلوتر از ' . $ref . ' است؛ به‌روزرسانی جدیدی وجود ندارد (احتمالاً PR هنوز merge نشده).']);
+        }
+
+        // واگرایی؟ (تاریخچه‌های متفاوت) — هرگز خودسرانه حل نکن
+        [, $behindRc] = $gitRun('merge-base --is-ancestor ' . escapeshellarg($old) . ' ' . escapeshellarg($new));
+        if ($behindRc !== 0) {
+            $updOut(['success' => false, 'error' => 'DIVERGED', 'message' => 'تاریخچهٔ سرور با ' . $ref . ' واگرا شده؛ به‌روزرسانی خودکار امن نیست. با دستور «git log --oneline -5» وضعیت را بررسی/گزارش کنید.'], 409);
+        }
+
+        // ---------- ۶) merge فقط fast-forward ----------
+        [$mergeLines, $mergeRc] = $gitRun('merge --ff-only FETCH_HEAD');
+        [$nowLines] = $gitRun('rev-parse HEAD');
+        $now = (string)implode('', $nowLines);
+        if ($mergeRc !== 0 || $now !== $new) {
+            $gitRun('merge --abort');   // اگر وسط merge مانده باشد
+            $updOut(['success' => false, 'error' => 'MERGE_FAILED', 'message' => 'merge ناموفق بود؛ هیچ چیزی عوض نشد.', 'details' => array_slice($mergeLines, 0, 8)], 500);
+        }
+
+        // ---------- ۷) تأیید سلامت؛ خراب بود → بازگشت خودکار ----------
+        $lintFail = null;
+        [$phpOk, $phpBin] = resolvePhpCliBinary();
+        if ($phpOk) {
+            foreach (['sync_manual.php', 'config.php', 'cli_run.php'] as $f) {
+                $out = (string)@shell_exec(escapeshellarg($phpBin) . ' -l ' . escapeshellarg(SYNC_APP_DIR . '/' . $f) . ' 2>&1');
+                if (stripos($out, 'No syntax errors') === false) {
+                    $lintFail = "php -l {$f}: " . trim(explode("\n", $out)[0] ?? '');
+                    break;
+                }
+            }
+        }
+        if ($lintFail === null && is_executable((string)NODE_BIN)) {
+            foreach (['send_soroush.js', 'send_igap.js', 'login_igap.js', 'login_soroush.js', 'lib/pw_common.js'] as $f) {
+                $cmd = escapeshellarg((string)NODE_BIN) . ' --check ' . escapeshellarg(SYNC_APP_DIR . '/' . $f) . ' 2>&1; echo "__RC__=$?"';
+                $out = (string)@shell_exec($cmd);
+                if (strpos($out, '__RC__=0') === false) {
+                    $lintFail = "node --check {$f}: " . trim(explode("\n", $out)[0] ?? '');
+                    break;
+                }
+            }
+        }
+        if ($lintFail !== null) {
+            $gitRun('reset --hard ' . escapeshellarg($old));
+            $updOut(['success' => false, 'error' => 'UPDATE_ROLLED_BACK', 'message' => 'به‌روزرسانی اعمال شد ولی بررسی سلامت شکست خورد و به‌طور خودکار به نسخهٔ قبلی برگشت: ' . $lintFail], 500);
+        }
+
+        // ---------- ۸) گزارش ----------
+        [$commitLines] = $gitRun('log --oneline ' . escapeshellarg($old) . '..' . escapeshellarg($new));
+        [$fileLines] = $gitRun('diff --name-only ' . escapeshellarg($old) . '..' . escapeshellarg($new));
+        $commits = array_values(array_filter($commitLines));
+        $updOut([
+            'success' => true,
+            'updated' => true,
+            'from'    => substr($old, 0, 7),
+            'to'      => substr($new, 0, 7),
+            'files'   => count(array_filter($fileLines)),
+            'commits' => array_slice($commits, 0, 15),
+            'message' => 'به‌روزرسانی انجام شد: ' . substr($old, 0, 7) . ' → ' . substr($new, 0, 7) . ' (' . count(array_filter($fileLines)) . ' فایل). برای دیدن نسخهٔ جدید داشبورد، صفحه را رفرش کنید.',
+        ]);
+    } finally {
+        if ($lockFp !== false) {
+            if ($lockHeld) { @flock($lockFp, LOCK_UN); }
+            @fclose($lockFp);
+        }
+    }
+}
+
 if ($action === 'background_sync') {
     header('Content-Type: application/json; charset=utf-8');
     @mkdir(LOG_DIR, 0770, true);
 
-    $pid = currentSyncWorkerPid();
-    if (isPidRunning($pid)) {
-        echo json_encode(['success' => true, 'alreadyRunning' => true, 'pid' => $pid, 'message' => 'صف هم‌اکنون در حال پردازش است.'], JSON_UNESCAPED_UNICODE);
+    [$running, $pid] = syncWorkerStatus();
+    if ($running) {
+        echo json_encode([
+            'success'       => true,
+            'alreadyRunning'=> true,
+            'pid'           => $pid,
+            'progress'      => readJsonFile(backgroundProgressFile()),
+            'message'       => 'صف هم‌اکنون در حال پردازش است.',
+        ], JSON_UNESCAPED_UNICODE);
         exit;
     }
 
@@ -908,40 +1921,661 @@ if ($action === 'background_sync') {
     if (!is_array($payload)) {
         $payload = [];
     }
-    $profile = normalizeDestinationProfile((string)($payload['profile'] ?? ($_GET['profile'] ?? 'main')));
-    $limit = (int)($payload['limit'] ?? ($_GET['limit'] ?? 5));
-    if ($limit < 1)  { $limit = 1; }
-    if ($limit > 50) { $limit = 50; }
+    $profile  = normalizeDestinationProfile((string)($payload['profile'] ?? ($_GET['profile'] ?? 'main')));
+    $maxPosts = (int)($payload['maxPosts'] ?? ($_GET['maxPosts'] ?? BACKGROUND_MAX_POSTS));
+    if ($maxPosts < 1)  { $maxPosts = 1; }
+    if ($maxPosts > 50) { $maxPosts = 50; }
+    $gap = (int)($payload['gap'] ?? BACKGROUND_GAP_SEC);
+    if ($gap < 0)   { $gap = 0; }
+    if ($gap > 120) { $gap = 120; }
 
-    $bodyFile = rtrim(LOG_DIR, '/') . '/background_sync_body_' . date('Ymd_His') . '_' . bin2hex(random_bytes(3)) . '.json';
-    @file_put_contents($bodyFile, json_encode([
-        'profile' => $profile,
-        'limit'   => $limit,
-        'advance' => true,
-        'only'    => ['bale', 'rubika', 'soroush', 'igap'],
-        'gap'     => max(0, (int)SYNC_GAP_SEC),
-    ], JSON_UNESCAPED_UNICODE));
-    @chmod($bodyFile, 0600);
-
-    $pidFile = syncWorkerPidFile();
-    $logFile = rtrim(LOG_DIR, '/') . '/background_sync.log';
-    $inner = 'PHP_BIN=$(command -v ea-php83 || command -v ea-php82 || command -v ea-php81 || command -v php); '
-           . 'echo "[' . date('Y-m-d H:i:s') . '] START sync_recent profile=' . $profile . ' limit=' . $limit . '"; '
-           . 'ACTION=sync_recent SYNC_BODY_FILE=' . escapeshellarg($bodyFile) . ' "$PHP_BIN" -f ' . escapeshellarg(SYNC_APP_DIR . '/cli_run.php') . '; '
-           . 'RC=$?; rm -f ' . escapeshellarg($bodyFile) . '; echo "[' . date('Y-m-d H:i:s') . '] END sync_recent rc=$RC"; exit $RC';
-    $cmd = 'cd ' . escapeshellarg(SYNC_APP_DIR)
-         . ' && nohup /usr/bin/env bash -lc ' . escapeshellarg($inner)
-         . ' >> ' . escapeshellarg($logFile) . ' 2>&1 & echo $!';
-    $out = trim((string)shell_exec($cmd));
-    $newPid = preg_match('/\b(\d+)\b/', $out, $m) ? (int)$m[1] : 0;
-    if ($newPid > 0) {
-        @file_put_contents($pidFile, (string)$newPid);
-        echo json_encode(['success' => true, 'pid' => $newPid, 'profile' => $profile, 'limit' => $limit, 'message' => 'صف ۵ پست آخر در پس‌زمینه شروع شد؛ می‌توانید صفحه را ببندید.'], JSON_UNESCAPED_UNICODE);
+    // ---------- ۱) باینری PHP CLI تأییدشده ----------
+    [$phpOk, $phpBin, $phpAttempts] = resolvePhpCliBinary();
+    if (!$phpOk) {
+        @file_put_contents(
+            rtrim(LOG_DIR, '/') . '/background_sync.log',
+            '[' . date('Y-m-d H:i:s') . '] PHP_CLI_RESOLVE_FAILED attempts=' . json_encode($phpAttempts, JSON_UNESCAPED_UNICODE) . "\n",
+            FILE_APPEND
+        );
+        echo json_encode([
+            'success'  => false,
+            'error'    => 'PHP_CLI_NOT_FOUND',
+            'message'  => 'هیچ باینری PHP CLI سالم (نسخهٔ ۸+ با اکستنشن‌های لازم) پیدا نشد. '
+                        . 'در فایل .env مقدار PHP_CLI_BIN را مسیر کامل PHP 8 قرار دهید (مثلاً /opt/cpanel/ea-php83/root/usr/bin/php).',
+            'attempts' => $phpAttempts,
+        ], JSON_UNESCAPED_UNICODE);
         exit;
     }
 
+    // ---------- ۲) body و launcher مستقل و قابل‌دیباگ ----------
+    $bodyFile = rtrim(LOG_DIR, '/') . '/background_body_' . date('Ymd_His') . '_' . bin2hex(random_bytes(3)) . '.json';
+    @file_put_contents($bodyFile, json_encode([
+        'profile'  => $profile,
+        'maxPosts' => $maxPosts,
+        'gap'      => $gap,
+        'only'     => ['bale', 'rubika', 'soroush', 'igap'],
+    ], JSON_UNESCAPED_UNICODE));
+    @chmod($bodyFile, 0600);
+
+    $pidFile   = syncWorkerPidFile();
+    $logFile   = rtrim(LOG_DIR, '/') . '/background_sync.log';
+    $launcher  = rtrim(LOG_DIR, '/') . '/background_launcher.sh';
+
+    $homeDir = (string)getenv('HOME');
+    if ($homeDir === '' && preg_match('#^(/home/[^/]+)#', (string)SYNC_APP_DIR, $hm)) {
+        $homeDir = $hm[1];
+    }
+    $pathEnv = implode(':', array_unique(array_filter([
+        dirname($phpBin),
+        '/usr/local/bin',
+        '/usr/bin',
+        '/bin',
+    ])));
+
+    $launcherBody = '#!/usr/bin/env bash' . "\n"
+        . '# تولیدشده توسط sync_manual.php (action=background_sync) در ' . date('Y-m-d H:i:s') . "\n"
+        . '# نقش: اجرای مستقل worker صف پس‌زمینه و ثبت PID آن برای داشبورد' . "\n"
+        . 'set -u' . "\n"
+        . 'cd ' . escapeshellarg(SYNC_APP_DIR) . "\n"
+        . 'export HOME=' . escapeshellarg($homeDir !== '' ? $homeDir : '/tmp') . "\n"
+        . 'export PATH=' . escapeshellarg($pathEnv) . ':${PATH:-/usr/bin:/bin}' . "\n"
+        . 'echo "[' . date('Y-m-d H:i:s') . '] launcher START php=' . $phpBin . ' profile=' . $profile . ' maxPosts=' . $maxPosts . '"' . "\n"
+        . 'echo "[' . date('Y-m-d H:i:s') . '] php version: $(' . escapeshellarg($phpBin) . ' -r \'echo PHP_VERSION;\' 2>&1)"' . "\n"
+        . 'ACTION=background_run SYNC_BODY_FILE=' . escapeshellarg($bodyFile) . ' ' . escapeshellarg($phpBin) . ' -f ' . escapeshellarg(SYNC_APP_DIR . '/cli_run.php') . ' &' . "\n"
+        . 'WPID=$!' . "\n"
+        . 'echo "$WPID" > ' . escapeshellarg($pidFile) . "\n"
+        . 'echo "[' . date('Y-m-d H:i:s') . '] worker started pid=$WPID"' . "\n"
+        . 'wait "$WPID"' . "\n"
+        . 'RC=$?' . "\n"
+        . 'rm -f ' . escapeshellarg($bodyFile) . "\n"
+        . 'rm -f ' . escapeshellarg($pidFile) . "\n"
+        . 'echo "[' . date('Y-m-d H:i:s') . '] launcher END rc=$RC"' . "\n"
+        . 'exit $RC' . "\n";
+    @file_put_contents($launcher, $launcherBody);
+    @chmod($launcher, 0700);
+
+    // setsid: جدا شدن کامل از نشست Apache/PHP-FPM تا با پایان درخواست،
+    // worker کشته نشود. </dev/null هم تا fd های وب را نگه نداریم.
+    $cmd = 'setsid nohup bash ' . escapeshellarg($launcher)
+         . ' </dev/null >> ' . escapeshellarg($logFile) . ' 2>&1 & echo $!';
+    $out = trim((string)@shell_exec($cmd));
+    $newPid = preg_match('/\b(\d+)\b/', $out, $m) ? (int)$m[1] : 0;
+    if ($newPid > 0) {
+        @file_put_contents($pidFile, (string)$newPid);
+        echo json_encode([
+            'success'  => true,
+            'pid'      => $newPid,
+            'phpBin'   => $phpBin,
+            'profile'  => $profile,
+            'maxPosts' => $maxPosts,
+            'message'  => 'صف پس‌زمینه شروع شد؛ همهٔ پست‌های جدید روی سرور پردازش می‌شوند و می‌توانید صفحه را ببندید.',
+        ], JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+
+    @file_put_contents(
+        $logFile,
+        '[' . date('Y-m-d H:i:s') . '] LAUNCH_FAILED raw=' . $out . "\n",
+        FILE_APPEND
+    );
     echo json_encode(['success' => false, 'error' => 'START_FAILED', 'message' => 'شروع اجرای پس‌زمینه ناموفق بود.', 'raw' => $out], JSON_UNESCAPED_UNICODE);
     exit;
+}
+
+/**
+ * ارسال گزارش مدیریتی چندبخشی به بله (هر بخش < ۳۵۰۰ کاراکتر تا سقف پیام بله).
+ * خروجی: [ok(bool), error(string)]
+ */
+function sendAdminReportLines(array $lines): array {
+    if ($lines === []) {
+        return [false, 'گزارشی برای ارسال وجود ندارد'];
+    }
+    $missing = envMissing(['BALE_BOT_TOKEN', 'BALE_ADMIN_CHAT_ID']);
+    if ($missing) {
+        return [false, envMissingMessage($missing)];
+    }
+    $url = 'https://tapi.bale.ai/bot' . preg_replace('/^bot/i', '', trim(BALE_BOT_TOKEN)) . '/sendMessage';
+    $header = "📊 گزارش صف پس‌زمینهٔ همگام‌سازی\nزمان: " . date('Y-m-d H:i:s') . "\n\n";
+
+    $chunks = [];
+    $cur = $header;
+    foreach ($lines as $line) {
+        if (mb_strlen($cur) + mb_strlen($line) + 2 > 3500) {
+            $chunks[] = $cur;
+            $cur = '';
+        }
+        $cur .= $line . "\n\n";
+    }
+    if (trim($cur) !== '') {
+        $chunks[] = $cur;
+    }
+    foreach ($chunks as $i => $chunk) {
+        $sent = callApi($url, json_encode(['chat_id' => BALE_ADMIN_CHAT_ID, 'text' => trim($chunk)]), false, ['Content-Type: application/json']);
+        if (!($sent['code'] === 200 && ($sent['res']['ok'] ?? false))) {
+            return [false, 'ارسال گزارش به مدیر ناموفق بود (HTTP ' . ($sent['code'] ?? 0) . ') در بخش ' . ($i + 1) . ' از ' . count($chunks)];
+        }
+    }
+    return [true, ''];
+}
+
+// ۱-د-۳) موتور صف پس‌زمینه (فقط CLI؛ توسط background_launcher.sh اجرا می‌شود)
+//
+//     • همهٔ «پست‌های جدید» (نه فقط ۵ پست آخر) پردازش می‌شوند.
+//     • هر پلتفرم پست‌ها را به ترتیب می‌فرستد و در اولین شکستِ خودش می‌ایستد
+//       (حفظ ترتیب زمانی هر کانال) — بقیهٔ پلتفرم‌ها به کار خود ادامه می‌دهند.
+//     • سروش و آی‌گپ هم‌زمان اجرا می‌شوند و «مرورگر هر کدام فقط یک بار» برای
+//       کل صف باز می‌شود (حالت batch اسکریپت‌های Node).
+//     • دفتر تحویل (delivery) تکراری‌فرستادن را غیرممکن می‌کند: پلتفرم‌هایی که
+//       قبلاً تحویل شده‌اند دوباره ارسال نمی‌شوند.
+//     • برای آیتم‌های شکست‌خورده تا BACKGROUND_MAX_PASSES پاس تلاش مجدد.
+//     • بدون هیچ مکثی بین پست‌ها (gap=0 پیش‌فرض؛ با BACKGROUND_GAP_SEC قابل تنظیم).
+//     • پیشرفتِ لحظه‌ای در background_progress.json برای داشبورد (queue_status).
+if ($action === 'background_run') {
+    if (php_sapi_name() !== 'cli') {
+        header('Content-Type: application/json; charset=utf-8');
+        http_response_code(403);
+        echo json_encode(['success' => false, 'error' => 'CLI_ONLY', 'message' => 'این اکشن فقط از طریق launcher پس‌زمینه قابل اجراست.'], JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+    @set_time_limit(0);
+    ignore_user_abort(true);
+
+    $payload = readJsonFile(is_string(getenv('SYNC_BODY_FILE')) ? (string)getenv('SYNC_BODY_FILE') : null) ?? [];
+    $profile  = normalizeDestinationProfile((string)($payload['profile'] ?? 'main'));
+    $maxPosts = max(1, min(50, (int)($payload['maxPosts'] ?? BACKGROUND_MAX_POSTS)));
+    $gap      = max(0, min(120, (int)($payload['gap'] ?? BACKGROUND_GAP_SEC)));
+    $only     = normalizePlatformList(is_array($payload['only'] ?? null) ? (array)$payload['only'] : []);
+    $dest     = destinationProfile($profile);
+
+    $ALL_PLATFORMS = ['bale', 'rubika', 'soroush', 'igap'];
+
+    // ---------- فایل پیشرفت مشترک با داشبورد ----------
+    $progress = [
+        'state'      => 'running',
+        'phase'      => 'scrape',
+        'startedAt'  => date('c'),
+        'updatedAt'  => date('c'),
+        'pid'        => getmypid(),
+        'profile'    => $profile,
+        'only'       => $only,
+        'totalPosts' => 0,
+        'posts'      => [],
+        'summary'    => null,
+        'message'    => 'در حال خواندن کانال ایتا…',
+    ];
+    $writeProgress = function () use (&$progress) {
+        $progress['updatedAt'] = date('c');
+        writeJsonFileAtomic(backgroundProgressFile(), $progress);
+    };
+    $writeProgress();
+
+    $tmpFiles = [];      // رسانه‌های موقت برای پاک‌سازی پایانی
+    $reportLines = [];
+
+    // ---------- قفل مشترک با cron_sync.sh ----------
+    // هر دو روی /tmp/cron_sync.lock همان flock(2) کرنل را می‌گیرند؛ نتیجه:
+    // اگر cron وسط چرخه‌اش باشد این worker می‌ایستد تا تمام شود، و اگر این
+    // worker در حال اجرا باشد cron دور بعدی را skip می‌کند — دیگر هرگز دو
+    // فرایند هم‌زمان یک پست نمی‌فرستند (ارسال تکراری ممکن نیست).
+    $lockFp = @fopen('/tmp/cron_sync.lock', 'c');
+    $lockHeld = false;
+    if ($lockFp !== false) {
+        $shutdownReleaseLock = function () use (&$lockFp, &$lockHeld) {
+            if ($lockFp) {
+                if ($lockHeld) { @flock($lockFp, LOCK_UN); $lockHeld = false; }
+                @fclose($lockFp);
+                $lockFp = null;
+            }
+        };
+        register_shutdown_function($shutdownReleaseLock);
+    }
+
+    try {
+        if ($lockFp !== false) {
+            $lockDeadline = time() + 600;   // حداکثر ۱۰ دقیقه انتظار برای پایان چرخهٔ جاری
+            while (!flock($lockFp, LOCK_EX | LOCK_NB)) {
+                if (time() >= $lockDeadline) {
+                    throw new RuntimeException('LOCK_BUSY: چرخهٔ همگام‌سازی دیگری (cron) هنوز در حال اجراست؛ صف را دوباره اجرا کنید.');
+                }
+                $progress['message'] = 'در انتظار پایان چرخهٔ همگام‌سازی جاری (cron)…';
+                $writeProgress();
+                sleep(5);
+            }
+            $lockHeld = true;   // تا پایان همین فرایند نگه داشته می‌شود؛ shutdown آن را آزاد می‌کند
+        }
+
+        // ---------- ۱) scrape تازه + محاسبهٔ پست‌های جدید ----------
+        $scrape = fetchEitaaPosts();
+        if (!$scrape['ok']) {
+            throw new RuntimeException('SCRAPE_FAILED: ' . $scrape['error']);
+        }
+        $lastSeen = getLastSeenId($db, EITAA_CHANNEL_ID);
+        $pending = array_values(array_filter($scrape['messages'], fn($m) => (int)$m['id'] > $lastSeen));
+        if (count($pending) > $maxPosts) {
+            $pending = array_slice($pending, 0, $maxPosts);   // قدیمی‌ها اول؛ ترتیب زمانی حفظ می‌شود
+        }
+
+        if ($pending === []) {
+            $progress['state'] = 'done';
+            $progress['phase'] = 'done';
+            $progress['message'] = 'پست جدیدی در کانال ایتا نبود.';
+            $progress['summary'] = ['total' => 0, 'delivered' => 0, 'partial' => 0, 'failed' => 0, 'deferred' => 0, 'lastSeenId' => $lastSeen, 'advancedTo' => 0];
+            $writeProgress();
+            exit;
+        }
+
+        // ---------- ۲) ساخت وضعیت هر پست + اعمال دفتر تحویل ----------
+        $posts = [];          // id => وضعیت کامل برای داشبورد
+        $assigned = [];       // id => پلتفرم‌هایی که باید واقعاً ارسال شوند
+        $fullyDelivered = []; // id => bool (هر ۴ پلتفرم قبلاً ok)
+        foreach ($pending as $m) {
+            $id = (int)$m['id'];
+            $alreadyOk = deliveredOkPlatforms($db, $id, $profile);
+            $assigned[$id] = array_values(array_filter($only, fn($p) => !in_array($p, $alreadyOk, true)));
+            $fullyDelivered[$id] = ($assigned[$id] === []);
+            $cell = [];
+            foreach ($ALL_PLATFORMS as $p) {
+                if (!in_array($p, $only, true)) {
+                    $cell[$p] = ['ok' => null, 'info' => 'SKIPPED'];
+                } elseif (in_array($p, $alreadyOk, true)) {
+                    $cell[$p] = ['ok' => true, 'info' => 'قبلاً ارسال شده (دفتر تحویل)'];
+                } else {
+                    $cell[$p] = ['ok' => null, 'info' => 'QUEUED'];
+                }
+            }
+            $posts[$id] = [
+                'id'        => $id,
+                'text'      => (string)($m['text'] ?? ''),
+                'mediaType' => $m['mediaType'] ?? null,
+                'fileName'  => $m['fileName'] ?? null,
+                'status'    => $fullyDelivered[$id] ? 'delivered_before' : 'pending',
+                'media'     => ['ok' => null, 'info' => empty($m['mediaUrl']) ? 'none' : 'queued'],
+            ] + $cell;
+        }
+        $progress['totalPosts'] = count($pending);
+        $progress['posts'] = $posts;
+        $progress['message'] = count($pending) . ' پست جدید پیدا شد؛ در حال دانلود رسانه‌ها…';
+        $writeProgress();
+
+        // ---------- ۳) دانلود موازی رسانه + تلاش دوم با scrape تازه ----------
+        $progress['phase'] = 'download';
+        $writeProgress();
+
+        $dlTargets = array_values(array_filter($pending, fn($m) => !empty($m['mediaUrl']) && empty($fullyDelivered[(int)$m['id']])));
+        $downloads = [];
+        if ($dlTargets !== []) {
+            $downloads = downloadMediaBatch($dlTargets);
+            $failedIds = array_keys(array_filter($downloads, fn($r) => !$r['ok']));
+            if ($failedIds !== []) {
+                // لینک‌های ایتا امضاشده و زمان‌دارند؛ یک scrape تازه شاید لینک سالم بدهد
+                $fresh = fetchEitaaPosts();
+                if ($fresh['ok']) {
+                    $retryTargets = array_values(array_filter($fresh['messages'], fn($m) => in_array((int)$m['id'], $failedIds, true) && !empty($m['mediaUrl'])));
+                    if ($retryTargets !== []) {
+                        $downloads = array_replace($downloads, downloadMediaBatch($retryTargets));
+                    }
+                }
+            }
+        }
+
+        // ---------- ۴) تعیین صف ارسال؛ تعویق پستِ بی‌رسانه (مثل حالت دستی) ----------
+        $progress['phase'] = 'send';
+        $sendList = [];
+        $deferredId = 0;
+        foreach ($pending as $m) {
+            $id = (int)$m['id'];
+            if ($fullyDelivered[$id]) {
+                continue;   // قبلاً کامل تحویل شده؛ فقط برای advance حساب می‌شود
+            }
+            $localFile = null;
+            if (!empty($m['mediaUrl'])) {
+                $r = $downloads[$id] ?? ['ok' => false, 'path' => null, 'reason' => 'NO_RESULT'];
+                if (!empty($r['ok']) && !empty($r['path']) && file_exists((string)$r['path'])) {
+                    $localFile = (string)$r['path'];
+                    $tmpFiles[] = $localFile;
+                    $posts[$id]['media'] = ['ok' => true, 'info' => 'downloaded'];
+                } else {
+                    $reason = (string)($r['reason'] ?? 'UNKNOWN');
+                    $attempts = bumpMediaFail($db, $id, $reason);
+                    if ($attempts < MEDIA_MAX_RETRY) {
+                        $posts[$id]['status'] = 'deferred';
+                        $posts[$id]['media'] = ['ok' => false, 'info' => 'FAILED:' . $reason];
+                        $deferredId = $id;
+                        $reportLines[] = "⏸ پست {$id} [{$m['mediaType']}]: رسانه دانلود نشد ({$reason}) — تعویق تا چرخهٔ بعد با لینک تازه (تلاش {$attempts}/" . MEDIA_MAX_RETRY . ")";
+                        break;   // حفظ ترتیب: پست‌های بعدی در این اجرا ارسال نمی‌شوند
+                    }
+                    // سقف تلاش رسیده → مثل sync_single: انتشار بدون رسانه + گزارش صریح
+                    $posts[$id]['media'] = ['ok' => false, 'info' => 'DROPPED_AFTER_' . MEDIA_MAX_RETRY . '_TRIES:' . $reason];
+                    $reportLines[] = "⚠️ پست {$id}: رسانه بعد از " . MEDIA_MAX_RETRY . " تلاش نیامد ({$reason}) — با متن فقط ارسال شد";
+                }
+            }
+            $sendList[] = [
+                'id'        => $id,
+                'text'      => (string)($m['text'] ?? ''),
+                'file'      => $localFile,
+                'type'      => $m['mediaType'] ?? null,
+                'fileName'  => safeFileName((string)($m['fileName'] ?? 'file.bin'), 'file.bin'),
+                'mediaUrl'  => $m['mediaUrl'] ?? null,
+            ];
+            clearMediaFail($db, $id);   // پست منتشر می‌شود؛ شمارندهٔ شکست رسانه پاک شود (مثل sync_single)
+        }
+
+        // کمکی: به‌روزرسانی سلول یک پلتفرم از یک پست
+        $setCell = function (int $id, string $platform, ?bool $ok, string $info) use (&$posts) {
+            if (!isset($posts[$id])) { return; }
+            $posts[$id][$platform] = ['ok' => $ok, 'info' => mb_substr($info, 0, 300)];
+        };
+        // کمکی: محاسبهٔ وضعیت هر پست از روی سلول‌ها
+        $recomputeStatuses = function () use (&$posts, $assigned) {
+            foreach ($posts as $id => $p) {
+                if (in_array($p['status'], ['deferred', 'delivered_before'], true)) { continue; }
+                $okCnt = 0; $assignedCnt = 0; $pendingCnt = 0;
+                foreach (['bale', 'rubika', 'soroush', 'igap'] as $platform) {
+                    if (!isset($assigned[$id]) || !in_array($platform, $assigned[$id], true)) { continue; }
+                    $assignedCnt++;
+                    $ok = $p[$platform]['ok'] ?? null;
+                    if ($ok === true) { $okCnt++; }
+                    elseif ($ok === null) { $pendingCnt++; }
+                }
+                if ($pendingCnt > 0) { $posts[$id]['status'] = 'sending'; }
+                elseif ($assignedCnt === 0) { $posts[$id]['status'] = 'delivered_before'; }
+                elseif ($okCnt === $assignedCnt) { $posts[$id]['status'] = 'ok'; }
+                elseif ($okCnt > 0) { $posts[$id]['status'] = 'partial'; }
+                else { $posts[$id]['status'] = 'failed'; }
+            }
+        };
+
+        if ($sendList !== []) {
+            // ---------- ۵) فهرست آیتم هر پلتفرم (بدون پلتفرم‌های قبلاً تحویل‌شده) ----------
+            $itemsByPlatform = ['bale' => [], 'rubika' => [], 'soroush' => [], 'igap' => []];
+            foreach ($sendList as $it) {
+                foreach ($assigned[$it['id']] as $platform) {
+                    $itemsByPlatform[$platform][] = $it;
+                }
+            }
+
+            // ---------- ۶) راه‌اندازی runnerهای Node (سروش + آی‌گپ) ----------
+            // فاصلهٔ عمدی بین دو cold-start کرومیوم: اگر هم‌زمان بالا بیایند،
+            // اپِ سنگین‌تر (آی‌گپ) ممکن است در سکتهٔ رم/CPU جا بماند و لیست
+            // گفت‌وگوهایش در مهلت دیده نشود (APP_NOT_LOADED).
+            $nodeWorkers = [];
+            foreach (['soroush', 'igap'] as $platform) {
+                $items = $itemsByPlatform[$platform];
+                if ($items === []) { continue; }
+                if ($platform === 'igap' && isset($nodeWorkers['soroush']) && BACKGROUND_STAGGER_SEC > 0) {
+                    $progress['message'] = 'انتظار ' . BACKGROUND_STAGGER_SEC . ' ثانیه بین راه‌اندازی دو مرورگر (کاهش فشار سرور)…';
+                    $writeProgress();
+                    sleep(BACKGROUND_STAGGER_SEC);
+                }
+                $h = launchUserbotBatch($platform, $items, $dest);
+                if (!$h['ok']) {
+                    foreach ($items as $it) {
+                        $setCell($it['id'], $platform, false, 'LAUNCH: ' . $h['message']);
+                        markDelivery($db, $it['id'], $platform, $profile, false, 'LAUNCH: ' . $h['message']);
+                    }
+                    continue;
+                }
+                $nodeWorkers[$platform] = [
+                    'platform'  => $platform,
+                    'handle'    => $h,
+                    'items'     => $items,
+                    'pass'      => 1,
+                    'seen'      => [],
+                    'profileDir'=> $platform === 'soroush' ? SOROUSH_PROFILE_DIR : IGAP_PROFILE_DIR,
+                ];
+            }
+
+            // ---------- ۷) workerهای HTTP (بله/روبیکا؛ یک آیتم در هر دور) ----------
+            $httpWorkers = [];
+            foreach (['bale', 'rubika'] as $platform) {
+                if ($itemsByPlatform[$platform] === []) { continue; }
+                $httpWorkers[$platform] = ['platform' => $platform, 'queue' => array_values($itemsByPlatform[$platform]), 'pass' => 1, 'pos' => 0];
+            }
+
+            // ادغام نتیجهٔ runner در وضعیت داشبورد + دفتر تحویل
+            $mergeRunner = function (array &$nw) use (&$posts, $db, $profile, $setCell) {
+                $pr = readJsonFile($nw['handle']['progressFile']);
+                if (!is_array($pr) || !isset($pr['items']) || !is_array($pr['items'])) { return; }
+                foreach ($pr['items'] as $pi) {
+                    $id = (int)($pi['id'] ?? 0);
+                    $status = (string)($pi['status'] ?? '');
+                    if ($id <= 0 || isset($nw['seen'][$id])) { continue; }
+                    if (!in_array($status, ['OK', 'ERROR', 'UNVERIFIED', 'NOT_ATTEMPTED'], true)) { continue; }
+                    $res = is_array($pi['result'] ?? null) ? $pi['result'] : [];
+                    if ($status === 'OK') {
+                        $ok = true;
+                        $info = (string)($res['message'] ?? 'OK');
+                    } else {
+                        $ok = false;
+                        $info = $status === 'NOT_ATTEMPTED'
+                            ? 'تا این‌جا پیش رفت؛ این پست در این پاس تلاش نشد'
+                            : '[' . (string)($res['code'] ?? $status) . '] ' . (string)($res['error'] ?? $res['message'] ?? '');
+                    }
+                    $setCell($id, $nw['platform'], $ok, trim($info));
+                    markDelivery($db, $id, $nw['platform'], $profile, $ok, trim($info));
+                    $nw['seen'][$id] = true;
+                }
+            };
+
+            // آیتم‌های باقی‌ماندهٔ یک runner از روی progress آن
+            $remainingItems = function (array $nw): array {
+                $pr = readJsonFile($nw['handle']['progressFile']);
+                $statusById = [];
+                if (is_array($pr) && is_array($pr['items'] ?? null)) {
+                    foreach ($pr['items'] as $pi) {
+                        $statusById[(int)($pi['id'] ?? 0)] = (string)($pi['status'] ?? '');
+                    }
+                }
+                $remaining = [];
+                $failedSeen = false;
+                foreach ($nw['items'] as $it) {
+                    $st = $statusById[(int)$it['id']] ?? '';
+                    if ($st !== 'OK') { $failedSeen = true; }
+                    if ($failedSeen) { $remaining[] = $it; }   // خودِ آیتم شکست‌خورده + بعدی‌ها
+                }
+                return $remaining;
+            };
+
+            $fatalRunnerCode = function (array $nw): ?string {
+                $pr = readJsonFile($nw['handle']['progressFile']);
+                $code = (string)($pr['error']['code'] ?? '');
+                // APP_NOT_LOADED عمداً مهلک نیست: وقتی دو کرومیوم هم‌زمان cold-start
+                // می‌شوند ممکن است اپِ سنگین‌تر (آی‌گپ) در مهلتش بالا نیاید؛ پاس دوم
+                // (پس از سبک شدن فشار) معمولاً موفق می‌شود. SESSION_EXPIRED و
+                // CHANNEL_NOT_FOUND مهلک می‌مانند تا به چت اشتباه نرویم.
+                $fatalCodes = ['SESSION_EXPIRED', 'CHANNEL_NOT_FOUND', 'COMPOSER_NOT_AVAILABLE', 'NODE_DEPS_MISSING', 'BAD_BATCH', 'SHELL_EXEC_DISABLED', 'BATCH_WRITE_FAILED', 'LAUNCH_FAILED'];
+                return in_array($code, $fatalCodes, true) ? $code : null;
+            };
+
+            // ---------- ۸) حلقهٔ یکپارچهٔ اجرا (تا پایان همهٔ workerها) ----------
+            while ($nodeWorkers !== [] || $httpWorkers !== []) {
+                // --- یک آیتم از هر صف HTTP ---
+                foreach (array_keys($httpWorkers) as $platform) {
+                    if (!isset($httpWorkers[$platform])) { continue; }
+                    $hw = &$httpWorkers[$platform];
+                    $it = $hw['queue'][$hw['pos']];
+                    if ($gap > 0 && $hw['pos'] > 0) { sleep($gap); }   // فقط اگر در .env خواسته شده باشد
+                    $ok = false;
+                    $info = '';
+                    for ($try = 1; $try <= 2 && !$ok; $try++) {
+                        if ($platform === 'bale') {
+                            $r = sendToBale($it['text'], $it['file'], $it['type'], $it['fileName'], $dest['baleChannel']);
+                            $ok = ($r['code'] === 200 and (bool)($r['res']['ok'] ?? false));
+                        } else {
+                            $r = sendToRubika($it['text'], $it['file'], $it['type'], $it['fileName'], $dest['rubikaChannel']);
+                            $ok = ($r['code'] === 200 and (($r['res']['status'] ?? '') === 'OK'));
+                        }
+                        $info = (string)($r['code'] ?? 'ERR');
+                        if (!$ok && $try === 1) { usleep(700000); }   // یک تلاش مجددِ همان لحظه
+                    }
+                    $setCell($it['id'], $platform, $ok, $ok ? $info : ('FAIL ' . $info));
+                    markDelivery($db, $it['id'], $platform, $profile, $ok, $info);
+
+                    if (!$ok) {
+                        if ($hw['pass'] < BACKGROUND_MAX_PASSES) {
+                            $hw['pass']++;
+                            $hw['queue'] = array_slice($hw['queue'], $hw['pos']);   // از همین آیتم دوباره
+                            $hw['pos'] = 0;
+                        } else {
+                            for ($j = $hw['pos']; $j < count($hw['queue']); $j++) {
+                                $rest = $hw['queue'][$j];
+                                if (($posts[$rest['id']][$platform]['ok'] ?? null) === null) {
+                                    $setCell($rest['id'], $platform, false, 'FAILED_AFTER_RETRIES');
+                                    markDelivery($db, $rest['id'], $platform, $profile, false, 'FAILED_AFTER_RETRIES');
+                                }
+                            }
+                            unset($httpWorkers[$platform]);
+                        }
+                    } else {
+                        $hw['pos']++;
+                        if ($hw['pos'] >= count($hw['queue'])) {
+                            unset($httpWorkers[$platform]);
+                        }
+                    }
+                    unset($hw);
+                }
+
+                // --- ادغام و مدیریت runnerهای Node ---
+                foreach (array_keys($nodeWorkers) as $platform) {
+                    if (!isset($nodeWorkers[$platform])) { continue; }
+                    $nw = &$nodeWorkers[$platform];
+                    $mergeRunner($nw);
+
+                    if (userbotAsyncDone($nw['handle'])) {
+                        sleep(1);
+                        $mergeRunner($nw);   // نتیجهٔ نهایی
+                        $remaining = $remainingItems($nw);
+                        $fatal = $fatalRunnerCode($nw);
+                        cleanupUserbotBatch($nw['handle']);
+
+                        if ($remaining !== [] && $fatal === null && $nw['pass'] < BACKGROUND_MAX_PASSES) {
+                            sleep(2);   // مرورگر پاس قبل کامل بسته شود
+                            $h2 = launchUserbotBatch($platform, $remaining, $dest);
+                            if ($h2['ok']) {
+                                $nw['handle'] = $h2;
+                                $nw['items'] = $remaining;
+                                $nw['pass']++;
+                                $nw['seen'] = [];
+                                $progress['message'] = "پاس تلاش مجدد {$platform} (پاس {$nw['pass']}) شروع شد.";
+                            } else {
+                                foreach ($remaining as $rest) {
+                                    if (($posts[$rest['id']][$platform]['ok'] ?? null) === null) {
+                                        $setCell($rest['id'], $platform, false, 'RELAUNCH: ' . $h2['message']);
+                                        markDelivery($db, $rest['id'], $platform, $profile, false, 'RELAUNCH: ' . $h2['message']);
+                                    }
+                                }
+                                unset($nodeWorkers[$platform]);
+                            }
+                        } else {
+                            if ($remaining !== []) {
+                                $note = $fatal !== null ? ('FATAL_' . $fatal) : 'NO_MORE_PASSES';
+                                foreach ($remaining as $rest) {
+                                    if (($posts[$rest['id']][$platform]['ok'] ?? null) === null) {
+                                        $setCell($rest['id'], $platform, false, $note);
+                                        markDelivery($db, $rest['id'], $platform, $profile, false, $note);
+                                    }
+                                }
+                            }
+                            unset($nodeWorkers[$platform]);
+                        }
+                    } elseif (time() > (int)$nw['handle']['deadline']) {
+                        killProcessGroup((int)$nw['handle']['pgid']);
+                        foreach ($nw['items'] as $rest) {
+                            if (($posts[$rest['id']][$platform]['ok'] ?? null) === null) {
+                                $setCell($rest['id'], $platform, false, 'RUNNER_TIMEOUT');
+                                markDelivery($db, $rest['id'], $platform, $profile, false, 'RUNNER_TIMEOUT');
+                            }
+                        }
+                        cleanupUserbotBatch($nw['handle']);
+                        unset($nodeWorkers[$platform]);
+                    }
+                    unset($nw);
+                }
+
+                $recomputeStatuses();
+                $progress['posts'] = $posts;
+                $writeProgress();
+                usleep($httpWorkers !== [] ? 500000 : 2000000);
+            }
+        }
+
+        // ---------- ۹) جلو بردن state تا آخرین پستِ پیوستهٔ تحویل‌شده ----------
+        $recomputeStatuses();
+        // پست‌هایی که به‌خاطر تعویقِ پست قبل، هرگز تلاش نشدند → pending (نه sending)
+        foreach ($posts as $id => $p) {
+            if (($p['status'] ?? '') !== 'sending') { continue; }
+            $started = false;
+            foreach ($only as $platform) {
+                $cell = $p[$platform] ?? ['ok' => null, 'info' => 'SKIPPED'];
+                if ($cell['ok'] !== null || !in_array((string)($cell['info'] ?? ''), ['QUEUED', 'SKIPPED', ''], true)) {
+                    $started = true;
+                    break;
+                }
+            }
+            if (!$started) { $posts[$id]['status'] = 'pending'; }
+        }
+        $progress['posts'] = $posts;
+        $advanceTo = 0;
+        foreach ($pending as $m) {
+            $id = (int)$m['id'];
+            $p = $posts[$id];
+            if (($p['status'] ?? '') === 'deferred') { break; }
+            $anyOk = false;
+            foreach ($only as $platform) {
+                if (($p[$platform]['ok'] ?? null) === true) { $anyOk = true; break; }
+            }
+            if ($anyOk) { $advanceTo = $id; } else { break; }
+        }
+        if ($advanceTo > 0) {
+            advanceLastSeenId($db, EITAA_CHANNEL_ID, $advanceTo);
+        }
+
+        // ---------- ۱۰) گزارش مدیریتی ----------
+        $mark = fn($cell) => (($cell['ok'] ?? null) === true) ? '✅' : ((($cell['ok'] ?? null) === null) ? '—' : '❌');
+        foreach ($pending as $m) {
+            $id = (int)$m['id'];
+            $p = $posts[$id];
+            $mediaNote = empty($m['mediaUrl']) ? '' : (' | رسانه: ' . (($p['media']['ok'] ?? false) === true ? '✅' : '❌ ' . (string)($p['media']['info'] ?? '')));
+            $reportLines[] = "🔹 پست {$id} [" . ($m['mediaType'] ?? 'text') . "]: بله " . $mark($p['bale']) . " | روبیکا " . $mark($p['rubika']) . " | سروش " . $mark($p['soroush']) . " | آی‌گپ " . $mark($p['igap']) . $mediaNote;
+        }
+
+        $summary = ['total' => count($pending), 'delivered' => 0, 'partial' => 0, 'failed' => 0, 'deferred' => 0, 'lastSeenId' => getLastSeenId($db, EITAA_CHANNEL_ID), 'advancedTo' => $advanceTo];
+        foreach ($posts as $p) {
+            if ($p['status'] === 'ok' || $p['status'] === 'delivered_before') { $summary['delivered']++; }
+            elseif ($p['status'] === 'partial') { $summary['partial']++; }
+            elseif ($p['status'] === 'deferred') { $summary['deferred']++; }
+            elseif ($p['status'] === 'failed') { $summary['failed']++; }
+        }
+        $reportLines[] = "📈 جمع‌بندی: از {$summary['total']} پست — کامل: {$summary['delivered']}، ناقص: {$summary['partial']}، ناموفق: {$summary['failed']}، تعویق‌شده: {$summary['deferred']} | last_msg_id → {$summary['advancedTo']}";
+
+        $progress['state'] = 'done';
+        $progress['phase'] = 'done';
+        $progress['posts'] = $posts;
+        $progress['summary'] = $summary;
+        $progress['message'] = $deferredId > 0
+            ? "صف تمام شد؛ پست {$deferredId} برای دانلود رسانه به چرخهٔ بعد موکول شد و پست‌های بعد از آن در این اجرا ارسال نشدند."
+            : 'صف پس‌زمینه با موفقیت تمام شد.';
+        $writeProgress();
+
+        [$reportOk, $reportErr] = sendAdminReportLines($reportLines);
+        if (!$reportOk) {
+            error_log('[background_run] report: ' . $reportErr);
+        }
+    } catch (Throwable $e) {
+        $progress['state'] = 'error';
+        $progress['phase'] = 'error';
+        $progress['message'] = 'خطای worker: ' . $e->getMessage();
+        $writeProgress();
+        error_log('[background_run] FATAL: ' . $e->getMessage() . ' @ ' . $e->getFile() . ':' . $e->getLine());
+        try {
+            sendAdminReportLines(array_merge(["❌ صف پس‌زمینه با خطا متوقف شد:"], [$e->getMessage()]));
+        } catch (Throwable $ignored) {}
+        foreach ($tmpFiles as $f) { @unlink($f); }
+        exit(1);
+    }
+
+    foreach ($tmpFiles as $f) { @unlink($f); }
+    exit(0);
 }
 
 // ۲. پردازش منفرد یک پست
@@ -1004,7 +2638,7 @@ if ($action === 'sync_single') {
     $hasDeliverable = (trim($text) !== '') || ($localFile && file_exists($localFile));
 
     if ($hasDeliverable) {
-        $sent = dispatchToPlatforms($onlyNorm, $text, $localFile, $mediaType, $fileName, $profile);
+        $sent = dispatchToPlatforms($onlyNorm, $text, $localFile, $mediaType, $fileName, $profile, $db, $msgId);
     } else {
         $sent = [];
         foreach (['bale', 'rubika', 'soroush', 'igap'] as $p) {
@@ -1186,7 +2820,7 @@ if ($action === 'resend') {
             $mediaInfo = $localFile ? 'downloaded' : ('FAILED:' . (string)$mediaReason);
         }
 
-        $sent = dispatchToPlatforms($only, $text, $localFile, $mediaType, $fileName !== '' ? $fileName : 'file.bin', $profile);
+        $sent = dispatchToPlatforms($only, $text, $localFile, $mediaType, $fileName !== '' ? $fileName : 'file.bin', $profile, $db, $msgId);
 
         if ($localFile and file_exists($localFile)) {
             @unlink($localFile);
@@ -1357,9 +2991,10 @@ if ($action === 'rewind') {
             <small style="color: #94a3b8;">پلتفرم‌ها: بله، روبیکا، سروش‌پلاس، آیگپ</small>
         </div>
         <div class="header-actions">
-            <button id="queueBtn" class="btn" style="background:#0d9488" onclick="startBackgroundSync('main')">افزودن به صف پس‌زمینه (۵ پست اصلی)</button>
+            <button id="queueBtn" class="btn" style="background:#0d9488" onclick="startBackgroundSync('main')">اجرای صف پس‌زمینه (همهٔ پست‌های جدید)</button>
             <button id="startBtn" class="btn" onclick="startSync()">اجرای دستی (۵ پست اصلی)</button>
             <button id="testBtn" class="btn" style="background:#7c3aed" onclick="startTestSync()">تست کانال‌های قبلی</button>
+            <button id="updateBtn" class="btn" style="background:#475569" onclick="selfUpdate()" title="به‌روزرسانی کد برنامه از گیت (ایمن: قفل صف، فقط fast-forward، بررسی سلامت و بازگشت خودکار)">↻ به‌روزرسانی از گیت</button>
         </div>
     </div>
 
@@ -1439,6 +3074,31 @@ if ($action === 'rewind') {
                 <div class="force-result" id="forceResult"></div>
             </div>
         </div>
+
+        <div class="panel">
+            <div class="panel-head">
+                <h2>زمان‌بندی خودکار</h2>
+                <p>در ساعت‌های تعیین‌شده، پست‌های <b>جدید</b> (تا سقف انتخابی، پیش‌فرض ۵ پست) با همان موتور صف پس‌زمینه و بدون دخالت شما به همهٔ پیام‌رسان‌ها ارسال می‌شوند.</p>
+            </div>
+            <div class="panel-body">
+                <div class="row space">
+                    <span class="lbl inline">ساعت سرور: <b id="schedClock">…</b></span>
+                    <span class="badge" id="schedTick">…</span>
+                </div>
+                <div class="hint" id="schedNext">در حال خواندن زمان‌بندی…</div>
+                <div class="row" style="margin-top:10px;">
+                    <input type="time" id="schedTime" value="09:00" title="ساعت اجرا (سرور)">
+                    <input type="number" id="schedPosts" min="1" max="50" value="5" style="max-width:78px" title="حداکثر تعداد پست جدید">
+                    <select id="schedProfile" style="max-width:120px" title="کانال مقصد">
+                        <option value="main">کانال اصلی</option>
+                        <option value="test">آزمایشی</option>
+                    </select>
+                    <button class="btn btn-ghost" onclick="addSchedule()">افزودن ساعت</button>
+                </div>
+                <div class="post-list" id="schedList" style="max-height:220px;"></div>
+                <div class="warnbox" id="schedCron" style="display:none;"></div>
+            </div>
+        </div>
       </aside>
     </div>
 </div>
@@ -1466,29 +3126,87 @@ if ($action === 'rewind') {
     }
 
     let queuePollTimer = null;
+    let bgSummaryShown = false;
+
     async function startBackgroundSync(profile = 'main') {
         const btn = document.getElementById('queueBtn');
         btn.disabled = true;
-        document.getElementById('statusText').innerText = 'در حال افزودن ۵ پست آخر به صف پس‌زمینه...';
-        log(`شروع صف پس‌زمینه (${profile === 'test' ? 'تست' : 'اصلی'}): ۵ پست آخر روی سرور پردازش می‌شود و لازم نیست مرورگر منتظر بماند.`, '#7dd3fc');
+        bgSummaryShown = false;
+        document.getElementById('statusText').innerText = 'در حال افزودن پست‌های جدید به صف پس‌زمینه...';
+        log(`شروع صف پس‌زمینه (${profile === 'test' ? 'تست' : 'اصلی'}): همهٔ پست‌های جدید روی سرور، با هم و بدون مکث پردازش می‌شوند؛ لازم نیست مرورگر باز بماند.`, '#7dd3fc');
         try {
             const res = await fetch(apiUrl('background_sync'), {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ profile, limit: 5 })
+                body: JSON.stringify({ profile, maxPosts: 50 })
             });
             const data = await res.json();
             if (!data.success) {
                 log('❌ صف پس‌زمینه شروع نشد: ' + (data.message || data.error || 'خطای نامشخص'), '#f87171');
+                if (Array.isArray(data.attempts) && data.attempts.length) {
+                    log('   باینری‌های آزموده‌شده: ' + data.attempts.join(' | '), '#fbbf24');
+                }
                 btn.disabled = false;
                 return;
             }
-            log((data.alreadyRunning ? 'صف از قبل در حال اجراست' : 'صف شروع شد') + ` — PID: ${data.pid || '؟'}`, '#4ade80');
-            document.getElementById('statusText').innerText = 'صف پس‌زمینه فعال است؛ وضعیت از لاگ خوانده می‌شود.';
+            log((data.alreadyRunning ? 'صف از قبل در حال اجراست' : 'صف پس‌زمینه شروع شد')
+                + ` — PID: ${data.pid || '؟'} — PHP: ${data.phpBin || ''}`, '#4ade80');
+            document.getElementById('cardsList').innerHTML = '';
+            document.getElementById('progressFill').style.width = '0%';
+            document.getElementById('percentText').innerText = '0%';
+            document.getElementById('statusText').innerText = 'صف پس‌زمینه فعال است؛ پیشرفت از سرور خوانده می‌شود.';
+            window.__bgRenderedIds = '';
             pollQueueStatus(true);
         } catch (e) {
             log('❌ خطای شروع صف پس‌زمینه: ' + e.message, '#f87171');
             btn.disabled = false;
+        }
+    }
+
+    // رندر پیشرفت زندهٔ صف پس‌زمینه از روی background_progress.json
+    function renderBackgroundProgress(p) {
+        if (!p) return;
+        const postsArr = Object.values(p.posts || {});
+        const finals = ['ok', 'partial', 'failed', 'deferred', 'delivered_before'];
+        if (postsArr.length) {
+            const ids = postsArr.map(x => x.id).join(',');
+            if (window.__bgRenderedIds !== ids) {
+                window.__bgRenderedIds = ids;
+                renderCards(postsArr.map(x => ({ id: x.id, text: x.text, mediaType: x.mediaType })));
+            }
+            postsArr.forEach(x => {
+                const cell = (pl) => x[pl] || { ok: null, info: 'SKIPPED' };
+                ['bale', 'rubika', 'soroush', 'igap'].forEach(pl => {
+                    const c = cell(pl);
+                    const b = document.getElementById(`${pl}-${x.id}`);
+                    if (!b) return;
+                    const waiting = !finals.includes(x.status) && c.ok === null && String(c.info || '') === 'QUEUED';
+                    if (waiting) { b.className = 'badge loading'; b.style.background = ''; b.innerText = ({bale:'بله',rubika:'روبیکا',soroush:'سروش',igap:'آیگپ'})[pl] + '…'; b.title = 'در صف این پلتفرم'; }
+                    else updateBadge(`${pl}-${x.id}`, c.ok, ({bale:'بله',rubika:'روبیکا',soroush:'سروش',igap:'آیگپ'})[pl], c.info);
+                });
+            });
+            const done = postsArr.filter(x => finals.includes(x.status)).length;
+            const pct = Math.round((done / postsArr.length) * 100);
+            document.getElementById('progressFill').style.width = `${pct}%`;
+            document.getElementById('percentText').innerText = `${pct}%`;
+            if (p.state === 'running') {
+                document.getElementById('statusText').innerText =
+                    `صف پس‌زمینه: ${faNum(done)} از ${faNum(postsArr.length)} پست (${p.phase || '...'})`;
+            }
+        } else if (p.state === 'running') {
+            document.getElementById('statusText').innerText = 'صف پس‌زمینه: ' + (p.message || p.phase || 'در حال آماده‌سازی…');
+        }
+
+        if ((p.state === 'done' || p.state === 'error') && !bgSummaryShown) {
+            bgSummaryShown = true;
+            const s = p.summary || {};
+            document.getElementById('progressFill').style.width = '100%';
+            document.getElementById('percentText').innerText = '100%';
+            document.getElementById('statusText').innerText = p.state === 'error'
+                ? ('صف پس‌زمینه با خطا متوقف شد: ' + (p.message || ''))
+                : (p.message || 'صف پس‌زمینه تمام شد.');
+            log(p.state === 'error' ? `❌ صف پس‌زمینه: ${p.message || 'خطا'}` : `■ پایان صف پس‌زمینه — کامل: ${faNum(s.delivered ?? 0)}، ناقص: ${faNum(s.partial ?? 0)}، ناموفق: ${faNum(s.failed ?? 0)}، تعویق: ${faNum(s.deferred ?? 0)} (last_msg_id → ${faNum(s.advancedTo ?? 0)})`,
+                p.state === 'error' ? '#f87171' : '#4ade80');
         }
     }
 
@@ -1499,10 +3217,12 @@ if ($action === 'rewind') {
                 const res = await fetch(apiUrl('queue_status'));
                 const data = await res.json();
                 if (!data.success) return false;
-                const lines = String(data.launcherLog || data.log || '').trim().split(/\n/).filter(Boolean).slice(-5);
+                renderBackgroundProgress(data.progress);
+                const qBtn = document.getElementById('queueBtn');
+                if (qBtn) qBtn.disabled = !!data.running;
+                // آخرین خط لاگ launcher (برای خطاهای محیطی مثل PHP غلط)
+                const lines = String(data.launcherLog || '').trim().split(/\n/).filter(Boolean).slice(-2);
                 if (lines.length) {
-                    document.getElementById('statusText').innerText = data.running ? 'صف پس‌زمینه در حال پردازش است...' : 'صف پس‌زمینه متوقف/تمام شد.';
-                    document.getElementById('percentText').innerText = data.running ? 'در صف' : 'پایان';
                     const last = lines[lines.length - 1];
                     if (window.__lastQueueLine !== last) {
                         window.__lastQueueLine = last;
@@ -1510,6 +3230,12 @@ if ($action === 'rewind') {
                     }
                 }
                 if (!data.running) {
+                    // اگر worker مرده ولی progress هنوز running است (کرش سخت):
+                    if (data.progress && data.progress.state === 'running' && !bgSummaryShown) {
+                        bgSummaryShown = true;
+                        document.getElementById('statusText').innerText = 'پردازش صف پس‌زمینه ناتمام متوقف شد؛ logs/background_sync.log را ببینید.';
+                        log('⚠️ فرایند صف پس‌زمینه بدون تکمیل پیشرفت متوقف شد؛ لاگ سرور را بررسی کنید.', '#fbbf24');
+                    }
                     clearInterval(queuePollTimer);
                     queuePollTimer = null;
                     document.getElementById('queueBtn').disabled = false;
@@ -1521,7 +3247,182 @@ if ($action === 'rewind') {
             }
         };
         const running = await tick();
-        if (running && !queuePollTimer) queuePollTimer = setInterval(tick, 5000);
+        if (running && !queuePollTimer) queuePollTimer = setInterval(tick, 2500);
+    }
+
+    // ---------- زمان‌بندی خودکار (schedule_*) ----------
+    const SCHED_STATUS_FA = {
+        fired: '✅ اجرا شد', skipped_busy: '⏭ رد شد (صف مشغول بود)',
+        running: '⏳ در حال اجرا', error: '❌ خطا',
+    };
+
+    async function loadSchedule() {
+        try {
+            const res = await fetch(apiUrl('schedule_list'));
+            const data = await res.json();
+            if (data.success) renderSchedule(data);
+        } catch (e) { /* بی‌صدا — تیک بعدی دوباره تلاش می‌کند */ }
+    }
+
+    function renderSchedule(data) {
+        const clock = $('schedClock');
+        if (clock) clock.innerText = `${faNum(data.nowHm || '')} (${data.timezone || ''})`;
+        const tick = $('schedTick');
+        if (tick) {
+            const active = !!data.tickActive;
+            tick.innerText = active ? '⏱ زمان‌بند فعال' : '⏱ کران نصب نیست';
+            tick.style.background = active ? '#14532d' : '#7f1d1d';
+            tick.style.color = active ? '#86efac' : '#fecaca';
+            tick.title = active
+                ? `آخرین تیک کرون: ${faNum(String(Math.max(0, data.heartbeatAgeSec ?? 0)))} ثانیه پیش`
+                : 'اسکریپت scheduler_tick.sh هر دقیقه از طریق crontab اجرا نمی‌شود';
+        }
+        const next = $('schedNext');
+        if (next) {
+            const items = data.items || [];
+            next.innerHTML = items.length === 0
+                ? 'هنوز ساعتی ثبت نشده است — با فرم بالا ساعت‌های دلخواه را اضافه کنید.'
+                : `⏰ اجرای بعدی: <b style="color:#7dd3fc">${faNum(data.nextAt || '—')}</b>`;
+        }
+        const cronBox = $('schedCron');
+        if (cronBox) {
+            if (!data.tickActive) {
+                cronBox.style.display = '';
+                cronBox.innerHTML = 'برای فعال‌شدن زمان‌بندی، این یک خط را به crontab سرور اضافه کنید (یک‌بار، از cPanel → Cron Jobs یا SSH):' +
+                    '<br><code style="direction:ltr;display:inline-block;background:#0f172a;padding:4px 8px;border-radius:6px;margin-top:6px;">' +
+                    escapeHtml(data.cronLine || '') + '</code>';
+            } else {
+                cronBox.style.display = 'none';
+            }
+        }
+        const list = $('schedList');
+        if (!list) return;
+        list.innerHTML = '';
+        (data.items || []).forEach(it => {
+            const row = document.createElement('div');
+            row.className = 'post-row';
+            row.style.opacity = it.enabled ? '1' : '0.55';
+            const lastRun = it.lastRun
+                ? (SCHED_STATUS_FA[it.lastRun.status] || it.lastRun.status)
+                : 'امروز هنوز نرسیده';
+            const lastTitle = it.lastRun && it.lastRun.summary ? escapeHtml(it.lastRun.summary) : '';
+            row.innerHTML =
+                `<div class="post-main">` +
+                    `<div class="post-top">` +
+                        `<span class="post-id" style="font-size:1rem">⏰ ${faNum(it.time)}</span>` +
+                        `<span class="tag ${it.enabled ? 'new' : 'old'}">${it.enabled ? 'فعال' : 'غیرفعال'}</span>` +
+                        `<span class="tag text">${faNum(String(it.maxPosts))} پست جدید</span>` +
+                        `<span class="tag ${it.profile === 'test' ? 'old' : 'media'}">${it.profile === 'test' ? 'آزمایشی' : 'اصلی'}</span>` +
+                    `</div>` +
+                    `<div class="post-txt" title="${lastTitle}">آخرین اجرا: ${lastRun}</div>` +
+                `</div>` +
+                `<div style="display:flex;gap:6px;align-items:center;flex-shrink:0">` +
+                    `<button class="btn btn-ghost" style="padding:4px 10px;font-size:0.75rem" onclick="toggleSchedule(${it.id}, ${it.enabled ? 'false' : 'true'})">${it.enabled ? 'خاموش' : 'روشن'}</button>` +
+                    `<button class="btn btn-ghost" style="padding:4px 10px;font-size:0.75rem;color:#f87171" onclick="removeSchedule(${it.id})">حذف</button>` +
+                `</div>`;
+            list.appendChild(row);
+        });
+    }
+
+    async function addSchedule() {
+        const time = ($('schedTime') || {}).value || '';
+        const maxPosts = parseInt(($('schedPosts') || {}).value, 10) || 5;
+        const profile = ($('schedProfile') || {}).value || 'main';
+        if (!/^\d{1,2}:\d{2}$/.test(time)) {
+            log('ساعت اجرا را به شکل درست (HH:MM) انتخاب کنید.', '#fbbf24');
+            return;
+        }
+        try {
+            const res = await fetch(apiUrl('schedule_add'), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ time, maxPosts, profile }),
+            });
+            const data = await res.json();
+            if (!data.success) {
+                log('❌ افزودن زمان‌بند ناموفق: ' + (data.message || data.error || 'خطای نامشخص'), '#f87171');
+                return;
+            }
+            log(`⏰ زمان‌بند ${faNum(time)} ثبت شد — تا ${faNum(String(maxPosts))} پست جدید در این ساعت.`, '#4ade80');
+            renderSchedule(data);
+        } catch (e) {
+            log('❌ خطای افزودن زمان‌بند: ' + e.message, '#f87171');
+        }
+    }
+
+    async function removeSchedule(id) {
+        if (!confirm('این ساعت از زمان‌بندی حذف شود؟')) return;
+        try {
+            const res = await fetch(apiUrl('schedule_remove'), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ id }),
+            });
+            const data = await res.json();
+            if (!data.success) {
+                log('❌ حذف زمان‌بند ناموفق: ' + (data.message || data.error || ''), '#f87171');
+                return;
+            }
+            log('⏰ زمان‌بند حذف شد.', '#fbbf24');
+            renderSchedule(data);
+        } catch (e) {
+            log('❌ خطای حذف زمان‌بند: ' + e.message, '#f87171');
+        }
+    }
+
+    async function toggleSchedule(id, enabled) {
+        try {
+            const res = await fetch(apiUrl('schedule_toggle'), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ id, enabled }),
+            });
+            const data = await res.json();
+            if (!data.success) {
+                log('❌ تغییر وضعیت زمان‌بند ناموفق: ' + (data.message || data.error || ''), '#f87171');
+                return;
+            }
+            log(`⏰ زمان‌بند ${enabled ? 'فعال' : 'غیرفعال'} شد.`, '#7dd3fc');
+            renderSchedule(data);
+        } catch (e) {
+            log('❌ خطای تغییر زمان‌بند: ' + e.message, '#f87171');
+        }
+    }
+
+    // ---------- به‌روزرسانی از گیت (self_update) ----------
+    async function selfUpdate() {
+        if (!confirm('به‌روزرسانی برنامه از گیت اجرا شود؟\n(ایمن: اگر صف در حال اجرا باشد رد می‌شود؛ فقط fast-forward؛ در صورت خرابی خودکار به قبلی برمی‌گردد)')) return;
+        const btn = document.getElementById('updateBtn');
+        const oldLabel = btn.innerText;
+        btn.disabled = true;
+        btn.innerText = '⏳ در حال به‌روزرسانی…';
+        document.getElementById('statusText').innerText = 'در حال به‌روزرسانی از گیت…';
+        log('↻ شروع به‌روزرسانی از گیت…', '#7dd3fc');
+        try {
+            const res = await fetch(apiUrl('self_update'), { method: 'POST' });
+            const data = await res.json();
+            if (!data.success) {
+                log('❌ به‌روزرسانی نشد: ' + (data.message || data.error || 'خطای نامشخص'), '#f87171');
+                (data.details || []).forEach(d => log('   ' + d, '#fca5a5'));
+                document.getElementById('statusText').innerText = 'به‌روزرسانی ناموفق بود (سیستم دست‌نخورده است).';
+            } else if (!data.updated) {
+                log('✔ ' + data.message, '#4ade80');
+                document.getElementById('statusText').innerText = data.message;
+            } else {
+                log(`✔ به‌روزرسانی انجام شد: ${data.from} → ${data.to} (${faNum(data.files || 0)} فایل)`, '#4ade80');
+                (data.commits || []).forEach(c => log('   ' + c, '#94a3b8'));
+                document.getElementById('statusText').innerText = `به‌روزرسانی شد: ${data.from} → ${data.to}`;
+                setTimeout(() => {
+                    if (confirm('به‌روزرسانی کامل شد. صفحه برای بارگذاری نسخهٔ جدید رفرش شود؟')) location.reload();
+                }, 800);
+            }
+        } catch (e) {
+            log('❌ خطای به‌روزرسانی: ' + e.message, '#f87171');
+            document.getElementById('statusText').innerText = 'به‌روزرسانی ناموفق بود.';
+        } finally {
+            btn.disabled = false;
+            btn.innerText = oldLabel;
+        }
     }
 
     async function startSync() {
@@ -2069,6 +3970,8 @@ if ($action === 'rewind') {
     ['optMedia', 'optAdvance', 'optGap'].forEach(id => { const el = $(id); if (el) el.addEventListener('change', updateSummary); });
     syncPlatformUI();
     pollQueueStatus(true);
+    loadSchedule();
+    setInterval(loadSchedule, 30000);
 </script>
 
 </body>

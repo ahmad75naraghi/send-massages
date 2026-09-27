@@ -22,6 +22,7 @@
  */
 
 const path = require('path');
+const fs = require('fs');
 const { chromium } = require('playwright');
 const C = require(path.join(__dirname, 'lib', 'pw_common.js'));
 
@@ -405,6 +406,247 @@ async function readActivePreview(page) {
     }).catch(() => '');
 }
 
+/* ============================================================
+   حالت Batch (صف پس‌زمینه):
+   یک بار مرورگر باز می‌شود، یک بار کانال مقصد، و همهٔ پست‌ها
+   پشت‌سرهم ارسال می‌شوند — به‌جای راه‌اندازی مجدد Chromium برای هر پست.
+   قرارداد فایل --batch (JSON):
+     { "items":[ {"id":123,"text":"...","file":"/tmp/x.jpg","type":"image",
+                  "fileName":"photo.jpg"}, ... ],
+       "progressFile":"/abs/path/progress.json" }
+   progressFile پس از هر آیتم به‌صورت اتمیک بازنویسی می‌شود:
+     { "platform":"soroush","items":[{"id":123,"status":"OK|ERROR|UNVERIFIED|NOT_ATTEMPTED","result":{...}}] }
+   ترتیب آیتم‌ها حفظ می‌شود و با اولین آیتمِ ناموفق، بقیه NOT_ATTEMPTED می‌شوند.
+   ============================================================ */
+
+// تمپوی انتظارهای ثابت: single = مقادیر اثبات‌شدهٔ امروز (دست‌نخورده)؛
+// batch = کمی کوتاه‌تر. درِ صحت، حلقهٔ verification با polling است نه این delayها.
+const TEMPO_SINGLE = { afterAttach: 1000, modalShown: 1500, afterSendClick: 3000, afterRetry: 1800, afterSubmit: 5000, afterEnter: 2000 };
+const TEMPO_BATCH  = { afterAttach: 800,  modalShown: 1200, afterSendClick: 1500, afterRetry: 1200, afterSubmit: 2000, afterEnter: 1500 };
+
+/**
+ * باز کردن چت مقصد با همان راهبردهای اثبات‌شدهٔ حالت تک‌پیام
+ * (hash-strict → search-strict → …) + تأیید هدر.
+ * خروجی: {ok:true, via, header} یا {ok:false, code, error}
+ */
+async function openTargetChannel(page, browser, opts, log) {
+    const strategies = [];
+    // اگر strict-channel روشن باشد، فقط نتیجهٔ exact username قابل قبول است؛
+    // این جلوی ارسال اشتباهی به کانال تست با نام نمایشی مشابه را می‌گیرد.
+    if (opts.strictChannel) {
+        // hash route uses the exact username and avoids the duplicate display-name problem.
+        strategies.push(['by-hash-strict', () => openChatByHash(page, browser, opts.channel, log)]);
+        strategies.push(['by-search-strict', () => openChatBySearch(page, opts.channel, log, true, opts.channelName)]);
+    } else {
+        strategies.push(['by-hash', () => openChatByHash(page, browser, opts.channel, log)]);
+        strategies.push(['by-search', () => openChatBySearch(page, opts.channel, log, false)]);
+        if (opts.channelName) strategies.push(['by-name', () => openChatByName(page, opts.channelName, log)]);
+    }
+
+    for (const [label, run] of strategies) {
+        const ok = await run();
+        if (!ok) { log.step(`${label}: composer not visible → next strategy`); continue; }
+        const hm = await headerMatches(page, opts.channelName, log);
+        if (!hm.ok) { log.step(`${label}: chat opened but header mismatch → next strategy`); continue; }
+        return { ok: true, via: label, header: hm.header };
+    }
+
+    const finalHash = currentUrlHash(page);
+    const reachedTarget = isConcreteChatHash(finalHash, opts.channel);
+    return {
+        ok: false,
+        code: reachedTarget ? 'COMPOSER_NOT_AVAILABLE' : 'CHANNEL_NOT_FOUND',
+        error: reachedTarget
+            ? `کانال "${opts.channel || opts.channelName}" باز شد (${page.url()}) ولی composer یا دکمهٔ ارسال پست داخل خود کانال دیده نشد. احتمالاً اکانت سروشِ این profile دسترسی ادمین/ارسال پست در کانال اصلی را ندارد.`
+            : `کانال "${opts.channel || opts.channelName}" با هیچ‌یک از راهبردهای امن باز/تأیید نشد.`,
+    };
+}
+
+/**
+ * ارسال یک پیام (متن یا رسانه) در چتِ از قبل باز‌شده.
+ * این همان جریان اثبات‌شدهٔ حالت تک‌پیام است که عیناً extract شده؛
+ * تنها تفاوت: انتظارهای ثابت از tempo می‌آیند و نتیجه به‌جای exit،
+ * به‌صورت شیء برگردانده می‌شود تا حلقهٔ batch هم بتواند مصرفش کند.
+ * خروجی: {status:'OK'|'UNVERIFIED'|'ERROR', code?, message|error, verified, proof, sentVia}
+ */
+async function sendOneSoroush(page, item, log, tempo) {
+    const text = String(item.text || '');
+    const file = item.file || null;
+
+    // ---------- سنجه‌های «پیش از ارسال» برای تأیید ----------
+    const beforeCount = await countMessages(page);
+    const beforePreview = await readActivePreview(page);
+    const snippet = C.snippetOf(text);
+    log.step(`item ${item.id ?? '-'}: before: messages=${beforeCount} preview="${C.RunLog.brief(beforePreview, 60)}"`);
+
+    let sentVia = 'none';
+
+    // ---------- مسیر رسانه ----------
+    if (file) {
+        const isVisual = (item.type === 'image' || item.type === 'video')
+            || (!item.type && ['.jpg', '.jpeg', '.png', '.webp', '.gif', '.mp4'].includes(path.extname(file).toLowerCase()));
+
+        const attach = await C.firstVisible(page, ATTACH_BTN, { timeout: 10000, label: 'attach button' });
+        if (!attach) {
+            await C.safeScreenshot(page, 'last_media_send.jpg', log);
+            return { status: 'ERROR', code: 'ATTACH_BUTTON_NOT_FOUND', error: 'دکمهٔ ضمیمه در composer پیدا نشد', sentVia };
+        }
+        await attach.locator.click({ force: true });
+        log.step(`attach button clicked via ${attach.selector}`);
+        await C.delay(tempo.afterAttach);
+
+        const menu = page.locator('.menu-container:not(.not-open), .AttachMenu .menu-container, .bubble.open').last();
+        if (!(await C.seen(menu, 6000))) {
+            await C.safeScreenshot(page, 'last_media_send.jpg', log);
+            return { status: 'ERROR', code: 'ATTACH_MENU_NOT_OPEN', error: 'منوی ضمیمه باز نشد', sentVia };
+        }
+
+        // انتخاب آیتم با آیکون/متن؛ در نهایت ایندکس (رفتار نسخهٔ قبل)
+        let target = await C.firstVisible(page, isVisual ? MENU_VISUAL : MENU_DOC, { timeout: 5000, label: 'attach menu item' });
+        if (!target) {
+            const visibleItems = menu.locator('.MenuItem:visible, [role="menuitem"]:visible');
+            target = { locator: isVisual ? visibleItems.first() : visibleItems.nth(1), selector: 'positional-fallback' };
+            log.step('WARNING: menu item by icon/text not found; using positional fallback');
+        } else {
+            log.step(`menu item matched: ${target.selector}`);
+        }
+
+        // دو مسیر تزریق فایل: رویداد filechooser (رفتار معمول WebZ) و در
+        // صورت عدم وقوع آن، input[type="file"] پنهان داخل منو/مودال.
+        const chooserPromise = page.waitForEvent('filechooser', { timeout: 12000 }).catch(() => null);
+        await target.locator.click({ force: true });
+        const chooser = await chooserPromise;
+
+        let injected = false;
+        if (chooser) {
+            await chooser.setFiles(file);
+            injected = true;
+            log.step(`file injected via filechooser: ${file}`);
+        } else {
+            const fileInput = page.locator('input[type="file"]').last();
+            await fileInput.setInputFiles(file, { timeout: 8000 })
+                .then(() => { injected = true; log.step(`file injected via input[type=file]: ${file}`); })
+                .catch(e => log.step('WARNING: input[type=file] fallback failed: ' + C.RunLog.brief(e.message, 120)));
+        }
+        if (!injected) {
+            await C.safeScreenshot(page, 'last_media_send.jpg', log);
+            return { status: 'ERROR', code: 'FILE_INJECT_FAILED', error: 'فایل به منوی ضمیمه تحویل داده نشد', sentVia };
+        }
+
+        // ---------- کپشن داخل مودال (با انتظار واقعی) ----------
+        const modalLoc = page.locator(MODAL).last();
+        const modalShown = await C.seen(modalLoc, 10000);
+        log.step(`modal shown: ${modalShown}`);
+        await C.delay(tempo.modalShown);
+
+        if (text) {
+            const caption = page.locator([
+                `${MODAL} div[contenteditable="true"]`,
+                `${MODAL} textarea`,
+                '.media-preview-container div[contenteditable="true"]',
+                '.media-preview div[contenteditable="true"]',
+                '.media-preview-container textarea',
+            ].join(', ')).last();
+            if (await C.seen(caption, 6000)) {
+                await caption.click({ force: true });
+                await C.insertText(page, text, log);
+            } else {
+                log.step('WARNING: modal caption editor not found; caption will be lost');
+            }
+        }
+
+        // ---------- ارسال مودال ----------
+        const sendBtn = await firstEnabled(page, MODAL_SEND, { timeout: 12000, label: 'modal send' });
+        if (sendBtn && !sendBtn.disabled) {
+            await sendBtn.locator.click({ force: true });
+            sentVia = 'modal-button:' + sendBtn.selector;
+            await C.delay(tempo.afterSendClick);
+            if (await page.locator(MODAL).last().isVisible().catch(() => false)) {
+                log.step('modal still visible after selector send; trying bottom-left send button');
+                const clicked = await clickModalSendBottomLeft(page, log, 'modal send fallback');
+                if (clicked) sentVia += '+bottom-left-click';
+            }
+        } else {
+            if (sendBtn && sendBtn.disabled) log.step('WARNING: modal send button stayed disabled; trying modal coordinate fallback');
+            const clicked = await clickModalSendBottomLeft(page, log, 'modal send fallback');
+            sentVia = clicked ? 'modal-bottom-left-click' : 'modal-fallback-missing';
+        }
+        await C.delay(tempo.afterRetry);
+        const modalStill = await page.locator(MODAL).last().isVisible().catch(() => false);
+        if (modalStill) {
+            log.step('modal still visible after send clicks; trying Ctrl+Enter');
+            await page.keyboard.press('Control+Enter');
+            sentVia += '+ctrl+enter';
+            await C.delay(tempo.afterRetry);
+        }
+        log.step(`media submit via ${sentVia}`);
+        await C.delay(tempo.afterSubmit);
+    }
+    // ---------- مسیر متن ساده ----------
+    else if (text) {
+        const composer = page.locator(COMPOSER).last();
+        await composer.click({ force: true });
+        await C.insertText(page, text, log);
+        await C.delay(500);
+        await page.keyboard.press('Enter');
+        sentVia = 'composer-enter';
+        log.step('text submitted via Enter');
+        await C.delay(tempo.afterEnter);
+    } else {
+        return { status: 'ERROR', code: 'EMPTY_PAYLOAD', error: 'هم text و هم file خالی است؛ چیزی برای ارسال نیست', sentVia };
+    }
+
+    // ---------- تأیید ارسال ----------
+    let verified = false;
+    let how = '';
+    let acceptedButNotVisual = false;
+    try {
+        await C.waitUntil(async () => {
+            const modalGone = !(await page.locator(MODAL).last().isVisible().catch(() => false));
+            const afterCount = await countMessages(page);
+            const afterPreview = await readActivePreview(page);
+            let snippetSeen = false;
+            if (snippet) {
+                snippetSeen = await page.locator('.MiddleColumn').getByText(snippet, { exact: false }).first().isVisible().catch(() => false);
+            }
+            const composerCleared = await page.evaluate(() => {
+                const el = document.querySelector('.MiddleColumn .input-message-input') || document.querySelector('.MiddleColumn div[contenteditable="true"]') || document.querySelector('#MiddleColumn .input-message-input') || document.querySelector('#MiddleColumn div[contenteditable="true"]');
+                return !!el && (el.innerText || '').trim() === '';
+            }).catch(() => false);
+            const previewChanged = !!beforePreview && afterPreview !== beforePreview;
+            const countGrew = beforeCount >= 0 && afterCount > beforeCount;
+
+            if (snippetSeen) { verified = true; how = 'snippet-in-chat'; return true; }
+            if (countGrew) { verified = true; how = 'message-count+' + (afterCount - beforeCount); return true; }
+            if (previewChanged) { verified = true; how = 'left-preview-changed'; return true; }
+            if (sentVia === 'composer-enter' && composerCleared) { verified = true; how = 'composer-cleared'; return true; }
+            if (file && modalGone && sentVia !== 'none') { acceptedButNotVisual = true; how = 'modal-closed-accepted'; return true; }
+            return false;
+        }, { timeout: file ? 45000 : 20000, interval: 700, label: 'send verification' });
+    } catch (e) {
+        log.step('verification window elapsed without positive signal: ' + e.message);
+    }
+    log.step(`verified=${verified} accepted=${acceptedButNotVisual} how=${how || 'n/a'}`);
+
+    if (verified || acceptedButNotVisual) {
+        return {
+            status: 'OK',
+            message: `Sent to Soroush (${sentVia})`,
+            verified,
+            proof: how || (verified ? 'verified' : 'accepted'),
+            sentVia,
+        };
+    }
+    await C.safeScreenshot(page, 'last_media_send.jpg', log);
+    return {
+        status: 'UNVERIFIED',
+        code: 'SEND_NOT_VERIFIED',
+        message: 'فرایند ارسال انجام شد ولی صحت آن تأیید نشد؛ اسکرین‌شات last_media_send.jpg و لاگ را ببینید',
+        verified: false,
+        sentVia,
+    };
+}
+
 (async () => {
     const opts = C.parseArgs(process.argv);
     // اولویت: آرگومان خط فرمان > .env (SOROUSH_*) > بدون مقدار
@@ -413,277 +655,239 @@ async function readActivePreview(page) {
     opts.channelName = (opts.channelName || C.env('SOROUSH_CHANNEL_NAME') || null);
     opts.channelName = opts.channelName ? String(opts.channelName).replace(/["\\]/g, '') : null;
     opts.strictChannel = String(opts.raw('strict-channel', C.env('SOROUSH_STRICT_CHANNEL', '0')) || '0') === '1';
-    const log = new C.RunLog('soroush');
-    log.step(`args: channel=${opts.channel || '-'} name=${opts.channelName || '-'} text=${opts.text.length}ch file=${opts.file || '-'} type=${opts.type || '-'} env=${C.ENV_FILE || 'none'}`);
+    const batchFile = opts.raw('batch', null);
+    const log = new C.RunLog(batchFile ? 'soroush_batch' : 'soroush');
+    log.step(`args: channel=${opts.channel || '-'} name=${opts.channelName || '-'} text=${opts.text.length}ch file=${opts.file || '-'} type=${opts.type || '-'} batch=${batchFile || '-'} env=${C.ENV_FILE || 'none'}`);
 
     let browser = null;
     let exitCode = 0;
     let result = null;
 
+    // این try بیرونی فقط برای finally مشترک است: returnهای زودهنگامِ حالت
+    // تک‌پیام هم باید از «بستن مرورگر + emit JSON» عبور کنند (مثل نسخهٔ قبل).
     try {
-        if (!opts.text && !opts.file) {
-            result = { status: 'ERROR', code: 'EMPTY_PAYLOAD', error: 'هم text و هم file خالی است؛ چیزی برای ارسال نیست' };
-            exitCode = 1;
-            return;
-        }
-        if (!opts.channel && !opts.channelName) {
-            result = { status: 'ERROR', code: 'NO_CHANNEL', error: 'کانال مقصد مشخص نیست؛ --channel یا --channel-name بدهید یا SOROUSH_CHANNEL_ID/SOROUSH_CHANNEL_NAME را در .env تنظیم کنید' };
-            exitCode = 1;
-            return;
-        }
-        if (opts.file && !require('fs').existsSync(opts.file)) {
-            result = { status: 'ERROR', code: 'FILE_MISSING', error: `فایل وجود ندارد: ${opts.file}` };
-            exitCode = 1;
-            return;
-        }
 
-        const launched = await C.launchBrowser({ chromium }, PROFILE_DIR, VIEWPORT, log);
-        browser = launched.browser;
-        const page = launched.page;
-
-        // ---------- ۱) بارگذاری و بررسی session ----------
-        await page.goto('https://web.splus.ir', { waitUntil: 'domcontentloaded', timeout: 60000 });
-        await C.delay(5000);
-
-        // بستن پاپ‌آپ PWA («متوجه شدم») که در نمونهٔ ورود لازم بود
-        try {
-            const dismiss = page.locator('button:has-text("متوجه شدم"), button:has-text("Got it")').first();
-            if (await C.seen(dismiss, 1500)) {
-                await dismiss.click({ force: true });
-                log.step('PWA popup dismissed');
+    // ==================== حالت Batch (صف پس‌زمینه) ====================
+    if (batchFile) {
+        const batch = C.readJsonFile(batchFile);
+        const progressFile = (batch && typeof batch.progressFile === 'string' && batch.progressFile) || (batchFile + '.progress.json');
+        const progress = { platform: 'soroush', startedAt: new Date().toISOString(), items: [] };
+        const writeProgress = () => C.writeJsonFileAtomic(progressFile, progress);
+        const stopRest = (fromIdx) => {
+            for (let j = fromIdx; j < progress.items.length; j++) {
+                if (progress.items[j].status === 'pending' || progress.items[j].status === 'RUNNING') progress.items[j].status = 'NOT_ATTEMPTED';
             }
-        } catch (e) {}
+        };
 
-        const loginMarker = await C.detectLoginPage(page, LOGIN_MARKERS);
-        if (loginMarker) {
-            await C.safeScreenshot(page, 'last_media_send.jpg', log);
-            result = { status: 'ERROR', code: 'SESSION_EXPIRED', error: `صفحهٔ ورود سروش‌پلاس دیده شد (${loginMarker}). با login_soroush.js دوباره وارد شوید.` };
+        const items = (batch && Array.isArray(batch.items)) ? batch.items : null;
+        if (!items || items.length === 0) {
+            result = { status: 'ERROR', code: 'BAD_BATCH', error: `فایل batch خالی یا نامعتبر است: ${batchFile}` };
             exitCode = 1;
-            return;
-        }
-
-        // ---------- ۲) باز کردن چت مقصد (سه راهبرد + تأیید) ----------
-        // هر راهبرد باید دو شرط را بگذراند: composer مرئی + تطابق هدر با نام کانال
-        const strategies = [];
-        // اگر strict-channel روشن باشد، فقط نتیجهٔ exact username قابل قبول است؛
-        // این جلوی ارسال اشتباهی به کانال تست با نام نمایشی مشابه را می‌گیرد.
-        if (opts.strictChannel) {
-            // hash route uses the exact username and avoids the duplicate display-name problem.
-            strategies.push(['by-hash-strict', () => openChatByHash(page, browser, opts.channel, log)]);
-            strategies.push(['by-search-strict', () => openChatBySearch(page, opts.channel, log, true, opts.channelName)]);
         } else {
-            strategies.push(['by-hash', () => openChatByHash(page, browser, opts.channel, log)]);
-            strategies.push(['by-search', () => openChatBySearch(page, opts.channel, log, false)]);
-            if (opts.channelName) strategies.push(['by-name', () => openChatByName(page, opts.channelName, log)]);
-        }
+            progress.items = items.map(it => ({ id: it.id, status: 'pending' }));
+            writeProgress();
+            try {
+                const launched = await C.launchBrowser({ chromium }, PROFILE_DIR, VIEWPORT, log);
+                browser = launched.browser;
+                const page = launched.page;
 
-        let opened = false;
-        let openedVia = '';
-        let header = '';
-        for (const [label, run] of strategies) {
-            const ok = await run();
-            if (!ok) { log.step(`${label}: composer not visible → next strategy`); continue; }
-            const hm = await headerMatches(page, opts.channelName, log);
-            if (!hm.ok) { log.step(`${label}: chat opened but header mismatch → next strategy`); continue; }
-            opened = true; openedVia = label; header = hm.header;
-            break;
-        }
+                // ---------- ۱) بارگذاری و بررسی session (یک بار برای کل صف) ----------
+                await page.goto('https://web.splus.ir', { waitUntil: 'domcontentloaded', timeout: 60000 });
+                await C.delay(5000);
 
-        if (!opened) {
-            await C.safeScreenshot(page, 'last_media_send.jpg', log);
-            const finalHash = currentUrlHash(page);
-            const reachedTarget = isConcreteChatHash(finalHash, opts.channel);
-            result = {
-                status: 'ERROR',
-                code: reachedTarget ? 'COMPOSER_NOT_AVAILABLE' : 'CHANNEL_NOT_FOUND',
-                error: reachedTarget
-                    ? `کانال "${opts.channel || opts.channelName}" باز شد (${page.url()}) ولی composer یا دکمهٔ ارسال پست داخل خود کانال دیده نشد. احتمالاً اکانت سروشِ این profile دسترسی ادمین/ارسال پست در کانال اصلی را ندارد.`
-                    : `کانال "${opts.channel || opts.channelName}" با هیچ‌یک از راهبردهای امن باز/تأیید نشد.`,
-                log: log.file
-            };
-            exitCode = 1;
-            return;
-        }
-        log.step(`chat opened via ${openedVia}. header="${header}"`);
+                try {
+                    const dismiss = page.locator('button:has-text("متوجه شدم"), button:has-text("Got it")').first();
+                    if (await C.seen(dismiss, 1500)) {
+                        await dismiss.click({ force: true });
+                        log.step('PWA popup dismissed');
+                    }
+                } catch (e) {}
 
-        const composer = page.locator(COMPOSER).last();
-
-        // ---------- ۳) سنجه‌های «پیش از ارسال» برای تأیید ----------
-        const beforeCount = await countMessages(page);
-        const beforePreview = await readActivePreview(page);
-        const snippet = C.snippetOf(opts.text);
-        log.step(`before: messages=${beforeCount} preview="${C.RunLog.brief(beforePreview, 60)}"`);
-
-        let sentVia = 'none';
-
-        // ---------- ۴) مسیر رسانه ----------
-        if (opts.file) {
-            const isVisual = (opts.type === 'image' || opts.type === 'video')
-                || (!opts.type && ['.jpg', '.jpeg', '.png', '.webp', '.gif', '.mp4'].includes(path.extname(opts.file).toLowerCase()));
-
-            const attach = await C.firstVisible(page, ATTACH_BTN, { timeout: 10000, label: 'attach button' });
-            if (!attach) {
-                await C.safeScreenshot(page, 'last_media_send.jpg', log);
-                result = { status: 'ERROR', code: 'ATTACH_BUTTON_NOT_FOUND', error: 'دکمهٔ ضمیمه در composer پیدا نشد', log: log.file };
-                exitCode = 1;
-                return;
-            }
-            await attach.locator.click({ force: true });
-            log.step(`attach button clicked via ${attach.selector}`);
-            await C.delay(1000);
-
-            const menu = page.locator('.menu-container:not(.not-open), .AttachMenu .menu-container, .bubble.open').last();
-            if (!(await C.seen(menu, 6000))) {
-                await C.safeScreenshot(page, 'last_media_send.jpg', log);
-                result = { status: 'ERROR', code: 'ATTACH_MENU_NOT_OPEN', error: 'منوی ضمیمه باز نشد', log: log.file };
-                exitCode = 1;
-                return;
-            }
-
-            // انتخاب آیتم با آیکون/متن؛ در نهایت ایندکس (رفتار نسخهٔ قبل)
-            let target = await C.firstVisible(page, isVisual ? MENU_VISUAL : MENU_DOC, { timeout: 5000, label: 'attach menu item' });
-            if (!target) {
-                const visibleItems = menu.locator('.MenuItem:visible, [role="menuitem"]:visible');
-                target = { locator: isVisual ? visibleItems.first() : visibleItems.nth(1), selector: 'positional-fallback' };
-                log.step('WARNING: menu item by icon/text not found; using positional fallback');
-            } else {
-                log.step(`menu item matched: ${target.selector}`);
-            }
-
-            // دو مسیر تزریق فایل: رویداد filechooser (رفتار معمول WebZ) و در
-            // صورت عدم وقوع آن، input[type="file"] پنهان داخل منو/مودال.
-            const chooserPromise = page.waitForEvent('filechooser', { timeout: 12000 }).catch(() => null);
-            await target.locator.click({ force: true });
-            const chooser = await chooserPromise;
-
-            let injected = false;
-            if (chooser) {
-                await chooser.setFiles(opts.file);
-                injected = true;
-                log.step(`file injected via filechooser: ${opts.file}`);
-            } else {
-                const fileInput = page.locator('input[type="file"]').last();
-                await fileInput.setInputFiles(opts.file, { timeout: 8000 })
-                    .then(() => { injected = true; log.step(`file injected via input[type=file]: ${opts.file}`); })
-                    .catch(e => log.step('WARNING: input[type=file] fallback failed: ' + C.RunLog.brief(e.message, 120)));
-            }
-            if (!injected) {
-                await C.safeScreenshot(page, 'last_media_send.jpg', log);
-                result = { status: 'ERROR', code: 'FILE_INJECT_FAILED', error: 'فایل به منوی ضمیمه تحویل داده نشد', log: log.file };
-                exitCode = 1;
-                return;
-            }
-
-            // ---------- ۵) کپشن داخل مودال (با انتظار واقعی) ----------
-            const modalLoc = page.locator(MODAL).last();
-            const modalShown = await C.seen(modalLoc, 10000);
-            log.step(`modal shown: ${modalShown}`);
-            await C.delay(1500);
-
-            if (opts.text) {
-                const caption = page.locator([
-                    `${MODAL} div[contenteditable="true"]`,
-                    `${MODAL} textarea`,
-                    '.media-preview-container div[contenteditable="true"]',
-                    '.media-preview div[contenteditable="true"]',
-                    '.media-preview-container textarea',
-                ].join(', ')).last();
-                if (await C.seen(caption, 6000)) {
-                    await caption.click({ force: true });
-                    await C.insertText(page, opts.text, log);
+                const loginMarker = await C.detectLoginPage(page, LOGIN_MARKERS);
+                if (loginMarker) {
+                    await C.safeScreenshot(page, 'last_media_send.jpg', log);
+                    stopRest(0);
+                    progress.error = { code: 'SESSION_EXPIRED', message: `صفحهٔ ورود سروش‌پلاس دیده شد (${loginMarker}). با login_soroush.js دوباره وارد شوید.` };
+                    writeProgress();
+                    result = { status: 'ERROR', code: 'SESSION_EXPIRED', error: progress.error.message, log: log.file };
+                    exitCode = 1;
                 } else {
-                    log.step('WARNING: modal caption editor not found; caption will be lost');
-                }
-            }
+                    // ---------- ۲) باز کردن چت مقصد (یک بار برای کل صف) ----------
+                    const opened = await openTargetChannel(page, browser, opts, log);
+                    if (!opened.ok) {
+                        await C.safeScreenshot(page, 'last_media_send.jpg', log);
+                        stopRest(0);
+                        progress.error = { code: opened.code, message: opened.error };
+                        writeProgress();
+                        result = { status: 'ERROR', code: opened.code, error: opened.error, log: log.file };
+                        exitCode = 1;
+                    } else {
+                        log.step(`chat opened via ${opened.via}. header="${opened.header}"`);
 
-            // ---------- ۶) ارسال مودال ----------
-            const sendBtn = await firstEnabled(page, MODAL_SEND, { timeout: 12000, label: 'modal send' });
-            if (sendBtn && !sendBtn.disabled) {
-                await sendBtn.locator.click({ force: true });
-                sentVia = 'modal-button:' + sendBtn.selector;
-                await C.delay(3000);
-                if (await page.locator(MODAL).last().isVisible().catch(() => false)) {
-                    log.step('modal still visible after selector send; trying bottom-left send button');
-                    const clicked = await clickModalSendBottomLeft(page, log, 'modal send fallback');
-                    if (clicked) sentVia += '+bottom-left-click';
-                }
-            } else {
-                if (sendBtn && sendBtn.disabled) log.step('WARNING: modal send button stayed disabled; trying modal coordinate fallback');
-                const clicked = await clickModalSendBottomLeft(page, log, 'modal send fallback');
-                sentVia = clicked ? 'modal-bottom-left-click' : 'modal-fallback-missing';
-            }
-            await C.delay(1800);
-            const modalStill = await page.locator(MODAL).last().isVisible().catch(() => false);
-            if (modalStill) {
-                log.step('modal still visible after send clicks; trying Ctrl+Enter');
-                await page.keyboard.press('Control+Enter');
-                sentVia += '+ctrl+enter';
-                await C.delay(1800);
-            }
-            log.step(`media submit via ${sentVia}`);
-            await C.delay(5000);
-        }
-        // ---------- ۷) مسیر متن ساده ----------
-        else if (opts.text) {
-            await composer.click({ force: true });
-            await C.insertText(page, opts.text, log);
-            await C.delay(500);
-            await page.keyboard.press('Enter');
-            sentVia = 'composer-enter';
-            log.step('text submitted via Enter');
-            await C.delay(2000);
-        }
+                        // ---------- ۳) ارسال آیتم‌ها به ترتیب؛ توقف در اولین شکست ----------
+                        let sent = 0;
+                        let failed = 0;
+                        let stoppedAt = -1;
+                        for (let i = 0; i < items.length; i++) {
+                            const it = items[i];
+                            const pi = progress.items[i];
 
-        // ---------- ۸) تأیید ارسال ----------
-        let verified = false;
-        let how = '';
-        let acceptedButNotVisual = false;
+                            if (it.file && !fs.existsSync(it.file)) {
+                                pi.status = 'ERROR';
+                                pi.result = { status: 'ERROR', code: 'FILE_MISSING', error: `فایل وجود ندارد: ${it.file}`, log: log.file };
+                                failed++;
+                                stoppedAt = i;
+                                stopRest(i + 1);
+                                writeProgress();
+                                break;
+                            }
+
+                            pi.status = 'RUNNING';
+                            writeProgress();
+                            try {
+                                // اگر composer بعد از پیام قبلی مخفی شده باشد (چند پست پشت‌سرهم)، دوباره ظاهرش می‌کنیم
+                                const composerReady = await ensureComposer(page, log, 15000);
+                                if (!composerReady) {
+                                    pi.status = 'ERROR';
+                                    pi.result = { status: 'ERROR', code: 'COMPOSER_NOT_AVAILABLE', error: 'composer پس از پیام قبلی در دسترس نبود', log: log.file };
+                                    failed++;
+                                    stoppedAt = i;
+                                    stopRest(i + 1);
+                                    writeProgress();
+                                    break;
+                                }
+                                const r = await sendOneSoroush(page, it, log, TEMPO_BATCH);
+                                pi.status = r.status;
+                                pi.result = Object.assign({ log: log.file }, r);
+                                if (r.status === 'OK') {
+                                    sent++;
+                                } else {
+                                    failed++;
+                                    stoppedAt = i;
+                                    stopRest(i + 1);
+                                }
+                                writeProgress();
+                                if (stoppedAt === i) break;
+                            } catch (err) {
+                                const code = /Timeout|timeout/.test(err.message) ? 'TIMEOUT' : 'RUNTIME';
+                                pi.status = 'ERROR';
+                                pi.result = { status: 'ERROR', code, error: C.RunLog.brief(err.message, 400), log: log.file };
+                                failed++;
+                                stopRest(i + 1);
+                                writeProgress();
+                                break;
+                            }
+                        }
+                        progress.finishedAt = new Date().toISOString();
+                        writeProgress();
+                        result = {
+                            status: failed === 0 ? 'OK' : (sent > 0 ? 'PARTIAL' : 'ERROR'),
+                            sent,
+                            failed,
+                            total: items.length,
+                            stoppedAt: stoppedAt >= 0 ? items[stoppedAt].id : null,
+                            log: log.file,
+                        };
+                        // exitCode عمداً 0 می‌ماند (حتی با PARTIAL): قضاوت نهایی با worker PHP
+                        // از روی progressFile است؛ 1 فقط برای خطای مهلک راه‌اندازی.
+                    }
+                }
+            } catch (err) {
+                const code = /Timeout|timeout/.test(err.message) ? 'TIMEOUT' : 'RUNTIME';
+                stopRest(0);
+                progress.error = { code, message: C.RunLog.brief(err.message, 400) };
+                writeProgress();
+                result = { status: 'ERROR', code, error: C.RunLog.brief(err.message, 400), log: log.file };
+                exitCode = 1;
+                log.step('FATAL: ' + err.stack);
+            }
+        }
+    }
+    // ==================== حالت تک‌پیام (رفتار قبلی، دست‌نخورده) ====================
+    else {
         try {
-            await C.waitUntil(async () => {
-                const modalGone = !(await page.locator(MODAL).last().isVisible().catch(() => false));
-                const afterCount = await countMessages(page);
-                const afterPreview = await readActivePreview(page);
-                let snippetSeen = false;
-                if (snippet) {
-                    snippetSeen = await page.locator('.MiddleColumn').getByText(snippet, { exact: false }).first().isVisible().catch(() => false);
+            if (!opts.text && !opts.file) {
+                result = { status: 'ERROR', code: 'EMPTY_PAYLOAD', error: 'هم text و هم file خالی است؛ چیزی برای ارسال نیست' };
+                exitCode = 1;
+                return;
+            }
+            if (!opts.channel && !opts.channelName) {
+                result = { status: 'ERROR', code: 'NO_CHANNEL', error: 'کانال مقصد مشخص نیست؛ --channel یا --channel-name بدهید یا SOROUSH_CHANNEL_ID/SOROUSH_CHANNEL_NAME را در .env تنظیم کنید' };
+                exitCode = 1;
+                return;
+            }
+            if (opts.file && !fs.existsSync(opts.file)) {
+                result = { status: 'ERROR', code: 'FILE_MISSING', error: `فایل وجود ندارد: ${opts.file}` };
+                exitCode = 1;
+                return;
+            }
+
+            const launched = await C.launchBrowser({ chromium }, PROFILE_DIR, VIEWPORT, log);
+            browser = launched.browser;
+            const page = launched.page;
+
+            // ---------- ۱) بارگذاری و بررسی session ----------
+            await page.goto('https://web.splus.ir', { waitUntil: 'domcontentloaded', timeout: 60000 });
+            await C.delay(5000);
+
+            // بستن پاپ‌آپ PWA («متوجه شدم») که در نمونهٔ ورود لازم بود
+            try {
+                const dismiss = page.locator('button:has-text("متوجه شدم"), button:has-text("Got it")').first();
+                if (await C.seen(dismiss, 1500)) {
+                    await dismiss.click({ force: true });
+                    log.step('PWA popup dismissed');
                 }
-                const composerCleared = await page.evaluate(() => {
-                    const el = document.querySelector('.MiddleColumn .input-message-input') || document.querySelector('.MiddleColumn div[contenteditable="true"]') || document.querySelector('#MiddleColumn .input-message-input') || document.querySelector('#MiddleColumn div[contenteditable="true"]');
-                    return !!el && (el.innerText || '').trim() === '';
-                }).catch(() => false);
-                const previewChanged = !!beforePreview && afterPreview !== beforePreview;
-                const countGrew = beforeCount >= 0 && afterCount > beforeCount;
+            } catch (e) {}
 
-                if (snippetSeen) { verified = true; how = 'snippet-in-chat'; return true; }
-                if (countGrew) { verified = true; how = 'message-count+' + (afterCount - beforeCount); return true; }
-                if (previewChanged) { verified = true; how = 'left-preview-changed'; return true; }
-                if (sentVia === 'composer-enter' && composerCleared) { verified = true; how = 'composer-cleared'; return true; }
-                if (opts.file && modalGone && sentVia !== 'none') { acceptedButNotVisual = true; how = 'modal-closed-accepted'; return true; }
-                return false;
-            }, { timeout: opts.file ? 45000 : 20000, interval: 700, label: 'send verification' });
-        } catch (e) {
-            log.step('verification window elapsed without positive signal: ' + e.message);
-        }
-        log.step(`verified=${verified} accepted=${acceptedButNotVisual} how=${how || 'n/a'}`);
+            const loginMarker = await C.detectLoginPage(page, LOGIN_MARKERS);
+            if (loginMarker) {
+                await C.safeScreenshot(page, 'last_media_send.jpg', log);
+                result = { status: 'ERROR', code: 'SESSION_EXPIRED', error: `صفحهٔ ورود سروش‌پلاس دیده شد (${loginMarker}). با login_soroush.js دوباره وارد شوید.` };
+                exitCode = 1;
+                return;
+            }
 
-        await C.safeScreenshot(page, 'last_media_send.jpg', log);
+            // ---------- ۲) باز کردن چت مقصد (سه راهبرد + تأیید) ----------
+            const opened = await openTargetChannel(page, browser, opts, log);
+            if (!opened.ok) {
+                await C.safeScreenshot(page, 'last_media_send.jpg', log);
+                result = { status: 'ERROR', code: opened.code, error: opened.error, log: log.file };
+                exitCode = 1;
+                return;
+            }
+            log.step(`chat opened via ${opened.via}. header="${opened.header}"`);
 
-        if (verified || acceptedButNotVisual) {
-            result = { status: 'OK', message: `Sent to Soroush (${sentVia})`, verified, proof: how || (verified ? 'verified' : 'accepted'), header, via: openedVia, log: log.file };
-        } else {
-            result = { status: 'UNVERIFIED', code: 'SEND_NOT_VERIFIED', message: 'فرایند ارسال انجام شد ولی صحت آن تأیید نشد؛ اسکرین‌شات last_media_send.jpg و لاگ را ببینید', verified: false, header, via: openedVia, log: log.file };
+            // ---------- ۳+۴) ارسال و تأیید ----------
+            const r = await sendOneSoroush(page, opts, log, TEMPO_SINGLE);
+
+            await C.safeScreenshot(page, 'last_media_send.jpg', log);
+
+            if (r.status === 'OK') {
+                result = { status: 'OK', message: r.message, verified: r.verified, proof: r.proof, header: opened.header, via: opened.via, log: log.file };
+            } else if (r.status === 'UNVERIFIED') {
+                result = { status: 'UNVERIFIED', code: 'SEND_NOT_VERIFIED', message: r.message, verified: false, header: opened.header, via: opened.via, log: log.file };
+                exitCode = 1;
+            } else {
+                result = { status: 'ERROR', code: r.code, error: r.error, log: log.file };
+                exitCode = 1;
+            }
+        } catch (err) {
+            const code = /Timeout|timeout/.test(err.message) ? 'TIMEOUT' : 'RUNTIME';
+            result = { status: 'ERROR', code, error: C.RunLog.brief(err.message, 400), log: log.file };
             exitCode = 1;
+            log.step('FATAL: ' + err.stack);
         }
-    } catch (err) {
-        const code = /Timeout|timeout/.test(err.message) ? 'TIMEOUT' : 'RUNTIME';
-        result = { status: 'ERROR', code, error: C.RunLog.brief(err.message, 400), log: log.file };
-        exitCode = 1;
-        log.step('FATAL: ' + err.stack);
+    }
+
     } finally {
-        await C.closeQuietly(browser, log);
-        C.cleanSingletons(PROFILE_DIR, log);
-        log.step(`RUN END status=${result ? result.status : 'NONE'} exit=${exitCode}`);
-        C.emit(result || { status: 'ERROR', code: 'NO_RESULT', error: 'بدون نتیجه' });
-        process.exitCode = exitCode;   // نه process.exit() — تا finally کامل اجرا شود
+        // ==================== خروج مشترک ====================
+        try {
+            await C.closeQuietly(browser, log);
+        } finally {
+            C.cleanSingletons(PROFILE_DIR, log);
+            log.step(`RUN END status=${result ? result.status : 'NONE'} exit=${exitCode}`);
+            C.emit(result || { status: 'ERROR', code: 'NO_RESULT', error: 'بدون نتیجه' });
+            process.exitCode = exitCode;   // نه process.exit() — تا finally کامل اجرا شود
+        }
     }
 })();
