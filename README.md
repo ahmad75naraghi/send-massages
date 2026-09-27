@@ -27,6 +27,12 @@
    - **سروش‌پلاس** و **آی‌گپ** از طریق **UserBot مبتنی بر Playwright** (چون API رسمی آن‌ها اجازهٔ ارسال به کانال با حساب کاربری را نمی‌دهد).
 5. نتیجهٔ هر پست را به‌صورت badge در داشبورد وب نمایش می‌دهد و گزارش تجمیعی را برای مدیر در بله ارسال می‌کند.
 
+> **⚠️ خیلی مهم — [REMINDERS.md](REMINDERS.md) را همیشه دم‌دست نگه دارید.**
+> یادآوری‌های عملیاتیِ حیاتی آنجا است: بازیابی session لاگ‌اوت‌شده با ورود دستی
+> (`manual_login.sh` + تونل SSH)، پشتیبان/بازگردانی session، خط کران زمان‌بند،
+> سه لاگی که اول از همه باید دید، جبران پست بدون تکرار، و چک‌لیست بعد از هر آپدیت.
+> همهٔ آن موارد در تولید واقعاً رخ داده‌اند.
+
 معماری به‌گونه‌ای طراحی شده که **هر پست در یک درخواست HTTP مستقل** پردازش شود؛ این تصمیم مستقیماً مشکل `504 Gateway Timeout` و `500 Internal Server Error` ناشی از محدودیت زمانی Apache/FastCGI را حل کرده است (نگاه کنید به [`ARCHITECTURE.md`](ARCHITECTURE.md) §۶).
 
 ---
@@ -587,6 +593,7 @@ ACTION=sync_single SYNC_BODY_FILE=/tmp/body.json php cli_run.php
 | [`DEPLOYMENT.md`](DEPLOYMENT.md) | نصب پکیج‌ها، مجوزها، مقداردهی اولیه session، Cron و Systemd، `.htaccess`، مانیتورینگ، رول‌بک |
 | [`PLAYWRIGHT_SPECS.md`](PLAYWRIGHT_SPECS.md) | مشخصات کامل سلکتورهای سروش‌پلاس و آی‌گپ، مدیریت race condition، workaround های headless، playbook نگهداری سلکتور |
 | [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md) | Runbook دسته‌بندی‌شده با دستورات دقیق bash برای هر حالت خرابی |
+| [`REMINDERS.md`](REMINDERS.md) | **یادآوری‌های خیلی مهم عملیاتی** — بازیابی session، پشتیبان‌ها، کران، جبران؛ اول این را ببین |
 
 ---
 
@@ -624,6 +631,11 @@ ACTION=sync_single SYNC_BODY_FILE=/tmp/body.json php cli_run.php
 ---
 | 27 | **زمان‌بندی خودکار**: پنل «زمان‌بندی خودکار» در داشبورد (افزودن/حذف/روشن‌وخاموش ساعت‌ها، ساعت سرور، heartbeat کران)، اکشن‌های `schedule_*` + `scheduler_tick` (CLI)، جداول `schedule`/`schedule_runs`/`schedule_meta` و `scheduler_tick.sh` — شلیک اسلات = همان مسیر صف پس‌زمینه با mutex روزانه | ✨ قابلیت | `sync_manual.php`, `scheduler_tick.sh`, `config.php` |
 
+| 28 | **رفع «آیگپ ✕» در صف** (مشاهدهٔ تولید): فاصلهٔ عمدی بین راه‌اندازی دو مرورگر (`BACKGROUND_STAGGER_SEC=12`)، مهلت لیست آی‌گپ ۸→۲۰ ثانیه، و `APP_NOT_LOADED` دیگر مهلک نیست (پاس دوم خودکار) | 🐛 Bugfix | `sync_manual.php`, `send_igap.js`, `config.php` |
+| 29 | **تشخیص session منقضی آی‌گپ با فرم ورود جدید** (سپتامبر ۲۰۲۶): فرم جدید نه `type=tel` داشت نه placeholder؛ لایهٔ دوم تشخیص با متن صفحه + آوردن «متن صفحه» داخل خود پیام `APP_NOT_LOADED` | 🐛 Bugfix | `send_igap.js`, `dump_dom.js` |
+| 30 | **بازنویسی `login_igap.js`**: انتخاب کشور، submit مقاوم با تأیید واقعی رفتن به مرحلهٔ کد، توقف صادقانه وقتی پیامکی درخواست نشده (قبلاً بی‌صدا منتظر کد می‌ماند!)، اسنپ‌شات متنی هر مرحله | 🐛 Bugfix | `login_igap.js` |
+| 31 | **`manual_login.sh` — ورود دستی از مرورگر خودتان**: کرومیوم سرور با CDP روی 127.0.0.1 + تونل SSH + DevTools Screencast؛ اثبات آماده‌بودن CDP با `/json/version`؛ راه‌حل نهاییِ هر تغییر فرم ورود | ✨ قابلیت | `manual_login.sh`, `start_browser.sh` |
+| 32 | **[`REMINDERS.md`](REMINDERS.md)** — یادآوری‌های خیلی مهم عملیاتی (session، پشتیبان، کران، جبران، چک‌لیست آپدیت) به‌عنوان سند مرجع روز بد | 📚 Documentation | `REMINDERS.md`, `README.md` |
 ## ۱۳. سلب مسئولیت عملیاتی
 
 - مسیرهای UserBot (سروش‌پلاس و آی‌گپ) به **رابط وب رسمی** این پیام‌رسان‌ها وابسته‌اند. هر به‌روزرسانی سمت آن‌ها ممکن است سلکتورهای DOM را باطل کند؛ در این صورت [`PLAYWRIGHT_SPECS.md`](PLAYWRIGHT_SPECS.md) §۸ (playbook بازسازی سلکتور) را دنبال کنید.
