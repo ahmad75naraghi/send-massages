@@ -232,6 +232,9 @@ bash -n *.sh lib/*.sh
 - `SCHEDULE_TIMEZONE` (خالی = منطقهٔ سرور) هم تیک هم ساعت نمایشی داشبورد.
 - تست آفلاین زنجیره: mock php با پورت python همین منطق روی sqlite واقعی + لانچر واقعی (در /tmp/schedtest — در sandbox ماندگار نیست).
 
+### ورود دستی (fallback نهایی)
+`manual_login.sh igap|soroush` = start_browser.sh (CDP فقط 127.0.0.1، پورت با REMOTE_DEBUG_PORT/MANUAL_LOGIN_PORT) + راهنمای تونل SSH؛ کاربر صفحهٔ کرومیومِ سرور را با DevTools Screencast (http://127.0.0.1:PORT از طریق ssh -L) می‌بیند و دستی لاگین می‌کند. session همان جا ساخته می‌شود؛ Ctrl+C بسته می‌کند + پاک‌سازی Singleton. وقتی فرم ورود وب‌کلاینت عوض شده بهترین راه است.
+
 ## هشدارهای مهم برای عامل‌های بعدی
 
 - روی کانال/branch دیگری کار نکنید مگر سیاست session اجازه بدهد.
