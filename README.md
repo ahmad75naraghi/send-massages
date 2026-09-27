@@ -416,6 +416,7 @@ IGAP_CHANNEL_NAME="کانال آزمایش" sudo -u file --preserve-env=IGAP_CHA
 | `BACKGROUND_GAP_SEC` | `0` | مکث بین پست‌ها در صف پس‌زمینه (۰ = بدون مکث؛ `SYNC_GAP_SEC` فقط مسیر دستی/cron) |
 | `SYNC_PARALLEL_DISPATCH` | `true` | ارسال هم‌زمان سروش+آی‌گپ (دو Chromium موازی)؛ برای سرور کم‌رمز `0` |
 | `BACKGROUND_MAX_PASSES` | `2` | حداکثر دفعات تلاش مجدد پلتفرم‌های ناموفق در صف |
+| `BACKGROUND_STAGGER_SEC` | `12` | فاصلهٔ عمدی بین راه‌اندازی دو مرورگر در ارسال موازی (۰ = بدون فاصله) |
 | `SCHEDULE_TIMEZONE` | *(خالی = منطقهٔ سرور)* | منطقهٔ زمانی ساعت‌های زمان‌بند و ساعت نمایشی سرور (مثال: `Asia/Tehran`) |
 | `MEDIA_MAX_RETRY` | `3` | سقف تلاش دانلود رسانه پیش از انتشار بدون رسانه ([`TROUBLESHOOTING.md`](TROUBLESHOOTING.md) §۳.۳) |
 | `SYNC_GAP_SEC` | `5` | فاصلهٔ بین پست‌ها در `cron_sync.sh` |

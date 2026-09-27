@@ -216,7 +216,7 @@ bash -n *.sh lib/*.sh
 
 ### قرارداد batch دو sender (`send_*.js --batch <file>`)
 - batch: `{items:[{id,text,file,type,fileName}…], progressFile:"/abs"}` → progress اتمیک per-item با `writeJsonFileAtomic` (rename)؛ آیتم‌ها **به‌ترتیب**، اولین شکست → ادامه NOT_ATTEMPTED؛ stdout آخرین خط JSON `{status:OK|PARTIAL|ERROR,sent,failed,total,stoppedAt,log}`؛ exit 0 مگر خطای راه‌اندازی مهلک.
-- کدهای مهلک (worker را متوقف می‌کنند): SESSION_EXPIRED, CHANNEL_NOT_FOUND, COMPOSER_NOT_AVAILABLE, APP_NOT_LOADED, NODE_DEPS_MISSING, BAD_BATCH, SHELL_EXEC_DISABLED, BATCH_WRITE_FAILED, LAUNCH_FAILED.
+- کدهای مهلک (worker را متوقف می‌کنند): SESSION_EXPIRED, CHANNEL_NOT_FOUND, COMPOSER_NOT_AVAILABLE, NODE_DEPS_MISSING, BAD_BATCH, SHELL_EXEC_DISABLED, BATCH_WRITE_FAILED, LAUNCH_FAILED. (APP_NOT_LOADED مهلک «نیست»: در فشار cold-start موازی گذراست و در پاس دوم دوباره تلاش می‌شود؛ مهلت لیست آی‌گپ هم ۲۰ ثانیه است و بین دو راه‌اندازی BACKGROUND_STAGGER_SEC=12 فاصله می‌افتد.)
 - نکتهٔ ساختاری مهم: خروج مشترک (بستن مرورگر + emit + exitCode) باید در `finally` یک try بیرونی باشد؛ returnهای زودهنگام حالت تک‌پیام باید از آن عبور کنند. (این قبلاً شکسته بود و با smoke test با Playwright قلابی گرفته شد.)
 
 ### دفتر تحویل و idempotency

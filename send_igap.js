@@ -484,7 +484,7 @@ async function sendOneIgap(page, name, item, log, tempo) {
                 await C.delay(INITIAL_WAIT_MS);
 
                 const loginMarker = await C.detectLoginPage(page, LOGIN_MARKERS);
-                const listReady = await C.seen(page.locator('#LeftColumn div[aria-haspopup="true"]').first(), 8000);
+                const listReady = await C.seen(page.locator('#LeftColumn div[aria-haspopup="true"]').first(), 20000);
                 if (!listReady) {
                     await C.safeScreenshot(page, 'last_igap_send.jpg', log);
                     stopRest(0);
@@ -613,7 +613,7 @@ async function sendOneIgap(page, name, item, log, tempo) {
             await C.delay(INITIAL_WAIT_MS);
 
             const loginMarker = await C.detectLoginPage(page, LOGIN_MARKERS);
-            const listReady = await C.seen(page.locator('#LeftColumn div[aria-haspopup="true"]').first(), 8000);
+            const listReady = await C.seen(page.locator('#LeftColumn div[aria-haspopup="true"]').first(), 20000);
             if (!listReady) {
                 await C.safeScreenshot(page, 'last_igap_send.jpg', log);
                 if (loginMarker) {

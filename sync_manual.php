@@ -1099,6 +1099,11 @@ function dispatchToPlatforms(array $only, string $text, ?string $localFile, ?str
             $h = launchUserbotAsync($builtSoroush['cmd'], SOROUSH_PROFILE_DIR);
             if ($h) { $handles['soroush'] = $h; }
         }
+        // فاصلهٔ عمدی بین دو cold-start کرومیوم — هم‌زمانی، آی‌گپِ سنگین‌تر را
+        // ممکن است در سکتهٔ رم/CPU جا بیندازد (APP_NOT_LOADED).
+        if (isset($handles['soroush']) && BACKGROUND_STAGGER_SEC > 0) {
+            sleep(BACKGROUND_STAGGER_SEC);
+        }
         $builtIgap = buildUserbotCommand(
             IGAP_SCRIPT, IGAP_PROFILE_DIR, $dest['igapChannel'], $dest['igapName'],
             $text, $localFile, $mediaType, ['item-id' => $dest['igapItemId']]
@@ -2128,11 +2133,19 @@ if ($action === 'background_run') {
                 }
             }
 
-            // ---------- ۶) راه‌اندازی runnerهای Node (سروش + آی‌گپ هم‌زمان) ----------
+            // ---------- ۶) راه‌اندازی runnerهای Node (سروش + آی‌گپ) ----------
+            // فاصلهٔ عمدی بین دو cold-start کرومیوم: اگر هم‌زمان بالا بیایند،
+            // اپِ سنگین‌تر (آی‌گپ) ممکن است در سکتهٔ رم/CPU جا بماند و لیست
+            // گفت‌وگوهایش در مهلت دیده نشود (APP_NOT_LOADED).
             $nodeWorkers = [];
             foreach (['soroush', 'igap'] as $platform) {
                 $items = $itemsByPlatform[$platform];
                 if ($items === []) { continue; }
+                if ($platform === 'igap' && isset($nodeWorkers['soroush']) && BACKGROUND_STAGGER_SEC > 0) {
+                    $progress['message'] = 'انتظار ' . BACKGROUND_STAGGER_SEC . ' ثانیه بین راه‌اندازی دو مرورگر (کاهش فشار سرور)…';
+                    $writeProgress();
+                    sleep(BACKGROUND_STAGGER_SEC);
+                }
                 $h = launchUserbotBatch($platform, $items, $dest);
                 if (!$h['ok']) {
                     foreach ($items as $it) {
@@ -2205,7 +2218,11 @@ if ($action === 'background_run') {
             $fatalRunnerCode = function (array $nw): ?string {
                 $pr = readJsonFile($nw['handle']['progressFile']);
                 $code = (string)($pr['error']['code'] ?? '');
-                $fatalCodes = ['SESSION_EXPIRED', 'CHANNEL_NOT_FOUND', 'COMPOSER_NOT_AVAILABLE', 'APP_NOT_LOADED', 'NODE_DEPS_MISSING', 'BAD_BATCH', 'SHELL_EXEC_DISABLED', 'BATCH_WRITE_FAILED', 'LAUNCH_FAILED'];
+                // APP_NOT_LOADED عمداً مهلک نیست: وقتی دو کرومیوم هم‌زمان cold-start
+                // می‌شوند ممکن است اپِ سنگین‌تر (آی‌گپ) در مهلتش بالا نیاید؛ پاس دوم
+                // (پس از سبک شدن فشار) معمولاً موفق می‌شود. SESSION_EXPIRED و
+                // CHANNEL_NOT_FOUND مهلک می‌مانند تا به چت اشتباه نرویم.
+                $fatalCodes = ['SESSION_EXPIRED', 'CHANNEL_NOT_FOUND', 'COMPOSER_NOT_AVAILABLE', 'NODE_DEPS_MISSING', 'BAD_BATCH', 'SHELL_EXEC_DISABLED', 'BATCH_WRITE_FAILED', 'LAUNCH_FAILED'];
                 return in_array($code, $fatalCodes, true) ? $code : null;
             };
 

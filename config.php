@@ -220,6 +220,9 @@ define('BACKGROUND_GAP_SEC', envInt('BACKGROUND_GAP_SEC', 0));
 define('SYNC_PARALLEL_DISPATCH', envBool('SYNC_PARALLEL_DISPATCH', true));
 // حداکثر دفعات تلاش هر پلتفرم در صف پس‌زمینه برای آیتم‌های ناموفق (۱ = بدون تلاش مجدد)
 define('BACKGROUND_MAX_PASSES', envInt('BACKGROUND_MAX_PASSES', 2));
+// فاصلهٔ عمدی بین راه‌اندازی دو مرورگر (سروش و آی‌گپ) در ارسال موازی؛ دو
+// cold-start هم‌زمان می‌تواند اپ آی‌گپ را در سکتهٔ رم/CPU جا بیندازد (۰ = بدون فاصله)
+define('BACKGROUND_STAGGER_SEC', envInt('BACKGROUND_STAGGER_SEC', 12));
 // منطقهٔ زمانی ساعت‌های زمان‌بند (خالی = منطقهٔ پیش‌فرض سرور؛ مثال: Asia/Tehran).
 // ساعت نشان‌داده‌شدهٔ «سرور» در داشبورد هم با همین منطقه است.
 define('SCHEDULE_TIMEZONE', env('SCHEDULE_TIMEZONE', ''));
